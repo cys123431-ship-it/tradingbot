@@ -773,3 +773,36 @@ async fn minimum_balance_submenu_sets_the_threshold() {
     press(&ctx, "minbal:55").await; // not a choice: ignored
     assert_eq!(ctx.section()["min_balance_usdt"], json!(0));
 }
+
+#[tokio::test]
+async fn loss_guard_submenu_sets_both_limits() {
+    let tmp = common::temp_dir("bm_loss_guard");
+    let ctx = controller(&tmp);
+    let (_, markup) = press(&ctx, "status").await;
+    assert!(callbacks(&markup).contains(&"bm:guard".to_string()));
+
+    let (text, markup) = press(&ctx, "guard").await;
+    assert!(text.contains("손실 한도를 고르세요"), "{text}");
+    let cbs = callbacks(&markup);
+    for n in [0, 5, 10, 15, 20] {
+        assert!(cbs.contains(&format!("bm:dll:{n}")), "{cbs:?}");
+    }
+    for n in [0, 2, 3, 4, 5] {
+        assert!(cbs.contains(&format!("bm:mls:{n}")), "{cbs:?}");
+    }
+
+    press(&ctx, "dll:5").await;
+    let (text, _) = press(&ctx, "mls:2").await;
+    assert_eq!(ctx.section()["daily_loss_limit_pct"], json!(5));
+    assert_eq!(ctx.section()["max_loss_streak"], json!(2));
+    assert!(text.contains("-5%") && text.contains("2연패"), "{text}");
+    let (rules, _) = press(&ctx, "rules").await;
+    assert!(
+        rules.contains("손실 한도: 오늘 손실이 시작 잔고의 -5%"),
+        "{rules}"
+    );
+
+    press(&ctx, "dll:0").await;
+    let (text, _) = press(&ctx, "mls:0").await;
+    assert!(text.contains("손실 한도: 끔"), "{text}");
+}

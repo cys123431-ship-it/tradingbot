@@ -1015,3 +1015,109 @@ async fn minimum_balance_can_be_turned_off() {
     h.fake.with_state(|s| s.wallet = 50.0);
     assert_eq!(h.run().await["action"], json!("entered"));
 }
+
+// ------------------------------------------------- daily loss / losing streak
+
+fn closed_trade(h: &Harness, id: &str, net: &str, exit_ms: i64) {
+    let mut t = Map::new();
+    for (k, v) in [
+        ("trade_id", json!(id)),
+        ("signal_id", json!(format!("S-{id}"))),
+        ("mode", json!("LIVE")),
+        ("network", json!("testnet")),
+        ("status", json!("CLOSED")),
+        (
+            "entry_time",
+            json!(tbot::strategy::service::iso_ms(exit_ms - 60_000)),
+        ),
+        ("exit_time", json!(tbot::strategy::service::iso_ms(exit_ms))),
+        ("side", json!("LONG")),
+        ("net_pnl", json!(net)),
+        ("exit_reason", json!("SMA25_STOP")),
+    ] {
+        t.insert(k.to_string(), v);
+    }
+    let ledger = h.service.ledger("testnet").unwrap();
+    ledger.lock().unwrap().upsert_trade(&t).unwrap();
+}
+
+#[tokio::test]
+async fn three_losses_in_a_row_today_stop_entries() {
+    let h = trend_harness("loss_streak", between_rows_below_sma25());
+    let now = h.service.now_ms();
+    closed_trade(&h, "a", "-1.0", now - 3_000);
+    closed_trade(&h, "b", "-1.0", now - 2_000);
+    closed_trade(&h, "c", "-1.0", now - 1_000);
+    let result = h.run().await;
+    assert_eq!(result["action"], json!("blocked"), "{result}");
+    let reason = result["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.starts_with("LOSS_STREAK_LIMIT: 오늘 3연패"),
+        "{reason}"
+    );
+    assert!(!h
+        .state_live()
+        .get("trade")
+        .map(|v| v.is_object())
+        .unwrap_or(false));
+    let notes = h.notes.lock().unwrap().clone();
+    assert!(notes.iter().any(|n| n.contains("내일 0시")), "{notes:?}");
+}
+
+#[tokio::test]
+async fn a_win_breaks_the_losing_streak() {
+    let h = trend_harness("loss_streak_broken", between_rows_below_sma25());
+    let now = h.service.now_ms();
+    closed_trade(&h, "a", "-1.0", now - 4_000);
+    closed_trade(&h, "b", "-1.0", now - 3_000);
+    closed_trade(&h, "c", "2.5", now - 2_000);
+    closed_trade(&h, "d", "-1.0", now - 1_000);
+    assert_eq!(h.run().await["action"], json!("entered"));
+}
+
+#[tokio::test]
+async fn daily_loss_limit_stops_entries() {
+    // Wallet 5000 now, -600 today: day start 5600, -10.7% >= -10%.
+    let h = trend_harness("daily_loss", between_rows_below_sma25());
+    let now = h.service.now_ms();
+    closed_trade(&h, "a", "-600.0", now - 1_000);
+    let result = h.run().await;
+    assert_eq!(result["action"], json!("blocked"), "{result}");
+    let reason = result["reason"].as_str().unwrap_or("");
+    assert!(reason.starts_with("DAILY_LOSS_LIMIT"), "{reason}");
+    assert!(reason.contains("-10.7%"), "{reason}");
+}
+
+#[tokio::test]
+async fn yesterdays_losses_do_not_count() {
+    let h = trend_harness("loss_yesterday", between_rows_below_sma25());
+    let now = h.service.now_ms();
+    let two_days = 2 * 24 * 3_600_000;
+    closed_trade(&h, "a", "-600.0", now - two_days - 3_000);
+    closed_trade(&h, "b", "-1.0", now - two_days - 2_000);
+    closed_trade(&h, "c", "-1.0", now - two_days - 1_000);
+    assert_eq!(h.run().await["action"], json!("entered"));
+}
+
+#[tokio::test]
+async fn loss_guards_can_be_turned_off() {
+    let root = temp_dir("loss_guards_off");
+    let mut extra = HashMap::new();
+    extra.insert("entry_mode".to_string(), json!("trend"));
+    extra.insert("max_loss_streak".to_string(), json!(0));
+    extra.insert("daily_loss_limit_pct".to_string(), json!(0));
+    let mut h = Harness::new(&root, true, "testnet", 86_000.0, extra);
+    h.rows = between_rows_below_sma25();
+    h.fake
+        .bars
+        .lock()
+        .unwrap()
+        .insert("1h".to_string(), h.rows.clone());
+    h.now_ms = now_after_default(&h.rows);
+    h.set_time_from_now();
+    let now = h.service.now_ms();
+    closed_trade(&h, "a", "-600.0", now - 3_000);
+    closed_trade(&h, "b", "-1.0", now - 2_000);
+    closed_trade(&h, "c", "-1.0", now - 1_000);
+    assert_eq!(h.run().await["action"], json!("entered"));
+}

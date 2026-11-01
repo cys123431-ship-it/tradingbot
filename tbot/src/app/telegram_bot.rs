@@ -22,7 +22,9 @@ const PICK_LIST_SIZE: usize = 12;
 
 pub const TIMEFRAMES: &[&str] = &["3m", "5m", "15m", "30m", "1h", "2h", "4h"];
 pub const LEVERAGE_CHOICES: &[i64] = &[2, 3, 4, 5];
-use crate::strategy::config_btc_ma::MIN_BALANCE_CHOICES;
+use crate::strategy::config_btc_ma::{
+    DAILY_LOSS_LIMIT_CHOICES, LOSS_STREAK_CHOICES, MIN_BALANCE_CHOICES,
+};
 pub const EMERGENCY_STOP_CHOICES: &[i64] = &[0, 10, 20, 30, 50];
 pub const REENTRY_WAIT_CHOICES: &[i64] = &[0, 1, 2, 3, 5];
 pub const SLOW_PERIOD_CHOICES: &[i64] = &[60, 120, 200];
@@ -393,6 +395,37 @@ fn reentry_text(cfg: &Value) -> String {
     } else {
         format!("{wait}봉 대기 후 같은 방향 재진입 (반대 크로스 시 즉시)")
     }
+}
+
+fn loss_guard_label(cfg: &Value) -> String {
+    let daily = match cfg_int(cfg, "daily_loss_limit_pct", 0) {
+        0 => "하루 끔".to_string(),
+        n => format!("하루 -{n}%"),
+    };
+    let streak = match cfg_int(cfg, "max_loss_streak", 0) {
+        0 => "연패 끔".to_string(),
+        n => format!("{n}연패"),
+    };
+    format!("{daily} · {streak}")
+}
+
+fn loss_guard_text(cfg: &Value) -> String {
+    let daily = cfg_int(cfg, "daily_loss_limit_pct", 0);
+    let streak = cfg_int(cfg, "max_loss_streak", 0);
+    if daily == 0 && streak == 0 {
+        return "끔".to_string();
+    }
+    let mut parts = Vec::new();
+    if daily > 0 {
+        parts.push(format!("오늘 손실이 시작 잔고의 -{daily}% 이상"));
+    }
+    if streak > 0 {
+        parts.push(format!("오늘 {streak}연패"));
+    }
+    format!(
+        "{}이면 그날 신규 진입 중지, 내일 0시(한국시간) 자동 재개",
+        parts.join(" 또는 ")
+    )
 }
 
 fn min_balance_label(cfg: &Value) -> String {
@@ -973,6 +1006,10 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             format!("💰 최소 잔고: {}", min_balance_label(cfg)),
             "bm:minbal",
         )]);
+        rows.push(vec![markup_button(
+            format!("🛡 손실 한도: {}", loss_guard_label(cfg)),
+            "bm:guard",
+        )]);
         let lookback_on = cfg_int(cfg, "cross_lookback_bars", 1) >= 2;
         rows.push(vec![markup_button(
             mark(lookback_on, "⏮ 2봉 전 크로스도 진입"),
@@ -1506,6 +1543,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
              • 진입 조건: 종가가 SMA25 기준 진입 방향 쪽에 있을 때만 (반대편이면 그 신호는 건너뜀)\n\
              • 크로스 진입 범위: {}\n\
              • 최소 잔고: {}\n\
+             • 손실 한도: {}\n\
              • SMA25 손절: 봉 마감 종가가 SMA25를 반대로 이탈하면 시장가 청산, 이후 새 크로스까지 재진입 안 함 (같은 봉의 반대 크로스가 우선)\n\
              • 수익 확보(증거금 기준): {} (항상 도달 칸 {gap}% 아래, 한 번 올라간 손절은 내려가지 않음)\n\
              • 수익 확보 손절로 청산되면 다음 크로스까지 대기\n\
@@ -1521,6 +1559,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             timeframe_labels(cfg_str(cfg, "timeframe", "")),
             lookback_text(cfg),
             min_balance_text(cfg),
+            loss_guard_text(cfg),
             lock_table(cfg),
         )
     }
@@ -1811,6 +1850,71 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                         "💥 LIVE 전환 완료 (다음 주기에 거래소 상태를 먼저 대조합니다)\n\n{status}"
                     ),
                     kb!(),
+                )
+            }
+            "guard" => {
+                let daily = cfg_int(&cfg, "daily_loss_limit_pct", 0);
+                let streak = cfg_int(&cfg, "max_loss_streak", 0);
+                let daily_row: Vec<Value> = DAILY_LOSS_LIMIT_CHOICES
+                    .iter()
+                    .map(|n| {
+                        let label = if *n == 0 {
+                            "하루 끔".to_string()
+                        } else {
+                            format!("하루 -{n}%")
+                        };
+                        markup_button(mark(daily == *n, &label), format!("bm:dll:{n}"))
+                    })
+                    .collect();
+                let streak_row: Vec<Value> = LOSS_STREAK_CHOICES
+                    .iter()
+                    .map(|n| {
+                        let label = if *n == 0 {
+                            "연패 끔".to_string()
+                        } else {
+                            format!("{n}연패")
+                        };
+                        markup_button(mark(streak == *n, &label), format!("bm:mls:{n}"))
+                    })
+                    .collect();
+                let rows = vec![
+                    daily_row,
+                    streak_row,
+                    vec![markup_button("↩️ 돌아가기", "bm:status")],
+                ];
+                (
+                    format!(
+                        "🛡 손실 한도를 고르세요.\n\
+                         • 하루 손실: 오늘(한국시간) 청산된 거래의 손익 합이 시작 잔고의 -N% 이상이면 중지\n\
+                         • 연패: 오늘 N번 연속 손실이면 중지\n\
+                         중지되면 그날은 신규 진입만 멈추고, 내일 0시에 자동으로 다시 진입합니다.\n\
+                         지금: {}",
+                        loss_guard_text(&cfg)
+                    ),
+                    markup(rows),
+                )
+            }
+            a if a.starts_with("dll:") || a.starts_with("mls:") => {
+                let (key, choices) = if a.starts_with("dll:") {
+                    ("daily_loss_limit_pct", DAILY_LOSS_LIMIT_CHOICES)
+                } else {
+                    ("max_loss_streak", LOSS_STREAK_CHOICES)
+                };
+                let choice = a
+                    .split_once(':')
+                    .map(|x| x.1)
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(-1);
+                if choices.contains(&choice) {
+                    if let Err(e) = self.set_coin_value(key, json!(choice)).await {
+                        return (Self::engine_error_text(&e), kb!());
+                    }
+                }
+                let cfg_now = self.config().await;
+                let status = self.format_status().await;
+                (
+                    format!("🛡 손실 한도: {}\n\n{status}", loss_guard_text(&cfg_now)),
+                    kb_owned!(),
                 )
             }
             "minbal" => {

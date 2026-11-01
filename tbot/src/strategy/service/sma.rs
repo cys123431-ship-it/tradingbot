@@ -52,6 +52,8 @@ pub(crate) const TRANSIENT_ENTRY_BLOCKS: &[&str] = &[
 pub(crate) const STOP_MA_EXIT: &str = "SMA25_STOP";
 const STOP_MA_SIDE_MISMATCH: &str = "STOP_MA_SIDE_MISMATCH";
 const MIN_BALANCE_BLOCK: &str = "MIN_BALANCE";
+const DAILY_LOSS_BLOCK: &str = "DAILY_LOSS_LIMIT";
+const LOSS_STREAK_BLOCK: &str = "LOSS_STREAK_LIMIT";
 const STOP_MA_UNAVAILABLE: &str = "STOP_MA_UNAVAILABLE";
 
 // Skip reasons tied to a single coin: the scan tries the next candidate.
@@ -171,6 +173,40 @@ fn stop_ma_entry_block(cfg: &Value, signal: &Value) -> String {
         }
         _ => format!("{STOP_MA_UNAVAILABLE}: SMA{period} 값 없음"),
     }
+}
+
+/// Today's (KST) loss guards from the closed trades of the day, oldest exit
+/// first. `wallet` is the current balance with no position open, so the
+/// day-start balance is `wallet - today's net PnL`.
+fn loss_guard_reason(cfg: &Value, todays: &[Map<String, Value>], wallet: f64) -> String {
+    let streak_limit = int_or_zero(cfg.get("max_loss_streak"));
+    if streak_limit > 0 {
+        let streak = todays
+            .iter()
+            .rev()
+            .take_while(|t| as_f64(t.get("net_pnl")).unwrap_or(0.0) < 0.0)
+            .count() as i64;
+        if streak >= streak_limit {
+            return format!("{LOSS_STREAK_BLOCK}: 오늘 {streak}연패 (한도 {streak_limit}연패)");
+        }
+    }
+    let loss_limit = as_f64(cfg.get("daily_loss_limit_pct")).unwrap_or(0.0);
+    if loss_limit > 0.0 {
+        let net: f64 = todays
+            .iter()
+            .map(|t| as_f64(t.get("net_pnl")).unwrap_or(0.0))
+            .sum();
+        let day_start = wallet - net;
+        if net < 0.0 && day_start > 0.0 {
+            let pct = -net / day_start * 100.0;
+            if pct + 1e-9 >= loss_limit {
+                return format!(
+                    "{DAILY_LOSS_BLOCK}: 오늘 {net:+.2} USDT (시작 잔고 대비 -{pct:.1}%, 한도 -{loss_limit}%)"
+                );
+            }
+        }
+    }
+    String::new()
 }
 
 /// LIVE only: non-empty when the wallet is at or below `min_balance_usdt`.
@@ -899,6 +935,70 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         }
     }
 
+    /// Closed trades of today (KST, by exit time) for this mode, oldest first.
+    fn todays_closed_trades(
+        &self,
+        network: &str,
+        mode: &str,
+    ) -> Result<Vec<Map<String, Value>>, ServiceError> {
+        use chrono::TimeZone as _;
+        let now = chrono::Utc
+            .timestamp_millis_opt(self.now_ms())
+            .single()
+            .unwrap_or_else(chrono::Utc::now);
+        let local = now.with_timezone(&chrono_tz::Asia::Seoul);
+        let day_start = chrono_tz::Asia::Seoul
+            .from_local_datetime(&local.date_naive().and_hms_opt(0, 0, 0).unwrap_or_default())
+            .earliest()
+            .map(|d| d.with_timezone(&chrono::Utc))
+            .unwrap_or(now);
+        let ledger = self.ledger(network)?;
+        let closed = ledger
+            .lock()
+            .unwrap()
+            .trades(Some(mode), Some(network), None, None, Some("CLOSED"))
+            .map_err(|e| ServiceError::new("StoreError", e.to_string()))?;
+        let mut todays: Vec<(chrono::DateTime<chrono::Utc>, Map<String, Value>)> = closed
+            .into_iter()
+            .filter_map(|t| {
+                let exit = t.get("exit_time").and_then(|v| v.as_str())?;
+                let at = chrono::DateTime::parse_from_rfc3339(exit)
+                    .ok()?
+                    .with_timezone(&chrono::Utc);
+                (at >= day_start).then_some((at, t))
+            })
+            .collect();
+        todays.sort_by_key(|(at, _)| *at);
+        Ok(todays.into_iter().map(|(_, t)| t).collect())
+    }
+
+    /// Daily loss / losing-streak guard for a new entry (empty = allowed).
+    fn loss_guard(
+        &self,
+        network: &str,
+        cfg: &Value,
+        mode: &str,
+        wallet: f64,
+    ) -> Result<String, ServiceError> {
+        if int_or_zero(cfg.get("max_loss_streak")) <= 0
+            && as_f64(cfg.get("daily_loss_limit_pct")).unwrap_or(0.0) <= 0.0
+        {
+            return Ok(String::new());
+        }
+        let todays = self.todays_closed_trades(network, mode)?;
+        Ok(loss_guard_reason(cfg, &todays, wallet))
+    }
+
+    /// One Telegram notice per guard and day; entries resume at 00:00 KST.
+    async fn notify_loss_guard(&self, reason: &str) {
+        let code = reason.split(':').next().unwrap_or(reason);
+        let text = format!(
+            "🛡 {}: {reason}\n오늘은 신규 진입을 멈춥니다. 내일 0시(한국시간)에 자동으로 다시 진입합니다.",
+            self.label()
+        );
+        self.notify(text, Some(&format!("loss_guard:{code}"))).await;
+    }
+
     /// Minimum balance reached with no position: turn the strategy OFF.
     async fn stop_for_min_balance(&self, reason: &str) {
         let off = match self.deps.config_writer.clone() {
@@ -1371,14 +1471,21 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         if latest == int_or_zero(state.get("last_evaluated_bar")) {
             return Ok(json!({"action": "waiting", "reason": "WAITING_NEXT_CLOSE"}));
         }
-        if mode == crate::strategy::config_base::TRADING_MODE_LIVE
-            && as_f64(cfg.get("min_balance_usdt")).unwrap_or(0.0) > 0.0
-        {
+        let min_on = mode == crate::strategy::config_base::TRADING_MODE_LIVE
+            && as_f64(cfg.get("min_balance_usdt")).unwrap_or(0.0) > 0.0;
+        let guards_on = int_or_zero(cfg.get("max_loss_streak")) > 0
+            || as_f64(cfg.get("daily_loss_limit_pct")).unwrap_or(0.0) > 0.0;
+        if min_on || guards_on {
             if let Ok((wallet, _, _, _)) = self.balances(network, &cfg, mode).await {
                 let low = min_balance_reason(&cfg, mode, wallet);
                 if !low.is_empty() {
                     self.stop_for_min_balance(&low).await;
                     return Ok(json!({"action": "blocked", "reason": low}));
+                }
+                let guard = self.loss_guard(network, &cfg, mode, wallet)?;
+                if !guard.is_empty() {
+                    self.notify_loss_guard(&guard).await;
+                    return Ok(json!({"action": "blocked", "reason": guard}));
                 }
             }
         }
@@ -1874,6 +1981,10 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
                 self.stop_for_min_balance(&reason).await;
                 return Ok(json!({"action": "blocked", "reason": reason}));
             }
+            if starts_with_any(&reason, &[DAILY_LOSS_BLOCK, LOSS_STREAK_BLOCK]) {
+                self.notify_loss_guard(&reason).await;
+                return Ok(json!({"action": "blocked", "reason": reason}));
+            }
             let market = signal
                 .get("market_id")
                 .map(py_string)
@@ -1929,6 +2040,10 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         let low = min_balance_reason(cfg, mode, wallet);
         if !low.is_empty() {
             return Ok((None, low, context));
+        }
+        let guard = self.loss_guard(network, cfg, mode, wallet)?;
+        if !guard.is_empty() {
+            return Ok((None, guard, context));
         }
         if mode == crate::strategy::config_base::TRADING_MODE_LIVE {
             let positions = match self.fetch_account_positions(network).await {

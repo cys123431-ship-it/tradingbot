@@ -31,6 +31,12 @@ pub const STOP_MA_PERIOD: i64 = 25;
 /// before a new entry. 0 = off.
 pub const MIN_BALANCE_CHOICES: &[i64] = &[0, 60, 70, 80, 90, 100];
 pub const DEFAULT_MIN_BALANCE: i64 = 80;
+/// Daily loss limit in % of the day-start balance (KST day). 0 = off.
+pub const DAILY_LOSS_LIMIT_CHOICES: &[i64] = &[0, 5, 10, 15, 20];
+pub const DEFAULT_DAILY_LOSS_LIMIT: i64 = 10;
+/// Losing trades in a row (today, KST) that stop entries until tomorrow. 0 = off.
+pub const LOSS_STREAK_CHOICES: &[i64] = &[0, 2, 3, 4, 5];
+pub const DEFAULT_LOSS_STREAK: i64 = 3;
 
 pub fn default_btc_ma_cross_config() -> Value {
     json!({
@@ -65,6 +71,8 @@ pub fn default_btc_ma_cross_config() -> Value {
         "stop_ma_period": STOP_MA_PERIOD,
         "cross_lookback_bars": 1,
         "min_balance_usdt": DEFAULT_MIN_BALANCE,
+        "daily_loss_limit_pct": DEFAULT_DAILY_LOSS_LIMIT,
+        "max_loss_streak": DEFAULT_LOSS_STREAK,
         "working_type": "MARK_PRICE",
         "lock_working_type": "CONTRACT_PRICE",
         "tp_working_type": "CONTRACT_PRICE",
@@ -322,6 +330,20 @@ pub fn normalize_btc_ma_cross_config(raw: Option<&Value>) -> Value {
         100_000,
     );
     cfg_obj.insert("min_balance_usdt".into(), json!(min_balance));
+    let daily_loss = crate::strategy::config_base::py_int(
+        cfg_obj.get("daily_loss_limit_pct"),
+        DEFAULT_DAILY_LOSS_LIMIT,
+        0,
+        100,
+    );
+    cfg_obj.insert("daily_loss_limit_pct".into(), json!(daily_loss));
+    let streak = crate::strategy::config_base::py_int(
+        cfg_obj.get("max_loss_streak"),
+        DEFAULT_LOSS_STREAK,
+        0,
+        100,
+    );
+    cfg_obj.insert("max_loss_streak".into(), json!(streak));
 
     for (key, default) in [
         ("working_type", "MARK_PRICE"),
