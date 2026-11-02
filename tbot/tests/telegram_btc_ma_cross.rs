@@ -741,10 +741,12 @@ async fn all_coins_scope_button_is_separate_from_top_alts() {
 
     let (text, _) = press(&ctx, "scope:all").await;
     assert_eq!(ctx.section()["scan_scope"], json!("all"));
-    assert!(text.contains("바이낸스 USDT 선물 전체 스캔"), "{text}");
+    assert!(text.contains("바이낸스 USDT 선물 전체 (BTC 포함"), "{text}");
+    let (text, _) = press(&ctx, "entry:trend").await;
+    assert!(text.contains("거래대금 순 첫 코인(보통 BTC)"), "{text}");
     let (text, _) = press(&ctx, "scope:alts").await;
     assert_eq!(ctx.section()["scan_scope"], json!("alts"));
-    assert!(text.contains("상위"), "{text}");
+    assert!(text.contains("상위") && text.contains("BTC 제외"), "{text}");
 }
 
 #[tokio::test]

@@ -265,10 +265,36 @@ fn rotation_text(cfg: &Value) -> String {
     if cfg_str(cfg, "entry_mode", "") != "trend" {
         return "ON (방향 유지 중 진입 모드에서만 동작)".to_string();
     }
-    if cfg_str(cfg, "scan_scope", "") == "single" {
-        return "ON (코인 지정 중에는 동작 안 함 — 지정 코인만 거래)".to_string();
+    let size = cfg_int(cfg, "alt_universe_size", 50);
+    let pool = match cfg_str(cfg, "scan_scope", "") {
+        "single" => return "ON (코인 지정 중에는 동작 안 함 — 지정 코인만 거래)".to_string(),
+        TRADFI_SCOPE => "TradFi 종목 중".to_string(),
+        "alts" => format!("알트 상위{size} 중"),
+        "all" => "전체 코인 중".to_string(),
+        // BTC-only still rotates into the top alts until the next exit.
+        _ => format!("BTC + 알트 상위{size} 중 (BTC만 선택이어도 이때는 알트도 진입)"),
+    };
+    format!(
+        "ON — 익절·손절 직후(SMA25 손절 제외) 방금 코인을 뺀 {pool} 거래대금 순 첫 코인에 바로 진입"
+    )
+}
+
+fn alt_exclude_btc(cfg: &Value) -> bool {
+    cfg_get(cfg, "alt_exclude_btc")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
+/// How one coin is chosen when the scope scans many.
+fn scan_pick_text(cfg: &Value, first: &str) -> String {
+    if cfg_str(cfg, "entry_mode", "") == "trend" {
+        format!(
+            "방향 유지 중 진입이라 모든 코인이 늘 신호 상태 → 거래대금 순 첫 코인(보통 {first})에 진입, \
+             재진입 대기·SMA25 조건에 걸리면 다음 코인"
+        )
+    } else {
+        "같은 봉에 여러 코인이 크로스하면 거래대금 1위".to_string()
     }
-    "ON — 익절·손절 직후 방금 코인을 뺀 거래대금 1위 코인에 바로 진입".to_string()
 }
 
 fn scope_text(cfg: &Value) -> String {
@@ -277,8 +303,21 @@ fn scope_text(cfg: &Value) -> String {
         TRADFI_SCOPE => format!(
             "🏦 TradFi만 — 바이낸스 메인넷 미국주식 + 금 (선물 상장 종목, 24h 거래대금 상위 {size}, 미국 정규장 시간에만 신규 진입)"
         ),
-        "alts" => format!("알트 전용 24h 거래대금 상위 {size}개 (BTC 제외, 동시 신호 시 거래대금 1위)"),
-        "all" => "바이낸스 USDT 선물 전체 스캔 (BTC 포함, 스테이블·TradFi 제외, 동시 신호 시 거래대금 1위)".to_string(),
+        "alts" => {
+            let (btc, first) = if alt_exclude_btc(cfg) {
+                ("BTC 제외", "ETH")
+            } else {
+                ("BTC 포함", "BTC")
+            };
+            format!(
+                "알트 24h 거래대금 상위 {size}개 ({btc}, 스테이블·TradFi 제외, {})",
+                scan_pick_text(cfg, first)
+            )
+        }
+        "all" => format!(
+            "바이낸스 USDT 선물 전체 (BTC 포함, 스테이블·TradFi 제외, {})",
+            scan_pick_text(cfg, "BTC")
+        ),
         "single" => {
             let single = cfg_str(cfg, "single_symbol", "");
             let single = if single.is_empty() { "BTCUSDT" } else { single };
@@ -519,14 +558,36 @@ fn lookback_text(cfg: &Value) -> String {
 }
 
 fn entry_mode_text(cfg: &Value) -> String {
+    let (fast, slow) = sma_names(cfg);
     if cfg_str(cfg, "entry_mode", "") == "trend" {
         format!(
-            "방향 유지 중 진입 (SMA3이 SMA200 위=롱 / 아래=숏, 수익확보·손절 청산 후 그 코인은 {})",
+            "방향 유지 중 진입 ({fast}이 {slow} 위=롱 / 아래=숏, 수익확보·손절·수동 청산 후 그 코인은 {})",
             reentry_text(cfg)
         )
     } else {
-        "돌파 시 진입 (SMA3이 SMA200을 뚫는 봉)".to_string()
+        format!("돌파 시 진입 ({fast}이 {slow}을 뚫는 봉)")
     }
+}
+
+/// ("SMA1", "SMA200") from the configured periods.
+fn sma_names(cfg: &Value) -> (String, String) {
+    (
+        format!("SMA{}", cfg_int(cfg, "fast_period", 3)),
+        format!("SMA{}", cfg_int(cfg, "slow_period", 200)),
+    )
+}
+
+/// "1/200 SMA" from the configured periods.
+fn strategy_name(cfg: &Value) -> String {
+    format!(
+        "{}/{} SMA",
+        cfg_int(cfg, "fast_period", 3),
+        cfg_int(cfg, "slow_period", 200)
+    )
+}
+
+fn lock_start_text(cfg: &Value) -> String {
+    format_g(py_n(cfg_get(cfg, "lock_start_roi_percent")))
 }
 
 fn stop_ma_on(cfg: &Value) -> bool {
@@ -806,15 +867,20 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
     }
 
     async fn handle_help(&self, chat_id: i64) -> Vec<Outgoing> {
-        let text = "📖 사용 가능한 명령\n\
-                    /btcmacross — 3/200 SMA 크로스 전략 메뉴\n\
-                    /macross — SMA3/SMA120 변동성 타겟 사이징 전략 메뉴\n\
-                    /macoin <코인> — 거래할 코인 1개 지정 (예: /macoin SOL)\n\
-                    /btcma <패스트> <슬로우> — SMA 기간 변경 (예: /btcma 1 200)\n\
-                    /btcmaperiod — SMA 기간 도움말\n\
-                    /map <패스트> <슬로우> — /macross SMA 기간 변경 (예: /map 1 200)\n\
-                    /stop — 모든 선물 전략 비상 정지"
-            .to_string();
+        let cfg = self.config().await;
+        let ma_cfg = self.ma_config().await;
+        let text = format!(
+            "📖 사용 가능한 명령\n\
+             /btcmacross — {} 크로스 전략 메뉴\n\
+             /macross — {} 크로스 + 변동성 타겟 사이징 전략 메뉴\n\
+             /macoin <코인> — /btcmacross 거래 코인 1개 지정 (예: /macoin SOL)\n\
+             /btcma <패스트> <슬로우> — /btcmacross SMA 기간 변경 (예: /btcma 1 200)\n\
+             /btcmaperiod — SMA 기간 도움말\n\
+             /map <패스트> <슬로우> — /macross SMA 기간 변경 (예: /map 1 200)\n\
+             /stop — 두 전략 모두 신규 진입 OFF + 보유 포지션 청산",
+            strategy_name(&cfg),
+            strategy_name(&ma_cfg),
+        );
         vec![Outgoing::Send {
             chat_id,
             text,
@@ -968,7 +1034,8 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         if let Err(e) = self.set_coin_value("enabled", json!(false)).await {
             return Self::engine_error_text(&e);
         }
-        let mut lines = vec!["🛑 3/200 SMA 크로스 완전 끄기".to_string()];
+        let name = strategy_name(&self.config().await);
+        let mut lines = vec![format!("🛑 {name} 크로스 완전 끄기")];
         match self
             .engine_call("close_position", json!({ "reason": "manual" }))
             .await
@@ -1094,7 +1161,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             markup_button(pick_label, "bm:pick"),
         ]);
         rows.push(vec![markup_button(
-            mark(scan_scope == "all", "🛰 전체 코인 스캔"),
+            mark(scan_scope == "all", "🛰 전체 코인 스캔 (BTC 포함)"),
             "bm:scope:all",
         )]);
         rows.push(vec![markup_button(
@@ -1288,7 +1355,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 .collect(),
             Ok(_) => vec!["BTCUSDT".to_string()],
             Err(e) => {
-                log_line(&format!("3/200 SMA coin list unavailable: {e}"));
+                log_line(&format!("btc_ma coin list unavailable: {e}"));
                 vec!["BTCUSDT".to_string()]
             }
         };
@@ -1326,7 +1393,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             Err(e) => return Self::engine_error_text(&e),
         };
         if py_truthy(status.get("unsupported")) {
-            return "📏 3/200 SMA 크로스 전략\n\
+            return "📏 SMA 크로스 전략 (/btcmacross)\n\
                     지금 /setup 거래소가 업비트라 사용할 수 없습니다. /setup에서 바이낸스(테스트넷 데모 또는 메인넷)를 선택하세요."
                 .to_string();
         }
@@ -1370,7 +1437,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 network_label(network),
                 if has_credentials { "있음" } else { "없음" }
             ),
-            "메인 선물 자동매매: 동작 중 (선물 전략은 하나만 켜짐)".to_string(),
+            "다른 전략: /macross와 동시에 켜지지 않음 (켜면 /macross 신규 진입 OFF)".to_string(),
             format!("종목: {}", scope_text(cfg)),
             format!("진입: {}", entry_mode_text(cfg)),
             format!(
@@ -1472,7 +1539,8 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                         .unwrap_or_default();
                     format!("+{}% @ {lock_price}", format_g(lock_roi))
                 }
-                _ => "아직 없음 (+5% 도달 전)".to_string(),
+                _ if !profit_lock_on(cfg) => "끔".to_string(),
+                _ => format!("아직 없음 (+{}% 도달 전)", lock_start_text(cfg)),
             };
             lines.push(format!("비상손절 {stop_price} · 수익 확보 {lock_desc}"));
         } else {
@@ -1535,7 +1603,10 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         let num = |key: &str| py_n(s.get(key));
         let int = |key: &str| s.get(key).map(|v| py_int_of(Some(v))).unwrap_or(0);
         [
-            format!("📈 3/200 SMA 성과 ({mode} · {network})"),
+            format!(
+                "📈 {} 성과 ({mode} · {network})",
+                strategy_name(status.get("config").unwrap_or(&empty))
+            ),
             format!(
                 "거래 {}회 · 승 {} / 패 {} · 승률 {:.1}%",
                 int("total_trades"),
@@ -1592,6 +1663,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             return "🧾 아직 기록된 판단이 없습니다. (선택한 봉이 마감될 때마다 기록됩니다)"
                 .to_string();
         }
+        let (fast_name, slow_name) = sma_names(&self.config().await);
         let mut lines = vec!["🧾 최근 판단 (최신순)".to_string()];
         for event in &events {
             let kind = event.get("event").and_then(|v| v.as_str()).unwrap_or("");
@@ -1643,7 +1715,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                     } else {
                         let fast = format_g_prec(py_n(event.get("sma_fast")), 8);
                         let slow = format_g_prec(py_n(event.get("sma_slow")), 8);
-                        detail.push_str(&format!(" · SMA3 {fast} / SMA200 {slow}"));
+                        detail.push_str(&format!(" · {fast_name} {fast} / {slow_name} {slow}"));
                     }
                     detail
                 }
@@ -1699,9 +1771,14 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             "• SMA25 손절: 끔 (SMA25 진입 조건도 없음)\n".to_string()
         };
         let lock_lines = if profit_lock_on(cfg) {
+            let after = if cfg_str(cfg, "entry_mode", "") == "trend" {
+                format!("그 코인은 {}", reentry_text(cfg))
+            } else {
+                "다음 크로스까지 대기".to_string()
+            };
             format!(
                 "• 수익 확보(증거금 기준): {} (항상 도달 칸 {gap}% 아래, 한 번 올라간 손절은 내려가지 않음)\n\
-                 • 수익 확보 손절로 청산되면 다음 크로스까지 대기\n",
+                 • 수익 확보 손절로 청산되면 {after}\n",
                 lock_table(cfg),
             )
         } else {
@@ -1709,12 +1786,12 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         };
         format!(
             "📘 {fast}/{slow} SMA 크로스 규칙 (기간은 /btcma 또는 버튼으로 변경)\n\
-             • 종목: {} (TradFi·스테이블코인 제외, 🎯 코인 지정 또는 /macoin SOL 로 1개 지정)\n\
+             • 종목: {} (🎯 코인 지정 또는 /macoin SOL 로 1개 지정)\n\
              • 진입: {}\n\
              • 익절 자동 전환: {}\n\
              • 청산 후 다른 코인 전환: {}\n\
              • 봉: {} 마감봉 기준, 진입·청산(반대 크로스) 모두 같은 봉 (3분~4시간 선택)\n\
-             • 보유 중 반대 크로스(또는 봉 마감 때 SMA3이 반대편): 시장가(reduce-only) 청산 후 즉시 반대 방향 진입\n\
+             • 보유 중 반대 크로스(또는 봉 마감 때 SMA{fast}이 SMA{slow} 반대편): 시장가(reduce-only) 청산 후 즉시 반대 방향 진입 (신규진입 OFF면 청산만)\n\
              {sma25_line}\
              • 크로스 진입 범위: {}\n\
              • 최소 잔고: {}\n\
@@ -1724,7 +1801,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
              • 비상손절: {stop_line} (메뉴에서 선택, 거래소에 Mark 기준으로 걸림)\n\
              • 레버리지 {leverage}배 ISOLATED 선택(2~5배, 다음 진입부터), 가용 증거금의 {margin:.0}% 사용, 계좌 전체 1포지션\n\
              • 🏦 TradFi만: 바이낸스 메인넷 전용 · 미국주식 TradFi + 금만 · 미국 정규장 시간에만 신규 진입\n\
-             • 거래소는 /setup 선택을 따르고, 켜면 다른 선물 자동전략은 멈춤\n\
+             • 거래소는 /setup 선택을 따르고, 켜면 /macross 전략은 신규 진입 OFF\n\
              • 수익을 보장하지 않는 전략입니다.",
             scope_text(cfg),
             entry_mode_text(cfg),
@@ -1772,7 +1849,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             _ => false,
         };
         let note = if holding {
-            "\n(보유 중인 포지션은 진입 당시 기간 기준으로 관리, 다음 진입부터 새 기간 적용)"
+            "\n(보유 중인 포지션도 다음 봉 마감부터 새 기간으로 반대 크로스를 판단 — 그때 패스트가 반대편이면 청산 후 반대 진입)"
         } else {
             ""
         };
@@ -1930,10 +2007,11 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                     "돌파 시 진입"
                 };
                 let body = format!(
-                    "⚠️ 3/200 SMA 크로스 전략을 켤까요?\n\
+                    "⚠️ {} 크로스 전략을 켤까요?\n\
                      모드 {mode_now} · {} (/setup) · {}\n\
                      종목 {} · {entry}\n\
-                     켜면 메인 선물 자동매매와 BTC 눌림목 전략의 신규 진입이 멈춥니다.\n{}",
+                     켜면 /macross 전략의 신규 진입이 OFF 됩니다 (그쪽 보유 포지션 관리는 계속).\n{}",
+                    strategy_name(&cfg),
                     network_label(&network),
                     timeframe_labels(cfg_str(&cfg, "timeframe", "")),
                     scope_text(&cfg),
@@ -1955,10 +2033,12 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 {
                     log_line(&format!("telegram: turn_off_others failed: {e}"));
                 }
-                let note =
-                    "\n메인 선물 자동매매 신규 진입을 일시정지했습니다 (보유 포지션 관리는 계속).";
+                let note = "\n/macross가 켜져 있었다면 신규 진입을 OFF 했습니다 (보유 포지션 관리는 계속).";
                 let status = self.format_status().await;
-                (format!("✅ 3/200 SMA 전략 ON{note}\n\n{status}"), kb!())
+                (
+                    format!("✅ {} 전략 ON{note}\n\n{status}", strategy_name(&cfg)),
+                    kb!(),
+                )
             }
             "off" => {
                 if let Err(e) = self.set_coin_value("enabled", json!(false)).await {
@@ -1971,11 +2051,13 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 )
             }
             "full_off" => (
-                "⚠️ 3/200 SMA 크로스를 완전히 끌까요?
+                format!(
+                    "⚠️ {} 크로스를 완전히 끌까요?
 · 신규 진입 OFF
 · 지금 모드에 이 전략의 포지션이 있으면 시장가(reduce-only)로 청산
-· 끈 뒤 설정·포지션을 다시 읽어 확인"
-                    .to_string(),
+· 끈 뒤 설정·포지션을 다시 읽어 확인",
+                    strategy_name(&cfg)
+                ),
                 kb!(("🛑 완전 끄기 확인", "bm:confirm_full_off")),
             ),
             "adopt" => {
@@ -1996,16 +2078,26 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                     ""
                 };
                 let plock_line = if profit_lock_on(&cfg) {
-                    "· 수익 잠금 (+5%부터 계단식)\n"
+                    format!("· 수익 잠금 (+{}%부터 계단식)\n", lock_start_text(&cfg))
                 } else {
-                    ""
+                    String::new()
                 };
+                let stop = cfg_int(&cfg, "emergency_stop_roi_percent", 0);
+                let stop_line =
+                    if cfg_get(&cfg, "scale_in_enabled").and_then(|v| v.as_bool()) == Some(true) {
+                        format!("· 물타기: {}\n", scale_in_text(&cfg))
+                    } else if stop > 0 {
+                        format!("· 비상손절: 증거금 -{stop}% 주문을 거래소에 걸기\n")
+                    } else {
+                        String::new()
+                    };
+                let (fast_name, slow_name) = sma_names(&cfg);
                 (
                     format!(
                         "🤝 이 포지션을 봇에게 맡길까요?\n{}\n\n\
                          맡기면 봇이 연 포지션처럼 관리합니다:\n\
-                         · SMA200 반대 크로스 → 청산 후 반대 진입\n\
-                         {sma25_line}{plock_line}\
+                         · {fast_name}/{slow_name} 반대 크로스 → 청산 후 반대 진입\n\
+                         {sma25_line}{plock_line}{stop_line}\
                          · 오늘 손익·손실 한도 계산에 포함\n\
                          직접 걸어 둔 TP/SL 주문은 그대로 남습니다.",
                         adopt_summary(&preview)
@@ -2296,11 +2388,11 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 let status = self.format_status().await;
                 let text = if on {
                     format!(
-                        "🧱 SMA25 손절: 켬\n봉 마감 종가가 SMA25 반대편이면 청산하고, 진입도 종가가 SMA25 진입 방향 쪽일 때만 합니다.\n(보유 중인 포지션은 진입할 때 설정 그대로, 다음 진입부터 적용)\n\n{status}"
+                        "🧱 SMA25 손절: 켬\n봉 마감 종가가 SMA25 반대편이면 청산하고, 진입도 종가가 SMA25 진입 방향 쪽일 때만 합니다.\n(진입할 때 SMA25가 꺼져 있던 보유 포지션에는 걸리지 않음, 다음 진입부터 적용)\n\n{status}"
                     )
                 } else {
                     format!(
-                        "🧱 SMA25 손절: 끔\nSMA25 진입 조건과 SMA25 손절을 쓰지 않습니다. 청산은 SMA 반대 크로스·수익 잠금·비상손절로만 합니다.\n(보유 중인 포지션은 진입할 때 설정 그대로, 다음 진입부터 적용)\n\n{status}"
+                        "🧱 SMA25 손절: 끔\nSMA25 진입 조건과 SMA25 손절을 쓰지 않습니다. 청산은 SMA 반대 크로스·수익 잠금·비상손절로만 합니다.\n(보유 중인 포지션도 바로 SMA25 손절이 풀림)\n\n{status}"
                     )
                 };
                 (text, kb!())
@@ -2518,18 +2610,15 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                     }
                 }
                 let cfg_now = self.config().await;
-                let slow_now = cfg_int(&cfg_now, "slow_period", 200);
+                let (fast_name, slow_name) = sma_names(&cfg_now);
                 let note = if holding {
-                    format!(
-                        "\n보유 중 포지션도 다음 봉 마감부터 SMA3/SMA{slow_now} 기준으로 관리합니다. \
-                         그때 SMA3이 반대편에 있으면 반대 방향으로 전환합니다."
-                    )
+                    "\n(보유 중인 포지션도 다음 봉 마감부터 새 기간으로 반대 크로스를 판단 — 그때 패스트가 반대편이면 청산 후 반대 진입)"
                 } else {
-                    String::new()
+                    ""
                 };
                 let status = self.format_status().await;
                 (
-                    format!("📐 기준선: SMA3 / SMA{slow_now}{note}\n\n{status}"),
+                    format!("📐 기준선: {fast_name} / {slow_name}{note}\n\n{status}"),
                     kb!(),
                 )
             }
@@ -2591,7 +2680,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                      버튼 프리셋: {presets}\n\
                      • 패스트는 슬로우보다 작아야 합니다 (1 이상, 슬로우 500 이하).\n\
                      • 보유 중에 바꾸면 다음 진입부터 적용되고, \
-                     보유 포지션은 진입 당시 기간으로 계속 관리됩니다."
+                     보유 포지션도 다음 봉 마감부터 새 기간으로 판단합니다 (그때 패스트가 반대편이면 청산 후 반대 진입)."
                 );
                 (body, kb!())
             }

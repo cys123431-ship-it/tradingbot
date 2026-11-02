@@ -362,8 +362,22 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         self.variant.client_id()
     }
 
-    pub(crate) fn label(&self) -> &'static str {
-        self.variant.label()
+    /// "1/200 SMA" / "3/120 SMA C" from the configured periods.
+    pub(crate) fn label(&self) -> String {
+        let cfg = self.config();
+        let period = |key: &str| {
+            cfg.get(key).and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
+        };
+        match (period("fast_period"), period("slow_period")) {
+            (Some(fast), Some(slow)) => match self.variant {
+                Variant::BtcMa => format!("{fast}/{slow} SMA"),
+                Variant::MaPlus => format!("{fast}/{slow} SMA C"),
+            },
+            _ => self.variant.label().to_string(),
+        }
     }
 
     /// Python tests call `service._universe_cache.clear()` after a config change.

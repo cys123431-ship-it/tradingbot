@@ -67,7 +67,14 @@ pub fn scope_text(cfg: &Value) -> String {
         );
     }
     if scan_scope == "alts" {
-        return format!("🌐 알트 전용 24h 거래대금 상위 {alt_universe_size}개 (BTC 제외)");
+        let btc = if cfg_get(cfg, "alt_exclude_btc").and_then(|v| v.as_bool()) == Some(false) {
+            "BTC 포함"
+        } else {
+            "BTC 제외"
+        };
+        return format!(
+            "🌐 알트 24h 거래대금 상위 {alt_universe_size}개 ({btc}, 스테이블·TradFi 제외, 같은 봉에 여러 코인이 크로스하면 거래대금 1위)"
+        );
     }
     if scan_scope == "single" {
         let symbol = cfg_get(cfg, "single_symbol")
@@ -203,7 +210,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         self.engine.call(cmd, Some(STRATEGY), args).await
     }
 
-    async fn ma_config(&self) -> Value {
+    pub(crate) async fn ma_config(&self) -> Value {
         match self.ma_call("config_get", json!({})).await {
             Ok(v @ Value::Object(_)) => v,
             Ok(_) => Value::Object(Map::new()),
@@ -334,10 +341,14 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             .collect();
         rows.push(lev_buttons);
         let scan_scope = cfg_str(cfg, "scan_scope", "");
+        let alt_size = match cfg_int_of(cfg, "alt_universe_size") {
+            0 => 50,
+            n => n,
+        };
         rows.push(vec![
             markup_button(mark(scan_scope == "btc", "🪙 BTC만"), "mc:scope:btc"),
             markup_button(
-                mark(scan_scope == "alts", "🌐 알트 상위50"),
+                mark(scan_scope == "alts", &format!("🌐 알트 상위{alt_size}")),
                 "mc:scope:alts",
             ),
         ]);
@@ -480,7 +491,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 );
             }
             let body = format!(
-                "⚠️ /macross 전략을 켤까요?\n모드: {} · {} · 기능 {}\n켜면 다른 선물 전략(3/200 SMA, BTC 눌림목)의 신규 진입이 OFF 됩니다.",
+                "⚠️ /macross 전략을 켤까요?\n모드: {} · {} · 기능 {}\n켜면 /btcmacross 전략의 신규 진입이 OFF 됩니다 (그쪽 보유 포지션 관리는 계속).",
                 cfg_str(&cfg, "trading_mode", ""),
                 timeframe_label(cfg_str(&cfg, "timeframe", "")),
                 feature_mode(&cfg)
@@ -503,7 +514,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             }
             let status = self.ma_status_text().await;
             return (
-                format!("✅ /macross ON — 다른 선물 전략은 OFF 했습니다.\n\n{status}"),
+                format!("✅ /macross ON — /btcmacross가 켜져 있었다면 신규 진입을 OFF 했습니다.\n\n{status}"),
                 keyboard!(),
             );
         }
@@ -638,7 +649,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             let fast = cfg_int_of(&cfg, "fast_period");
             let slow = cfg_int_of(&cfg, "slow_period");
             let body = format!(
-                "✏️ SMA 기간 직접 입력\n지금: {}\n\n명령: /map <패스트> <슬로우>  (또는 /maperiod)\n예) /map 1 200 → 패스트 1, 슬로우 200\n예) /map 5 60 → 패스트 5, 슬로우 60\n\n버튼 프리셋: {presets}\n• 패스트는 슬로우보다 작아야 합니다 (1 이상, 슬로우 500 이하).\n• 보유 중에 바꾸면 다음 진입부터 적용되고, 보유 포지션은 진입 당시 기간으로 계속 관리됩니다.\n• 이 전략의 백테스트 최적 조합은 3/120입니다.",
+                "✏️ SMA 기간 직접 입력\n지금: {}\n\n명령: /map <패스트> <슬로우>  (또는 /maperiod)\n예) /map 1 200 → 패스트 1, 슬로우 200\n예) /map 5 60 → 패스트 5, 슬로우 60\n\n버튼 프리셋: {presets}\n• 패스트는 슬로우보다 작아야 합니다 (1 이상, 슬로우 500 이하).\n• 보유 중에 바꾸면 보유 포지션도 다음 봉 마감부터 새 기간으로 판단합니다 (그때 패스트가 반대편이면 청산 후 반대 진입).\n• 이 전략의 백테스트 최적 조합은 3/120입니다.",
                 periods_label(fast, slow)
             );
             return (body, keyboard!());
@@ -741,7 +752,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             }
         }
         let mut note = if holding {
-            "\n(보유 중인 포지션은 진입 당시 기간 기준으로 관리, 다음 진입부터 새 기간 적용)"
+            "\n(보유 중인 포지션도 다음 봉 마감부터 새 기간으로 반대 크로스를 판단 — 그때 패스트가 반대편이면 청산 후 반대 진입)"
                 .to_string()
         } else {
             String::new()
@@ -812,7 +823,15 @@ async fn ma_status_text<A: EngineApi + 'static>(cfg: &Value, bot: &TelegramBot<A
             timeframe_label(timeframe)
         ),
         format!("기능: {}", feature_summary(cfg)),
-        "청산: 반대 크로스 시 종료 · 수익잠금 +5%→+4% 계단 · 비상손절 OFF".to_string(),
+        {
+            let start = py_n(cfg_get(cfg, "lock_start_roi_percent"));
+            let gap = py_n(cfg_get(cfg, "lock_gap_percent"));
+            format!(
+                "청산: 반대 크로스 시 종료 · 수익잠금 +{}%→+{}% 계단 · 비상손절 OFF",
+                format_g(start),
+                format_g(start - gap)
+            )
+        },
         format!("레버리지: {leverage}x ISOLATED · 증거금: 가용 잔고 {margin_pct:.0}%"),
         format!("종목: {}", scope_text(cfg)),
     ];

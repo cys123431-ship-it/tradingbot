@@ -557,13 +557,14 @@ impl<E: FuturesExchange + 'static> Engine<E> {
     /// Another futures strategy took over: switch the others OFF.
     async fn turn_off_others(&self, except_key: &str) -> Result<Value, String> {
         let strategies = [
-            ("btc_ma_cross", "3/200 SMA", "/btcmacross"),
-            ("ma_cross", "SMA3/120 C", "/macross"),
+            ("btc_ma_cross", "/btcmacross", ""),
+            ("ma_cross", "/macross", " C"),
         ];
-        for (key, label, command) in strategies {
+        for (key, command, suffix) in strategies {
             if key == except_key {
                 continue;
             }
+            let label = self.sma_label(key, suffix);
             let enabled = self
                 .cfg
                 .section(key)
@@ -605,12 +606,32 @@ impl<E: FuturesExchange + 'static> Engine<E> {
         }
     }
 
+    /// "1/200 SMA" (+ suffix) from a strategy section's configured periods.
+    fn sma_label(&self, section: &str, suffix: &str) -> String {
+        let cfg = self.cfg.section(section);
+        let default_slow = if section == "ma_cross" { 120 } else { 200 };
+        let period = |key: &str, default: i64| {
+            cfg.get(key)
+                .and_then(|v| {
+                    v.as_i64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                })
+                .unwrap_or(default)
+        };
+        format!(
+            "{}/{} SMA{suffix}",
+            period("fast_period", 3),
+            period("slow_period", default_slow)
+        )
+    }
+
     async fn emergency_stop(&self) -> Result<Value, String> {
         let mut lines: Vec<String> = Vec::new();
-        for (label, service, section) in [
-            ("3/200 SMA", &self.btc_ma, "btc_ma_cross"),
-            ("SMA3/120 C", &self.ma_plus, "ma_cross"),
+        for (suffix, service, section) in [
+            ("", &self.btc_ma, "btc_ma_cross"),
+            (" C", &self.ma_plus, "ma_cross"),
         ] {
+            let label = self.sma_label(section, suffix);
             let was_on = self
                 .cfg
                 .section(section)

@@ -1744,8 +1744,31 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         let entry_price = get_str(trade, "entry_price");
         let margin = get_num(trade, "margin_used");
         let leverage = get(trade, "leverage").cloned().unwrap_or(Value::Null);
+        let cfg = self.config();
+        let lock_on = cfg
+            .get("profit_lock_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let mut lock = if lock_on {
+            let start = cfg
+                .get("lock_start_roi_percent")
+                .and_then(|v| {
+                    v.as_f64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                })
+                .unwrap_or(5.0);
+            format!("증거금 +{} 도달 시 수익 확보 손절 시작", fmt_g(start) + "%")
+        } else {
+            "수익 확보 끔".to_string()
+        };
+        if get(trade, "scale_in")
+            .map(|v| py_truthy(Some(v)))
+            .unwrap_or(false)
+        {
+            lock.push_str(" · 물타기 켬");
+        }
         Ok(format!(
-            "📈 {} 진입 ({tag} · {network} · {timeframe} · SMA{}/{} · {kind})\n{market} {side} {quantity} {base} @ {entry_price} · 증거금 {} USDT x{}\n{stop} · 증거금 +5% 도달 시 수익 확보 손절 시작",
+            "📈 {} 진입 ({tag} · {network} · {timeframe} · SMA{}/{} · {kind})\n{market} {side} {quantity} {base} @ {entry_price} · 증거금 {} USDT x{}\n{stop} · {lock}",
             self.label(),
             str_of(&fast),
             str_of(&slow),
