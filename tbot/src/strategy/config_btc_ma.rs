@@ -27,6 +27,10 @@ pub const LEVERAGE_CHOICES: &[i64] = &[2, 3, 4, 5];
 pub const DEFAULT_LEVERAGE: i64 = 5;
 /// Fixed stop line: close beyond SMA25 against the position exits it.
 pub const STOP_MA_PERIOD: i64 = 25;
+/// SMA25 stop on (25) / off (0).
+pub const STOP_MA_CHOICES: &[i64] = &[25, 0];
+/// Margin per entry in % of the available balance (Telegram buttons).
+pub const MARGIN_FRACTION_CHOICES: &[i64] = &[10, 20, 30, 50];
 /// LIVE: at or below this wallet balance (USDT) the strategy turns itself OFF
 /// before a new entry. 0 = off.
 pub const MIN_BALANCE_CHOICES: &[i64] = &[0, 60, 70, 80, 90, 100];
@@ -68,6 +72,8 @@ pub fn default_btc_ma_cross_config() -> Value {
         "lock_start_roi_percent": "5",
         "lock_step_percent": "5",
         "lock_gap_percent": "1",
+        "profit_lock_enabled": true,
+        "scale_in_enabled": false,
         "stop_ma_period": STOP_MA_PERIOD,
         "cross_lookback_bars": 1,
         "min_balance_usdt": DEFAULT_MIN_BALANCE,
@@ -318,7 +324,15 @@ pub fn normalize_btc_ma_cross_config(raw: Option<&Value>) -> Value {
     let lock_start_float = lock_start.parse::<f64>().unwrap_or(5.0);
     let lock_gap = py_decimal_text(cfg_obj.get("lock_gap_percent"), 1.0, 0.1, lock_start_float);
     cfg_obj.insert("lock_gap_percent".into(), Value::String(lock_gap));
-    cfg_obj.insert("stop_ma_period".into(), json!(STOP_MA_PERIOD));
+    let stop_ma = match cfg_obj.get("stop_ma_period").and_then(int_of_value) {
+        Some(0) => 0,
+        _ => STOP_MA_PERIOD,
+    };
+    cfg_obj.insert("stop_ma_period".into(), json!(stop_ma));
+    let profit_lock = py_bool(cfg_obj.get("profit_lock_enabled"), true);
+    cfg_obj.insert("profit_lock_enabled".into(), Value::Bool(profit_lock));
+    let scale_in = py_bool(cfg_obj.get("scale_in_enabled"), false);
+    cfg_obj.insert("scale_in_enabled".into(), Value::Bool(scale_in));
     // 1 = cross on the last closed bar only; 2 = also the bar before it.
     let lookback =
         crate::strategy::config_base::py_int(cfg_obj.get("cross_lookback_bars"), 1, 1, 2);

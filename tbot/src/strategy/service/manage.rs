@@ -7,16 +7,19 @@ use rust_decimal::Decimal;
 use serde_json::{json, Map, Value};
 
 use crate::core::candles::timeframe_ms;
-use crate::core::rules::{round_price_to_tick, TradingRules};
-use crate::core::sma_cross::{profit_lock_target, CrossResult};
+use crate::core::rules::{floor_to_step, round_price_to_tick, TradingRules};
+use crate::core::sma_cross::{
+    profit_lock_target, scale_in_fraction, scale_in_stop_price, CrossResult, SCALE_IN_STEPS,
+};
 use crate::exchange::{ExchangeError, FuturesExchange};
-use crate::safety::order_gateway::ReduceOnlyCloseRequest;
+use crate::safety::order_gateway::{PositionAddRequest, ReduceOnlyCloseRequest};
 use crate::store::order_state::{OrderIntent, OrderState};
 use crate::strategy::config_base::TRADING_MODE_DRY_RUN;
 use crate::strategy::service::base::py_truthy;
 use crate::strategy::service::{
-    py_f, symbol_pair, ServiceError, SmaCrossService, CCXT_SYMBOL, ERROR_RECOVERY, IDLE, MARKET_ID,
-    POSITION_OPEN, PROFIT_LOCK_EXIT_REASON, PROTECTION_FAILED, PROTECTION_ORDERS_SUBMITTED,
+    position_entry, position_qty, py_f, symbol_pair, ServiceError, SmaCrossService, CCXT_SYMBOL,
+    ERROR_RECOVERY, IDLE, MARKET_ID, POSITION_OPEN, PROFIT_LOCK_EXIT_REASON, PROTECTION_FAILED,
+    PROTECTION_ORDERS_SUBMITTED,
 };
 
 // Re-exported helper used by the service (from trading.rs).
@@ -153,6 +156,528 @@ fn starts_with_any(text: &str, prefixes: &[&str]) -> bool {
 }
 
 impl<E: FuturesExchange + 'static> SmaCrossService<E> {
+    /// `(done, fraction)` when a scale-in add is due at this closed bar.
+    fn scale_in_due(
+        &self,
+        cfg: &Value,
+        trade: &Map<String, Value>,
+        signal: &Value,
+    ) -> Option<(usize, f64)> {
+        if !cfg
+            .get("scale_in_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        if !py_truthy(get(trade, "scale_in")) {
+            return None;
+        }
+        if signal
+            .get("stale")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        let bar_open = signal
+            .get("bar_open_ms")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        if bar_open <= get_int(trade, "signal_bar_ms") {
+            return None;
+        }
+        let side = get_str(trade, "side");
+        if signal.get("trend_side").and_then(|v| v.as_str()) != Some(side.as_str()) {
+            return None;
+        }
+        if !get_str(trade, "lock_price").is_empty() {
+            return None;
+        }
+        let close = py_f(signal.get("close"), 0.0);
+        if close <= 0.0 {
+            return None;
+        }
+        let first_entry = get_num(trade, "first_entry_price");
+        if first_entry <= 0.0 {
+            return None;
+        }
+        let leverage = get_num(trade, "leverage");
+        let done = get_int(trade, "scale_in_count").max(0) as usize;
+        let fraction = scale_in_fraction(&side, first_entry, close, leverage, done)?;
+        Some((done, fraction))
+    }
+
+    /// Quantity to add for `fraction` of the first quantity, or `None` below the minimums.
+    fn scale_in_qty(
+        trade: &Map<String, Value>,
+        rules: &TradingRules,
+        fraction: f64,
+        price: f64,
+    ) -> Option<Decimal> {
+        let first_qty = get_num(trade, "first_quantity");
+        let raw = crate::store::ledger::py_float_repr(first_qty * fraction);
+        let step = rules.effective_step().to_string();
+        let qty = floor_to_step(&raw, &step).ok()?;
+        if qty < rules.effective_min_qty() {
+            return None;
+        }
+        let price_dec = Decimal::from_f64_retain(price)?;
+        if qty * price_dec < rules.min_notional {
+            return None;
+        }
+        Some(qty)
+    }
+
+    async fn scale_in_live(
+        &self,
+        network: &str,
+        cfg: &Value,
+        state: &mut Map<String, Value>,
+        signal: &Value,
+    ) -> Result<Option<Value>, ServiceError> {
+        let mut trade = state
+            .get("trade")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let Some((done, fraction)) = self.scale_in_due(cfg, &trade, signal) else {
+            return Ok(None);
+        };
+        let side = get_str(&trade, "side");
+        let bar_open_ms = signal
+            .get("bar_open_ms")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let close = py_f(signal.get("close"), 0.0);
+        let (ccxt_symbol, market) = symbol_pair(Some(&Value::Object(trade.clone())));
+        let rules = self.trading_rules(network, cfg, &market).await?;
+        let qty_add = match Self::scale_in_qty(&trade, &rules, fraction, close) {
+            Some(q) => q,
+            None => {
+                trade.insert("scale_in_count".to_string(), json!(done + 1));
+                let mut fields = Map::new();
+                fields.insert("network".to_string(), Value::String(network.to_string()));
+                fields.insert("symbol".to_string(), Value::String(ccxt_symbol.clone()));
+                fields.insert("leg".to_string(), json!(done + 1));
+                fields.insert(
+                    "reason".to_string(),
+                    Value::String("BELOW_EXCHANGE_MINIMUM".to_string()),
+                );
+                self.ledger(network)?
+                    .lock()
+                    .unwrap()
+                    .event("SCALE_IN_SKIP", fields);
+                state.insert("trade".to_string(), Value::Object(trade));
+                self.save_state(network, TRADING_MODE_LIVE, state)?;
+                self.notify(
+                    format!(
+                        "➕ {} {market}: 물타기 {}/{} 건너뜀 — 최소 주문 수량 미달",
+                        self.label(),
+                        done + 1,
+                        SCALE_IN_STEPS.len()
+                    ),
+                    None,
+                )
+                .await;
+                return Ok(None);
+            }
+        };
+        trade.insert("scale_in_count".to_string(), json!(done + 1));
+        state.insert("trade".to_string(), Value::Object(trade.clone()));
+        self.save_state(network, TRADING_MODE_LIVE, state)?;
+        let (gateway, _) = self.gateway(network).await?;
+        let qty_f = qty_add.to_string().parse::<f64>().unwrap_or(0.0);
+        let submit = gateway
+            .submit_position_add(PositionAddRequest {
+                strategy: self.client_id().to_string(),
+                symbol: ccxt_symbol.clone(),
+                side: side.to_lowercase(),
+                signal_timestamp: json!(bar_open_ms),
+                leg: (done + 1) as i64,
+                qty: qty_f,
+            })
+            .await?;
+        let mut fields = Map::new();
+        fields.insert("network".to_string(), Value::String(network.to_string()));
+        fields.insert("symbol".to_string(), Value::String(ccxt_symbol.clone()));
+        fields.insert("leg".to_string(), json!(done + 1));
+        fields.insert("qty".to_string(), Value::String(qty_add.to_string()));
+        fields.insert("state".to_string(), Value::String(submit.state.clone()));
+        fields.insert(
+            "error".to_string(),
+            submit
+                .error
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        self.ledger(network)?
+            .lock()
+            .unwrap()
+            .event("SCALE_IN_ORDER", fields);
+        trade.insert(
+            "scale_in_pending_cid".to_string(),
+            Value::String(submit.client_order_id.clone()),
+        );
+        trade.insert("scale_in_sync_pending".to_string(), json!(true));
+        trade.insert(
+            "scale_in_last_qty".to_string(),
+            Value::String(qty_add.to_string()),
+        );
+        state.insert("trade".to_string(), Value::Object(trade));
+        self.save_state(network, TRADING_MODE_LIVE, state)?;
+        self.scale_in_sync(network, cfg, state).await
+    }
+
+    async fn scale_in_sync(
+        &self,
+        network: &str,
+        cfg: &Value,
+        state: &mut Map<String, Value>,
+    ) -> Result<Option<Value>, ServiceError> {
+        let mode = TRADING_MODE_LIVE;
+        let mut trade = state
+            .get("trade")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let (ccxt_symbol, market) = symbol_pair(Some(&Value::Object(trade.clone())));
+        let position = match self.fetch_position(network, &ccxt_symbol).await {
+            Ok(v) => v,
+            Err(exc) => {
+                let mut fields = Map::new();
+                fields.insert("network".to_string(), Value::String(network.to_string()));
+                fields.insert("error".to_string(), Value::String(exc.to_string()));
+                self.ledger(network)?
+                    .lock()
+                    .unwrap()
+                    .event("POSITION_FETCH_FAILED", fields);
+                return Ok(None);
+            }
+        };
+        let Some(p) = position else {
+            return Ok(None);
+        };
+        let qty_pos = position_qty(Some(&p));
+        let avg = position_entry(Some(&p));
+        trade.insert("scale_in_sync_pending".to_string(), json!(false));
+        if qty_pos <= get_num(&trade, "quantity") + 1e-12 {
+            state.insert("trade".to_string(), Value::Object(trade.clone()));
+            self.save_state(network, mode, state)?;
+            let cid = get_str(&trade, "scale_in_pending_cid");
+            self.notify(
+                format!(
+                    "⚠️ {} {market}: 물타기 주문이 체결되지 않았습니다 ({})",
+                    self.label(),
+                    cid
+                ),
+                None,
+            )
+            .await;
+            return Ok(None);
+        }
+        let side = get_str(&trade, "side");
+        let leverage = get_num(&trade, "leverage");
+        trade.insert(
+            "quantity".to_string(),
+            Value::String(crate::store::ledger::py_float_repr(qty_pos)),
+        );
+        if avg > 0.0 {
+            trade.insert(
+                "entry_price".to_string(),
+                Value::String(crate::store::ledger::py_float_repr(avg)),
+            );
+        }
+        let entry_num = get_num(&trade, "entry_price");
+        trade.insert(
+            "margin_used".to_string(),
+            Value::String(crate::store::ledger::py_float_repr(
+                entry_num * qty_pos / leverage,
+            )),
+        );
+        let cid = get_str(&trade, "scale_in_pending_cid");
+        if !cid.is_empty() {
+            let store = self.store(network)?;
+            // Only a filled add record becomes PROTECTED; others wait for reconciliation.
+            let filled = {
+                let guard = store.lock().unwrap();
+                guard
+                    .get(&cid)
+                    .map_err(|e| ServiceError::new("StoreError", e.to_string()))?
+                    .is_some_and(|r| {
+                        r.order_state == OrderState::FilledUnverifiedLiquidation.as_str()
+                    })
+            };
+            if filled {
+                let mut guard = store.lock().unwrap();
+                guard
+                    .transition(&cid, OrderState::Protected.as_str(), Map::new())
+                    .map_err(|e| ServiceError::new("StoreError", e.to_string()))?;
+            }
+        }
+        let first_entry = get_num(&trade, "first_entry_price");
+        let first_qty = get_num(&trade, "first_quantity");
+        let loss_roi = get_num(&trade, "scale_in_loss_roi");
+        let new_stop = scale_in_stop_price(
+            &side,
+            entry_num,
+            qty_pos,
+            first_entry,
+            first_qty,
+            leverage,
+            loss_roi,
+        );
+        if let Some(stop) = new_stop {
+            let tick = get_str(&trade, "tick_size");
+            let tick = if tick.is_empty() {
+                "0.1".to_string()
+            } else {
+                tick
+            };
+            let direction = if side == "LONG" { "up" } else { "down" };
+            let rounded =
+                round_price_to_tick(&crate::store::ledger::py_float_repr(stop), &tick, direction)
+                    .map_err(|e| ServiceError::new("TradingRulesError", e.to_string()))?;
+            let stop_text = rounded.to_string();
+            if stop_text != get_str(&trade, "stop_price") {
+                let old_id = get_str(&trade, "sl_client_algo_id");
+                if !old_id.is_empty() {
+                    if let Err(exc) = self.cancel_algo(network, &old_id).await {
+                        let mut fields = Map::new();
+                        fields.insert("network".to_string(), Value::String(network.to_string()));
+                        fields.insert("id".to_string(), Value::String(old_id.clone()));
+                        fields.insert("error".to_string(), Value::String(exc.to_string()));
+                        self.ledger(network)?
+                            .lock()
+                            .unwrap()
+                            .event("CANCEL_FAILED", fields);
+                        state.insert("trade".to_string(), Value::Object(trade));
+                        return Ok(Some(
+                            self.failsafe_close(network, cfg, state, "SCALE_IN_SL_CANCEL_FAILED")
+                                .await?,
+                        ));
+                    }
+                }
+                let rev = get_int(&trade, "sl_revision") + 1;
+                trade.insert("sl_revision".to_string(), json!(rev));
+                trade.insert("stop_price".to_string(), Value::String(stop_text.clone()));
+                let result = self
+                    .place_protection(network, cfg, &mut trade, "sl")
+                    .await?;
+                let mut fields = Map::new();
+                fields.insert("network".to_string(), Value::String(network.to_string()));
+                fields.insert("kind".to_string(), Value::String("sl".to_string()));
+                fields.insert("result".to_string(), Value::String(result.clone()));
+                fields.insert("trigger".to_string(), Value::String(stop_text));
+                self.ledger(network)?
+                    .lock()
+                    .unwrap()
+                    .event("PROTECTION", fields);
+                if result != "OK" {
+                    state.insert("trade".to_string(), Value::Object(trade));
+                    return Ok(Some(
+                        self.failsafe_close(network, cfg, state, &format!("SL_{result}"))
+                            .await?,
+                    ));
+                }
+            }
+        }
+        self.ledger(network)?
+            .lock()
+            .unwrap()
+            .upsert_trade(&trade)
+            .map_err(|e| ServiceError::new("StoreError", e.to_string()))?;
+        state.insert("trade".to_string(), Value::Object(trade.clone()));
+        self.save_state(network, mode, state)?;
+        let count = get_int(&trade, "scale_in_count");
+        let last_qty = get_str(&trade, "scale_in_last_qty");
+        let quantity = get_str(&trade, "quantity");
+        let entry_price = get_str(&trade, "entry_price");
+        let stop_price = get_str(&trade, "stop_price");
+        self.notify(
+            format!(
+                "➕ {} {market} 물타기 {}/{}: +{} → 수량 {} · 평단 {}\n손절 {} (첫 증거금 -{}%)",
+                self.label(),
+                count,
+                SCALE_IN_STEPS.len(),
+                last_qty,
+                quantity,
+                entry_price,
+                stop_price,
+                fmt_g(loss_roi)
+            ),
+            None,
+        )
+        .await;
+        Ok(None)
+    }
+
+    async fn scale_in_paper(
+        &self,
+        network: &str,
+        cfg: &Value,
+        state: &mut Map<String, Value>,
+        signal: &Value,
+    ) -> Result<(), ServiceError> {
+        let mut trade = state
+            .get("trade")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let Some((done, fraction)) = self.scale_in_due(cfg, &trade, signal) else {
+            return Ok(());
+        };
+        let side = get_str(&trade, "side");
+        let long = side == "LONG";
+        let close = py_f(signal.get("close"), 0.0);
+        let (ccxt_symbol, market) = symbol_pair(Some(&Value::Object(trade.clone())));
+        let rules = self.trading_rules(network, cfg, &market).await?;
+        let qty_add = match Self::scale_in_qty(&trade, &rules, fraction, close) {
+            Some(q) => q,
+            None => {
+                trade.insert("scale_in_count".to_string(), json!(done + 1));
+                let mut fields = Map::new();
+                fields.insert("network".to_string(), Value::String(network.to_string()));
+                fields.insert("dry_run".to_string(), json!(true));
+                fields.insert("symbol".to_string(), Value::String(ccxt_symbol.clone()));
+                fields.insert("leg".to_string(), json!(done + 1));
+                fields.insert(
+                    "reason".to_string(),
+                    Value::String("BELOW_EXCHANGE_MINIMUM".to_string()),
+                );
+                self.ledger(network)?
+                    .lock()
+                    .unwrap()
+                    .event("SCALE_IN_SKIP", fields);
+                state.insert("trade".to_string(), Value::Object(trade));
+                self.save_state(network, TRADING_MODE_DRY_RUN, state)?;
+                self.notify(
+                    format!(
+                        "➕ {} {market}: 물타기 {}/{} 건너뜀 — 최소 주문 수량 미달",
+                        self.label(),
+                        done + 1,
+                        SCALE_IN_STEPS.len()
+                    ),
+                    None,
+                )
+                .await;
+                return Ok(());
+            }
+        };
+        let qty_f = qty_add.to_string().parse::<f64>().unwrap_or(0.0);
+        let mut price = match self.premium_index(network, &market).await {
+            Ok(map) => py_f(map.get("mark_price"), 0.0),
+            Err(_) => close,
+        };
+        if price <= 0.0 {
+            price = close;
+        }
+        let slip = py_f(cfg.get("slippage_buffer_pct"), 0.0);
+        let price = if long {
+            price * (1.0 + slip)
+        } else {
+            price * (1.0 - slip)
+        };
+        let q = get_num(&trade, "quantity");
+        let a = get_num(&trade, "entry_price");
+        let new_qty = q + qty_f;
+        let new_avg = if new_qty > 0.0 {
+            (q * a + qty_f * price) / new_qty
+        } else {
+            a
+        };
+        let leverage = get_num(&trade, "leverage");
+        trade.insert(
+            "quantity".to_string(),
+            Value::String(crate::store::ledger::py_float_repr(new_qty)),
+        );
+        trade.insert(
+            "entry_price".to_string(),
+            Value::String(crate::store::ledger::py_float_repr(new_avg)),
+        );
+        trade.insert(
+            "margin_used".to_string(),
+            Value::String(crate::store::ledger::py_float_repr(
+                new_avg * new_qty / leverage,
+            )),
+        );
+        trade.insert("scale_in_count".to_string(), json!(done + 1));
+        let first_entry = get_num(&trade, "first_entry_price");
+        let first_qty = get_num(&trade, "first_quantity");
+        let loss_roi = get_num(&trade, "scale_in_loss_roi");
+        if let Some(stop) = scale_in_stop_price(
+            &side,
+            new_avg,
+            new_qty,
+            first_entry,
+            first_qty,
+            leverage,
+            loss_roi,
+        ) {
+            let tick = get_str(&trade, "tick_size");
+            let tick = if tick.is_empty() {
+                "0.1".to_string()
+            } else {
+                tick
+            };
+            let direction = if long { "up" } else { "down" };
+            let rounded =
+                round_price_to_tick(&crate::store::ledger::py_float_repr(stop), &tick, direction)
+                    .map_err(|e| ServiceError::new("TradingRulesError", e.to_string()))?;
+            trade.insert("stop_price".to_string(), Value::String(rounded.to_string()));
+        }
+        self.ledger(network)?
+            .lock()
+            .unwrap()
+            .upsert_trade(&trade)
+            .map_err(|e| ServiceError::new("StoreError", e.to_string()))?;
+        let mut fields = Map::new();
+        fields.insert(
+            "mode".to_string(),
+            Value::String(TRADING_MODE_DRY_RUN.to_string()),
+        );
+        fields.insert("network".to_string(), Value::String(network.to_string()));
+        fields.insert("dry_run".to_string(), json!(true));
+        fields.insert("symbol".to_string(), Value::String(ccxt_symbol.clone()));
+        fields.insert("leg".to_string(), json!(done + 1));
+        fields.insert("qty".to_string(), Value::String(qty_add.to_string()));
+        fields.insert(
+            "price".to_string(),
+            Value::String(crate::store::ledger::py_float_repr(price)),
+        );
+        fields.insert(
+            "avg".to_string(),
+            Value::String(crate::store::ledger::py_float_repr(new_avg)),
+        );
+        self.ledger(network)?
+            .lock()
+            .unwrap()
+            .event("SCALE_IN", fields);
+        state.insert("trade".to_string(), Value::Object(trade.clone()));
+        self.save_state(network, TRADING_MODE_DRY_RUN, state)?;
+        let count = get_int(&trade, "scale_in_count");
+        let quantity = get_str(&trade, "quantity");
+        let entry_price = get_str(&trade, "entry_price");
+        let stop_price = get_str(&trade, "stop_price");
+        self.notify(
+            format!(
+                "➕ {} {market} 물타기 {}/{}: +{} → 수량 {} · 평단 {}\n손절 {} (첫 증거금 -{}%)",
+                self.label(),
+                count,
+                SCALE_IN_STEPS.len(),
+                qty_add,
+                quantity,
+                entry_price,
+                stop_price,
+                fmt_g(loss_roi)
+            ),
+            None,
+        )
+        .await;
+        Ok(())
+    }
+
     // ---------------------------------------------------------- protection
     pub(crate) fn protection_spec(
         &self,
@@ -409,6 +934,14 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             "best_price".to_string(),
             Value::String(crate::store::ledger::py_float_repr(best)),
         );
+        // Profit lock switched off: keep tracking best_price, place no lock.
+        if !cfg
+            .get("profit_lock_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+        {
+            return Ok(None);
+        }
         let leverage = get_num(trade, "leverage");
         let start_roi = py_f(cfg.get("lock_start_roi_percent"), 0.0);
         let step = py_f(cfg.get("lock_step_percent"), 0.0);
@@ -724,6 +1257,14 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
                 .close_live(network, cfg, state, "stop_ma", STOP_MA_EXIT)
                 .await;
         }
+        if get(&trade, "scale_in_sync_pending")
+            .map(|v| py_truthy(Some(v)))
+            .unwrap_or(false)
+        {
+            if let Some(v) = self.scale_in_sync(network, cfg, state).await? {
+                return Ok(v);
+            }
+        }
         let (signal, _) = self
             .evaluate_new_bar(network, cfg, mode, state, Some(&trade))
             .await?;
@@ -744,6 +1285,16 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             return self
                 .close_live(network, cfg, state, "stop_ma", STOP_MA_EXIT)
                 .await;
+        }
+        if let Some(sig) = signal.as_ref() {
+            if let Some(v) = self.scale_in_live(network, cfg, state, sig).await? {
+                return Ok(v);
+            }
+            trade = state
+                .get("trade")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
         }
         let mark = match self.premium_index(network, &market).await {
             Ok(map) => py_f(map.get("mark_price"), 0.0),
@@ -1134,6 +1685,9 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
                 .enter_on_signal(network, cfg, mode, &mut state, &sig)
                 .await?;
             return Ok(json!({"action": "reversed", "entry": entered}));
+        }
+        if let Some(sig) = raw_signal.as_ref() {
+            self.scale_in_paper(network, cfg, state, sig).await?;
         }
         Ok(json!({"action": "managed"}))
     }

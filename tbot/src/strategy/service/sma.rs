@@ -2477,7 +2477,16 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         let leverage = int_or_zero(cfg.get("leverage"));
         let (ccxt_symbol, market_id) = symbol_pair(Some(signal));
         let side = signal.get("side").and_then(|v| v.as_str()).unwrap_or("");
+        let scale_in = cfg
+            .get("scale_in_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let emergency_roi = py_f(cfg.get("emergency_stop_roi_percent"), 0.0);
+        let emergency_roi = if scale_in {
+            crate::core::sma_cross::scale_in_loss_roi(emergency_roi)
+        } else {
+            emergency_roi
+        };
         let stop = crate::core::sma_cross::emergency_stop_price(
             side,
             dec_to_f64(entry),
@@ -2557,6 +2566,17 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
                 .cloned()
                 .unwrap_or(Value::Null),
         );
+        if scale_in {
+            trade.insert("emergency_stop_roi".to_string(), json!(emergency_roi));
+            trade.insert("scale_in".to_string(), json!(true));
+            trade.insert(
+                "first_entry_price".to_string(),
+                Value::String(entry.to_string()),
+            );
+            trade.insert("first_quantity".to_string(), Value::String(qty.to_string()));
+            trade.insert("scale_in_count".to_string(), json!(0));
+            trade.insert("scale_in_loss_roi".to_string(), json!(emergency_roi));
+        }
         trade.insert("best_price".to_string(), Value::String(entry.to_string()));
         trade.insert("lock_roi".to_string(), Value::String(String::new()));
         trade.insert("lock_price".to_string(), Value::String(String::new()));

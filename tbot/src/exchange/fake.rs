@@ -515,10 +515,45 @@ impl FuturesExchange for FakeBinance {
         } else {
             let filled = (amount * state.fill_ratio * 1_000_000.0).round() / 1_000_000.0;
             let pos_side = if side == "buy" { "long" } else { "short" };
+            let mark = state.mark;
+            // Same side already open: average in.
+            let same_side = state
+                .position
+                .as_ref()
+                .map(|p| {
+                    p.get("side")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s == pos_side)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            let (contracts, entry_price) = if same_side {
+                let old_contracts = state
+                    .position
+                    .as_ref()
+                    .and_then(|p| p.get("contracts"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let old_entry = state
+                    .position
+                    .as_ref()
+                    .and_then(|p| p.get("entryPrice"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let total = old_contracts + filled;
+                let avg = if total > 0.0 {
+                    (old_contracts * old_entry + filled * mark) / total
+                } else {
+                    mark
+                };
+                (total, avg)
+            } else {
+                (filled, mark)
+            };
             state.position = Some(json!({
                 "side": pos_side,
-                "contracts": filled,
-                "entryPrice": state.mark
+                "contracts": contracts,
+                "entryPrice": entry_price
             }));
             let status = if state.fill_ratio >= 1.0 {
                 "closed"

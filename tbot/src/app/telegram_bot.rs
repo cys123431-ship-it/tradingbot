@@ -18,12 +18,15 @@ use crate::core::periods::{
 const CONFIG_KEY: &str = "btc_ma_cross";
 const STRATEGY: &str = "btc_ma";
 const DEFAULT_PROFIT_LOCK_SWITCH_COUNT: i64 = 3;
+
+use crate::core::sma_cross::{scale_in_loss_roi, SCALE_IN_STEPS};
 const PICK_LIST_SIZE: usize = 12;
 
 pub const TIMEFRAMES: &[&str] = &["3m", "5m", "15m", "30m", "1h", "2h", "4h"];
 pub const LEVERAGE_CHOICES: &[i64] = &[2, 3, 4, 5];
 use crate::strategy::config_btc_ma::{
-    DAILY_LOSS_LIMIT_CHOICES, LOSS_STREAK_CHOICES, MIN_BALANCE_CHOICES,
+    DAILY_LOSS_LIMIT_CHOICES, LOSS_STREAK_CHOICES, MARGIN_FRACTION_CHOICES, MIN_BALANCE_CHOICES,
+    STOP_MA_PERIOD,
 };
 pub const EMERGENCY_STOP_CHOICES: &[i64] = &[0, 10, 20, 30, 50];
 pub const REENTRY_WAIT_CHOICES: &[i64] = &[0, 1, 2, 3, 5];
@@ -524,6 +527,35 @@ fn entry_mode_text(cfg: &Value) -> String {
     } else {
         "돌파 시 진입 (SMA3이 SMA200을 뚫는 봉)".to_string()
     }
+}
+
+fn stop_ma_on(cfg: &Value) -> bool {
+    cfg_int(cfg, "stop_ma_period", STOP_MA_PERIOD) > 0
+}
+
+fn profit_lock_on(cfg: &Value) -> bool {
+    cfg_get(cfg, "profit_lock_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
+fn scale_in_text(cfg: &Value) -> String {
+    let on = cfg_get(cfg, "scale_in_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !on {
+        return "끔".to_string();
+    }
+    let steps = SCALE_IN_STEPS
+        .iter()
+        .map(|(roi, _)| format!("-{}%", *roi as i64))
+        .collect::<Vec<_>>()
+        .join("·");
+    let frac = format_g(SCALE_IN_STEPS[0].1);
+    let loss = scale_in_loss_roi(cfg_int(cfg, "emergency_stop_roi_percent", 0) as f64) as i64;
+    format!(
+        "켬 (봉 마감 때 첫 진입가 대비 증거금 {steps} 손실 + 추세 유지면 첫 수량의 {frac}배씩 추가, 손절은 첫 증거금 -{loss}%)",
+    )
 }
 
 fn lock_table(cfg: &Value) -> String {
@@ -1178,6 +1210,49 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 .collect(),
         );
         rows.push(vec![
+            markup_button(
+                mark(stop_ma_on(cfg), "🧱 SMA25 손절"),
+                if stop_ma_on(cfg) {
+                    "bm:stopma:off"
+                } else {
+                    "bm:stopma:on"
+                },
+            ),
+            markup_button(
+                mark(profit_lock_on(cfg), "🔒 수익 잠금"),
+                if profit_lock_on(cfg) {
+                    "bm:plock:off"
+                } else {
+                    "bm:plock:on"
+                },
+            ),
+        ]);
+        {
+            let on = cfg_get(cfg, "scale_in_enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            rows.push(vec![markup_button(
+                mark(on, "➕ 물타기 (추세 유지 시)"),
+                if on {
+                    "bm:scalein:off"
+                } else {
+                    "bm:scalein:on"
+                },
+            )]);
+        }
+        let current = (py_n(cfg_get(cfg, "margin_fraction")) * 100.0).round() as i64;
+        rows.push(
+            MARGIN_FRACTION_CHOICES
+                .iter()
+                .map(|n| {
+                    markup_button(
+                        mark(current == *n, &format!("증거금 {n}%")),
+                        format!("bm:mf:{n}"),
+                    )
+                })
+                .collect(),
+        );
+        rows.push(vec![
             markup_button("📊 상태", "bm:status"),
             markup_button("📈 성과 통계", "bm:stats"),
         ]);
@@ -1317,10 +1392,16 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             } else {
                 format!("비상손절: 증거금 -{stop}% (Mark 기준)")
             },
-            format!(
-                "수익 확보 손절(증거금 기준, Last 기준 트리거): {}",
-                lock_table(cfg)
-            ),
+            if profit_lock_on(cfg) {
+                format!(
+                    "수익 확보 손절(증거금 기준, Last 기준 트리거): {}",
+                    lock_table(cfg)
+                )
+            } else {
+                "수익 확보 손절: 끔".to_string()
+            },
+            format!("SMA25 손절: {}", if stop_ma_on(cfg) { "켬" } else { "끔" }),
+            format!("물타기: {}", scale_in_text(cfg)),
         ];
         if cfg_str(cfg, "scan_scope", "") == TRADFI_SCOPE {
             let tradfi_state = match self
@@ -1609,6 +1690,23 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         } else {
             format!("증거금 -{stop}%")
         };
+        let scale_line = scale_in_text(cfg);
+        let sma25_line = if stop_ma_on(cfg) {
+            "• 진입 조건: 종가가 SMA25 기준 진입 방향 쪽에 있을 때만 (반대편이면 그 신호는 건너뜀)\n\
+             • SMA25 손절: 봉 마감 종가가 SMA25를 반대로 이탈하면 시장가 청산, 이후 새 크로스까지 재진입 안 함 (같은 봉의 반대 크로스가 우선)\n"
+                .to_string()
+        } else {
+            "• SMA25 손절: 끔 (SMA25 진입 조건도 없음)\n".to_string()
+        };
+        let lock_lines = if profit_lock_on(cfg) {
+            format!(
+                "• 수익 확보(증거금 기준): {} (항상 도달 칸 {gap}% 아래, 한 번 올라간 손절은 내려가지 않음)\n\
+                 • 수익 확보 손절로 청산되면 다음 크로스까지 대기\n",
+                lock_table(cfg),
+            )
+        } else {
+            "• 수익 확보: 끔\n".to_string()
+        };
         format!(
             "📘 {fast}/{slow} SMA 크로스 규칙 (기간은 /btcma 또는 버튼으로 변경)\n\
              • 종목: {} (TradFi·스테이블코인 제외, 🎯 코인 지정 또는 /macoin SOL 로 1개 지정)\n\
@@ -1617,13 +1715,12 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
              • 청산 후 다른 코인 전환: {}\n\
              • 봉: {} 마감봉 기준, 진입·청산(반대 크로스) 모두 같은 봉 (3분~4시간 선택)\n\
              • 보유 중 반대 크로스(또는 봉 마감 때 SMA3이 반대편): 시장가(reduce-only) 청산 후 즉시 반대 방향 진입\n\
-             • 진입 조건: 종가가 SMA25 기준 진입 방향 쪽에 있을 때만 (반대편이면 그 신호는 건너뜀)\n\
+             {sma25_line}\
              • 크로스 진입 범위: {}\n\
              • 최소 잔고: {}\n\
              • 손실 한도: {}\n\
-             • SMA25 손절: 봉 마감 종가가 SMA25를 반대로 이탈하면 시장가 청산, 이후 새 크로스까지 재진입 안 함 (같은 봉의 반대 크로스가 우선)\n\
-             • 수익 확보(증거금 기준): {} (항상 도달 칸 {gap}% 아래, 한 번 올라간 손절은 내려가지 않음)\n\
-             • 수익 확보 손절로 청산되면 다음 크로스까지 대기\n\
+             {lock_lines}\
+             • 물타기: {scale_line}\n\
              • 비상손절: {stop_line} (메뉴에서 선택, 거래소에 Mark 기준으로 걸림)\n\
              • 레버리지 {leverage}배 ISOLATED 선택(2~5배, 다음 진입부터), 가용 증거금의 {margin:.0}% 사용, 계좌 전체 1포지션\n\
              • 🏦 TradFi만: 바이낸스 메인넷 전용 · 미국주식 TradFi + 금만 · 미국 정규장 시간에만 신규 진입\n\
@@ -1637,7 +1734,6 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             lookback_text(cfg),
             min_balance_text(cfg),
             loss_guard_text(cfg),
-            lock_table(cfg),
         )
     }
 
@@ -1893,13 +1989,23 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 if preview.get("ok").and_then(|v| v.as_bool()) != Some(true) {
                     return (format!("🤝 {}", adopt_error_text(&preview)), kb!());
                 }
+                let cfg = self.config().await;
+                let sma25_line = if stop_ma_on(&cfg) {
+                    "· 봉 마감이 SMA25 반대편 → 손절\n"
+                } else {
+                    ""
+                };
+                let plock_line = if profit_lock_on(&cfg) {
+                    "· 수익 잠금 (+5%부터 계단식)\n"
+                } else {
+                    ""
+                };
                 (
                     format!(
                         "🤝 이 포지션을 봇에게 맡길까요?\n{}\n\n\
                          맡기면 봇이 연 포지션처럼 관리합니다:\n\
                          · SMA200 반대 크로스 → 청산 후 반대 진입\n\
-                         · 봉 마감이 SMA25 반대편 → 손절\n\
-                         · 수익 잠금 (+5%부터 계단식)\n\
+                         {sma25_line}{plock_line}\
                          · 오늘 손익·손실 한도 계산에 포함\n\
                          직접 걸어 둔 TP/SL 주문은 그대로 남습니다.",
                         adopt_summary(&preview)
@@ -2178,6 +2284,89 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 let status = self.format_status().await;
                 (
                     format!("🔎 종목: {}{note}\n\n{status}", scope_text(&cfg_now)),
+                    kb!(),
+                )
+            }
+            a @ ("stopma:on" | "stopma:off") => {
+                let on = a == "stopma:on";
+                let value = if on { json!(STOP_MA_PERIOD) } else { json!(0) };
+                if let Err(e) = self.set_coin_value("stop_ma_period", value).await {
+                    return (Self::engine_error_text(&e), kb!());
+                }
+                let status = self.format_status().await;
+                let text = if on {
+                    format!(
+                        "🧱 SMA25 손절: 켬\n봉 마감 종가가 SMA25 반대편이면 청산하고, 진입도 종가가 SMA25 진입 방향 쪽일 때만 합니다.\n(보유 중인 포지션은 진입할 때 설정 그대로, 다음 진입부터 적용)\n\n{status}"
+                    )
+                } else {
+                    format!(
+                        "🧱 SMA25 손절: 끔\nSMA25 진입 조건과 SMA25 손절을 쓰지 않습니다. 청산은 SMA 반대 크로스·수익 잠금·비상손절로만 합니다.\n(보유 중인 포지션은 진입할 때 설정 그대로, 다음 진입부터 적용)\n\n{status}"
+                    )
+                };
+                (text, kb!())
+            }
+            a @ ("scalein:on" | "scalein:off") => {
+                let on = a == "scalein:on";
+                if let Err(e) = self.set_coin_value("scale_in_enabled", json!(on)).await {
+                    return (Self::engine_error_text(&e), kb!());
+                }
+                let status = self.format_status().await;
+                let text = if on {
+                    let loss = scale_in_loss_roi(cfg_int(
+                        &self.config().await,
+                        "emergency_stop_roi_percent",
+                        0,
+                    ) as f64) as i64;
+                    format!(
+                        "➕ 물타기: 켬\n· 봉 마감 때 첫 진입가 대비 증거금 손실이 -10%, -20%가 되고 종가가 아직 진입 방향 쪽(추세 유지)이면 첫 수량의 0.5배씩 추가 (최대 2번)\n· 수익 잠금이 걸린 뒤에는 추가하지 않음\n· 손절은 첫 증거금의 -{loss}%가 되는 가격으로 거래소에 걸고, 추가할 때마다 다시 계산\n(다음 진입부터 적용)\n\n{status}"
+                    )
+                } else {
+                    format!(
+                        "➕ 물타기: 끔\n남은 물타기는 하지 않습니다. 이미 걸린 손절 위치는 그대로입니다.\n\n{status}"
+                    )
+                };
+                (text, kb!())
+            }
+            a @ ("plock:on" | "plock:off") => {
+                let on = a == "plock:on";
+                if let Err(e) = self.set_coin_value("profit_lock_enabled", json!(on)).await {
+                    return (Self::engine_error_text(&e), kb!());
+                }
+                let cfg_now = self.config().await;
+                let status = self.format_status().await;
+                let text = if on {
+                    let lock_table = lock_table(&cfg_now);
+                    format!(
+                        "🔒 수익 잠금: 켬 ({lock_table})\n보유 중인 포지션에도 바로 적용됩니다.\n\n{status}"
+                    )
+                } else {
+                    format!(
+                        "🔒 수익 잠금: 끔\n새 수익 잠금 주문을 걸지 않습니다. 이미 걸려 있는 잠금 주문은 그대로 둡니다.\n\n{status}"
+                    )
+                };
+                (text, kb!())
+            }
+            a if a.starts_with("mf:") => {
+                let choice = a
+                    .split_once(':')
+                    .map(|x| x.1)
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(-1);
+                if MARGIN_FRACTION_CHOICES.contains(&choice) {
+                    let value = json!(format!("{}", choice as f64 / 100.0));
+                    if let Err(e) = self.set_coin_value("margin_fraction", value).await {
+                        return (Self::engine_error_text(&e), kb!());
+                    }
+                }
+                let cfg_now = self.config().await;
+                let leverage = cfg_int(&cfg_now, "leverage", 5);
+                let margin = py_n(cfg_get(&cfg_now, "margin_fraction")) * 100.0;
+                let exposure = leverage as f64 * margin;
+                let status = self.format_status().await;
+                (
+                    format!(
+                        "💵 증거금: 가용 잔고의 {margin:.0}% (다음 진입부터 적용)\n포지션 크기 = 레버리지 {leverage}x × {margin:.0}% = 잔고의 {exposure:.0}%\n\n{status}"
+                    ),
                     kb!(),
                 )
             }

@@ -136,11 +136,19 @@ fn run_case(case: &Value) -> bool {
         "normalize_btc_ma_cross_config" => {
             let raw = as_opt_value(&args, "raw");
             let mut out = normalize_btc_ma_cross_config(raw.as_ref());
-            // Rust-only additions (SMA25 stop line, 2-bar cross lookback, minimum balance,
-            // daily loss / losing-streak limits);
+            // Rust-only additions (SMA25 stop line + switch, profit-lock switch, averaging in,
+            // 2-bar cross lookback, minimum balance, daily loss / losing-streak limits);
             // Python never had them.
             if let Some(obj) = out.as_object_mut() {
                 assert_eq!(obj.remove("stop_ma_period"), Some(serde_json::json!(25)));
+                assert_eq!(
+                    obj.remove("profit_lock_enabled"),
+                    Some(serde_json::json!(true))
+                );
+                assert_eq!(
+                    obj.remove("scale_in_enabled"),
+                    Some(serde_json::json!(false))
+                );
                 assert_eq!(obj.remove("min_balance_usdt"), Some(serde_json::json!(80)));
                 assert_eq!(
                     obj.remove("daily_loss_limit_pct"),

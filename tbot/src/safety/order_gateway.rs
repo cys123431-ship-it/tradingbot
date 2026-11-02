@@ -354,6 +354,20 @@ impl Default for EntryRequest {
     }
 }
 
+/// Market order that adds to an open position in the same direction.
+#[derive(Debug, Clone)]
+pub struct PositionAddRequest {
+    pub strategy: String,
+    pub symbol: String,
+    /// "long" / "short" (direction of the existing position).
+    pub side: String,
+    /// Bar that triggered the add; with `leg` it makes the client id idempotent.
+    pub signal_timestamp: Value,
+    /// 1-based add number within the trade.
+    pub leg: i64,
+    pub qty: f64,
+}
+
 pub struct ReduceOnlyCloseRequest {
     pub strategy: String,
     pub symbol: String,
@@ -1347,6 +1361,410 @@ impl<E: FuturesExchange> IdempotentOrderGateway<E> {
                 OrderState::FilledUnverifiedLiquidation.as_str(),
                 changes,
             )?;
+        }
+
+        Ok(OrderSubmissionResult {
+            client_order_id,
+            state: updated.order_state,
+            order: Some(order),
+            position,
+            recovered: false,
+            error: None,
+        })
+    }
+
+    pub async fn submit_position_add(
+        &self,
+        req: PositionAddRequest,
+    ) -> Result<OrderSubmissionResult, ExchangeError> {
+        let PositionAddRequest {
+            strategy,
+            symbol,
+            side,
+            signal_timestamp,
+            leg,
+            qty,
+        } = req;
+
+        let ts_value = if matches!(signal_timestamp, Value::Null) {
+            None
+        } else {
+            Some(&signal_timestamp)
+        };
+        let leg_text = leg.to_string();
+        let client_order_id = build_client_order_id(BuildClientOrderIdArgs {
+            strategy: &strategy,
+            symbol: &symbol,
+            side: &side,
+            signal_timestamp: ts_value,
+            stage: "add",
+            leg: Some(&leg_text),
+            revision: None,
+            max_length: 36,
+        });
+
+        let _global = self.global_entry_lock.clone().lock_owned().await;
+        let symbol_lock = self.lock_for(&symbol);
+        let _symbol_guard = symbol_lock.lock_owned().await;
+
+        if let Some(existing) = self.store_get(&client_order_id)? {
+            let st = existing.order_state.as_str();
+            if st == OrderState::Protected.as_str()
+                || st == OrderState::Closed.as_str()
+                || st == OrderState::Canceled.as_str()
+                || st == OrderState::Failed.as_str()
+            {
+                if st == OrderState::Closed.as_str()
+                    || st == OrderState::Canceled.as_str()
+                    || st == OrderState::Failed.as_str()
+                {
+                    self.store_exec(|store| {
+                        store.release_entry_lease(&client_order_id, &existing.order_state)
+                    })?;
+                }
+                return Ok(OrderSubmissionResult {
+                    client_order_id,
+                    state: existing.order_state,
+                    order: None,
+                    position: None,
+                    recovered: true,
+                    error: Some("add already handled".to_string()),
+                });
+            }
+            if let Some(recovered) = self._recover(&existing, false).await? {
+                return Ok(recovered);
+            }
+            return Ok(OrderSubmissionResult {
+                client_order_id,
+                state: existing.order_state,
+                order: None,
+                position: None,
+                recovered: true,
+                error: existing.last_error,
+            });
+        }
+
+        let blocker = self.store_entry_block_reason(Some(&symbol), true, false)?;
+        if let Some(blocker) = blocker {
+            return Ok(OrderSubmissionResult {
+                client_order_id,
+                state: "BLOCKED".to_string(),
+                order: None,
+                position: None,
+                recovered: false,
+                error: Some(blocker),
+            });
+        }
+
+        let side_lower = side.to_lowercase();
+        let expected_side = if side_lower == "long" || side_lower == "buy" {
+            "long"
+        } else {
+            "short"
+        };
+
+        let position = match self.fetch_position(&symbol).await {
+            Ok(p) => p,
+            Err(exc) => {
+                self.store_set_runtime_state(
+                    "entry_lock_reason",
+                    Value::String(format!(
+                        "RECONCILIATION_REQUIRED:position_fetch:{}",
+                        exc.class
+                    )),
+                )?;
+                return Ok(OrderSubmissionResult {
+                    client_order_id,
+                    state: "BLOCKED".to_string(),
+                    order: None,
+                    position: None,
+                    recovered: false,
+                    error: Some(format!("position preflight unavailable: {}", exc.message)),
+                });
+            }
+        };
+        let pos = match position {
+            Some(p) => p,
+            None => {
+                return Ok(OrderSubmissionResult {
+                    client_order_id,
+                    state: "BLOCKED".to_string(),
+                    order: None,
+                    position: None,
+                    recovered: false,
+                    error: Some("no position to add to".to_string()),
+                });
+            }
+        };
+        let pos_side = pos
+            .get("side")
+            .map(value_str)
+            .unwrap_or_default()
+            .to_lowercase();
+        if !pos_side.is_empty() && pos_side != expected_side {
+            return Ok(OrderSubmissionResult {
+                client_order_id,
+                state: "BLOCKED".to_string(),
+                order: None,
+                position: Some(pos),
+                recovered: false,
+                error: Some(format!(
+                    "position side {} does not match add side {}",
+                    pos_side, expected_side
+                )),
+            });
+        }
+
+        // Absolute contracts before the add.
+        let position_qty_before = match &pos {
+            Value::Object(pos_map) => {
+                let info = as_dict(pos_map.get("info"));
+                pos_map
+                    .get("contracts")
+                    .filter(|v| truthy(v))
+                    .or_else(|| info.get("positionAmt").filter(|v| truthy(v)))
+                    .and_then(to_f64_opt)
+                    .map(f64::abs)
+                    .unwrap_or(0.0)
+            }
+            _ => 0.0,
+        };
+
+        let acquired = self.store_exec(|store| {
+            store.try_acquire_entry_lease(
+                &self.lease_owner_id,
+                120.0,
+                &symbol,
+                &client_order_id,
+                false,
+                true,
+            )
+        })?;
+        if !acquired {
+            return Ok(OrderSubmissionResult {
+                client_order_id,
+                state: "BLOCKED".to_string(),
+                order: None,
+                position: Some(pos),
+                recovered: false,
+                error: Some("GLOBAL_ENTRY_LEASE_HELD".to_string()),
+            });
+        }
+
+        let record = OrderRecord {
+            client_order_id: client_order_id.clone(),
+            symbol: symbol.clone(),
+            side: side.to_uppercase(),
+            strategy: strategy.clone(),
+            signal_timestamp: python_repr(&signal_timestamp),
+            requested_qty: qty,
+            order_intent: OrderIntent::PositionAdd.as_str().to_string(),
+            order_purpose: "position_add".to_string(),
+            position_qty_before,
+            ..Default::default()
+        };
+        let record = self.store_upsert(record)?;
+
+        let exchange_existing = match self
+            .fetch_order_by_client_id(&symbol, &client_order_id)
+            .await
+        {
+            Ok(v) => v,
+            Err(exc) => {
+                let mut changes = Map::new();
+                changes.insert(
+                    "last_error".to_string(),
+                    Value::String(format!(
+                        "pre-submit duplicate lookup unavailable: {}",
+                        exc.message
+                    )),
+                );
+                self.store_transition(
+                    &client_order_id,
+                    OrderState::SubmittedUnknown.as_str(),
+                    changes,
+                )?;
+                self.store_set_runtime_state(
+                    "entry_lock_reason",
+                    Value::String("RECONCILIATION_REQUIRED".to_string()),
+                )?;
+                return Ok(OrderSubmissionResult {
+                    client_order_id,
+                    state: OrderState::SubmittedUnknown.as_str().to_string(),
+                    order: None,
+                    position: None,
+                    recovered: false,
+                    error: Some(exc.message),
+                });
+            }
+        };
+        if let Some(existing_order) = exchange_existing {
+            let updated = self
+                .transition_from_exchange_order(&client_order_id, &existing_order)?
+                .unwrap_or_else(|| record.clone());
+            return Ok(OrderSubmissionResult {
+                client_order_id,
+                state: updated.order_state,
+                order: Some(existing_order),
+                position: None,
+                recovered: true,
+                error: None,
+            });
+        }
+
+        self.store_transition(
+            &client_order_id,
+            OrderState::Submitting.as_str(),
+            Map::new(),
+        )?;
+
+        let mut order_params = Map::new();
+        order_params.insert(
+            "newClientOrderId".to_string(),
+            Value::String(client_order_id.clone()),
+        );
+        let exchange_side = if side_lower == "long" || side_lower == "buy" {
+            "buy"
+        } else {
+            "sell"
+        };
+
+        let create_result = self
+            .create_order(&symbol, "market", exchange_side, qty, None, order_params)
+            .await;
+
+        let order = match create_result {
+            Ok(o) => o,
+            Err(exc) => {
+                if is_definitive_rejection(&exc) {
+                    let mut changes = Map::new();
+                    changes.insert("last_error".to_string(), Value::String(exc.message.clone()));
+                    self.store_transition(&client_order_id, OrderState::Failed.as_str(), changes)?;
+                    let st = OrderState::Failed.as_str().to_string();
+                    self.store_exec(|store| store.release_entry_lease(&client_order_id, &st))?;
+                    if is_authentication_error(&exc) {
+                        self.store_set_runtime_state(
+                            "entry_lock_reason",
+                            Value::String(format!("AUTHENTICATION_ERROR:{}", exc.class)),
+                        )?;
+                    }
+                    return Ok(OrderSubmissionResult {
+                        client_order_id,
+                        state: OrderState::Failed.as_str().to_string(),
+                        order: None,
+                        position: None,
+                        recovered: false,
+                        error: Some(exc.message),
+                    });
+                }
+                let mut changes = Map::new();
+                changes.insert(
+                    "last_error".to_string(),
+                    Value::String(format!("{}: {}", exc.class, exc.message)),
+                );
+                changes.insert("retry_count".to_string(), Value::from(1));
+                self.store_transition(
+                    &client_order_id,
+                    OrderState::SubmittedUnknown.as_str(),
+                    changes,
+                )?;
+                let unknown_record = match self.store_get(&client_order_id)? {
+                    Some(r) => r,
+                    None => {
+                        return Err(ExchangeError::new(
+                            "RuntimeError",
+                            "submitted order state disappeared before recovery",
+                        ));
+                    }
+                };
+                if let Some(recovered) = self._recover(&unknown_record, true).await? {
+                    return Ok(recovered);
+                }
+                return Ok(OrderSubmissionResult {
+                    client_order_id,
+                    state: OrderState::SubmittedUnknown.as_str().to_string(),
+                    order: None,
+                    position: None,
+                    recovered: false,
+                    error: Some(exc.message),
+                });
+            }
+        };
+
+        let mut updated = self
+            .transition_from_exchange_order(&client_order_id, &order)?
+            .unwrap_or_else(|| record.clone());
+        if updated.order_state == OrderState::Canceled.as_str()
+            || updated.order_state == OrderState::Failed.as_str()
+        {
+            let st = updated.order_state.clone();
+            self.store_exec(|store| store.release_entry_lease(&client_order_id, &st))?;
+        }
+        if updated.order_state == OrderState::PartiallyFilled.as_str() {
+            match self.cancel_partial_remainder(&symbol, &order).await {
+                Ok(()) => {}
+                Err(exc) => {
+                    let mut changes = Map::new();
+                    changes.insert(
+                        "last_error".to_string(),
+                        Value::String(format!("partial remainder cancel failed: {}", exc.message)),
+                    );
+                    self.store_transition(
+                        &client_order_id,
+                        OrderState::SubmittedUnknown.as_str(),
+                        changes,
+                    )?;
+                    return Ok(OrderSubmissionResult {
+                        client_order_id,
+                        state: OrderState::SubmittedUnknown.as_str().to_string(),
+                        order: Some(order),
+                        position: None,
+                        recovered: false,
+                        error: Some(exc.message),
+                    });
+                }
+            }
+        }
+
+        let position = self.fetch_position(&symbol).await?;
+        if let Some(pos) = position.as_ref() {
+            let pos_side = pos
+                .get("side")
+                .map(value_str)
+                .unwrap_or_default()
+                .to_lowercase();
+            if !pos_side.is_empty() && pos_side != expected_side {
+                let message = format!(
+                    "order/position side contradiction: expected={} actual={}",
+                    expected_side, pos_side
+                );
+                let mut changes = Map::new();
+                changes.insert("last_error".to_string(), Value::String(message.clone()));
+                self.store_transition(
+                    &client_order_id,
+                    OrderState::SubmittedUnknown.as_str(),
+                    changes,
+                )?;
+                return Ok(OrderSubmissionResult {
+                    client_order_id,
+                    state: OrderState::SubmittedUnknown.as_str().to_string(),
+                    order: Some(order),
+                    position,
+                    recovered: false,
+                    error: Some(message),
+                });
+            }
+
+            // Keep the add order's own fill values.
+            if entry_progress_rank(&updated.order_state)
+                < entry_progress_rank(OrderState::FilledUnverifiedLiquidation.as_str())
+            {
+                updated = self.store_transition(
+                    &client_order_id,
+                    OrderState::FilledUnverifiedLiquidation.as_str(),
+                    Map::new(),
+                )?;
+            }
         }
 
         Ok(OrderSubmissionResult {

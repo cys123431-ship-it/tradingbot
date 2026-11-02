@@ -1161,6 +1161,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
                     OrderIntent::Close.as_str(),
                     OrderIntent::EmergencyClose.as_str(),
                     OrderIntent::ManualClose.as_str(),
+                    OrderIntent::PositionAdd.as_str(),
                 ];
                 for record in records {
                     if intents.contains(&record.order_intent.as_str()) {

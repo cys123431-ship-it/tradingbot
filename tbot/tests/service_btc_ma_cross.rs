@@ -1187,3 +1187,213 @@ async fn adoption_warns_when_the_position_is_against_the_trend() {
     let warnings = preview["warnings"].to_string();
     assert!(warnings.contains("추세가 SHORT"), "{warnings}");
 }
+
+#[tokio::test]
+async fn sma25_stop_off_ignores_the_sma25_gate_and_stop() {
+    let root = temp_dir("sma25_off");
+    let mut extra = HashMap::new();
+    extra.insert("entry_mode".to_string(), json!("trend"));
+    extra.insert("stop_ma_period".to_string(), json!(0));
+    let mut h = Harness::new(&root, true, "testnet", 86_000.0, extra);
+    h.rows = between_rows();
+    h.fake
+        .bars
+        .lock()
+        .unwrap()
+        .insert("1h".to_string(), h.rows.clone());
+    h.now_ms = now_after_default(&h.rows);
+    h.set_time_from_now();
+
+    let result = h.run().await;
+    assert_eq!(result["action"], json!("entered"), "{result}");
+    let trade = h.state_live()["trade"].as_object().cloned().unwrap();
+    assert_ne!(trade.get("stop_ma_period"), Some(&json!(25)));
+
+    push_bar(&mut h, 108.9);
+    let result = h.run().await;
+    assert_eq!(result["action"], json!("managed"), "{result}");
+}
+
+#[tokio::test]
+async fn profit_lock_off_never_places_a_lock() {
+    let root = temp_dir("lock_off");
+    let mut extra = HashMap::new();
+    extra.insert("profit_lock_enabled".to_string(), json!(false));
+    let h = Harness::new(&root, true, "testnet", 86_000.0, extra);
+    h.run().await;
+    h.fake.with_state(|s| s.mark = 85_000.0 * 1.021);
+    h.run().await;
+    let trade = h.state_live()["trade"].as_object().cloned().unwrap();
+    let lock_price = trade.get("lock_price");
+    assert!(
+        lock_price.is_none() || lock_price == Some(&json!("")),
+        "{lock_price:?}"
+    );
+    assert!(trade
+        .get("lock_client_algo_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .is_empty());
+}
+
+#[test]
+fn stop_ma_period_normalizes_to_25_or_0() {
+    use tbot::strategy::config_btc_ma::normalize_btc_ma_cross_config;
+    let stop = |raw: Value| {
+        normalize_btc_ma_cross_config(Some(&raw))["stop_ma_period"]
+            .as_i64()
+            .unwrap()
+    };
+    assert_eq!(stop(json!({"stop_ma_period": 0})), 0);
+    assert_eq!(stop(json!({"stop_ma_period": 7})), 25);
+    assert_eq!(stop(json!({})), 25);
+    let lock = |raw: Value| {
+        normalize_btc_ma_cross_config(Some(&raw))["profit_lock_enabled"]
+            .as_bool()
+            .unwrap()
+    };
+    assert!(!lock(json!({"profit_lock_enabled": false})));
+    assert!(lock(json!({})));
+    assert!(!lock(json!({"profit_lock_enabled": "false"})));
+}
+
+#[test]
+fn scale_in_math() {
+    use tbot::core::sma_cross::{scale_in_fraction, scale_in_loss_roi, scale_in_stop_price};
+    assert_eq!(scale_in_fraction("SHORT", 104.0, 106.2, 5.0, 0), Some(0.5));
+    assert_eq!(scale_in_fraction("SHORT", 104.0, 105.0, 5.0, 0), None);
+    assert_eq!(scale_in_fraction("LONG", 100.0, 96.0, 5.0, 1), Some(0.5));
+    assert_eq!(scale_in_fraction("LONG", 100.0, 90.0, 5.0, 2), None);
+    assert_eq!(scale_in_loss_roi(0.0), 50.0);
+    assert_eq!(scale_in_loss_roi(30.0), 30.0);
+    assert_eq!(scale_in_loss_roi(50.0), 50.0);
+    let stop = scale_in_stop_price("LONG", 100.0, 1.0, 100.0, 1.0, 5.0, 50.0).unwrap();
+    assert!((stop - 90.0).abs() < 1e-9, "{stop}");
+}
+
+#[tokio::test]
+async fn scale_in_adds_at_minus_10_and_moves_the_stop() {
+    let root = temp_dir("scale_in_adds");
+    let mut extra = HashMap::new();
+    extra.insert("entry_mode".to_string(), json!("trend"));
+    extra.insert("scale_in_enabled".to_string(), json!(true));
+    extra.insert("stop_ma_period".to_string(), json!(0));
+    extra.insert("emergency_stop_roi_percent".to_string(), json!(0));
+    // Keeps the fake's max quantity (120) out of the way at price ~104.
+    extra.insert("margin_fraction".to_string(), json!("0.1"));
+    let mut h = Harness::new(&root, true, "testnet", 86_000.0, extra);
+    h.rows = between_rows();
+    h.fake
+        .bars
+        .lock()
+        .unwrap()
+        .insert("1h".to_string(), h.rows.clone());
+    h.now_ms = now_after_default(&h.rows);
+    h.set_time_from_now();
+    h.fake.with_state(|s| s.mark = 104.0);
+    let entered = h.run().await;
+    assert_eq!(entered["action"], json!("entered"), "{entered}");
+    let trade0 = h.state_live()["trade"].as_object().cloned().unwrap();
+    assert_eq!(trade0["side"], json!("SHORT"));
+    assert_eq!(trade0["scale_in"], json!(true));
+    assert_eq!(trade0["scale_in_count"], json!(0));
+    let old_sl = trade0["sl_client_algo_id"].as_str().unwrap().to_string();
+    let old_stop = trade0["stop_price"].as_str().unwrap().to_string();
+    let first_qty = trade0["quantity"].as_str().unwrap().parse::<f64>().unwrap();
+
+    h.fake.with_state(|s| s.mark = 106.2);
+    push_bar(&mut h, 106.2);
+    assert_eq!(h.run().await["action"], json!("managed"));
+    let trade = h.state_live()["trade"].as_object().cloned().unwrap();
+    assert_eq!(trade["scale_in_count"], json!(1));
+    let qty = trade["quantity"].as_str().unwrap().parse::<f64>().unwrap();
+    assert!(qty > 1.49 * first_qty, "{qty} vs {first_qty}");
+    let entry = trade["entry_price"]
+        .as_str()
+        .unwrap()
+        .parse::<f64>()
+        .unwrap();
+    assert!(entry > 104.0 && entry < 106.2, "{entry}");
+    let stop = trade["stop_price"].as_str().unwrap().to_string();
+    assert_ne!(stop, old_stop);
+    assert!(stop.parse::<f64>().unwrap() < old_stop.parse::<f64>().unwrap());
+    let new_sl = trade["sl_client_algo_id"].as_str().unwrap().to_string();
+    assert_ne!(new_sl, old_sl);
+    let algos = h.fake.algos_snapshot();
+    assert_eq!(algos[&old_sl]["algoStatus"], json!("CANCELED"));
+
+    h.fake.with_state(|s| s.mark = 106.0);
+    push_bar(&mut h, 106.0);
+    h.run().await;
+    let trade = h.state_live()["trade"].as_object().cloned().unwrap();
+    assert_eq!(trade["scale_in_count"], json!(1));
+}
+
+#[tokio::test]
+async fn scale_in_off_never_adds() {
+    let root = temp_dir("scale_in_off");
+    let mut extra = HashMap::new();
+    extra.insert("entry_mode".to_string(), json!("trend"));
+    extra.insert("stop_ma_period".to_string(), json!(0));
+    extra.insert("emergency_stop_roi_percent".to_string(), json!(0));
+    // Keeps the fake's max quantity (120) out of the way at price ~104.
+    extra.insert("margin_fraction".to_string(), json!("0.1"));
+    let mut h = Harness::new(&root, true, "testnet", 86_000.0, extra);
+    h.rows = between_rows();
+    h.fake
+        .bars
+        .lock()
+        .unwrap()
+        .insert("1h".to_string(), h.rows.clone());
+    h.now_ms = now_after_default(&h.rows);
+    h.set_time_from_now();
+    h.fake.with_state(|s| s.mark = 104.0);
+    let entered = h.run().await;
+    assert_eq!(entered["action"], json!("entered"), "{entered}");
+    let trade0 = h.state_live()["trade"].as_object().cloned().unwrap();
+    let first_qty = trade0["quantity"].as_str().unwrap().to_string();
+
+    h.fake.with_state(|s| s.mark = 106.2);
+    push_bar(&mut h, 106.2);
+    h.run().await;
+    let trade = h.state_live()["trade"].as_object().cloned().unwrap();
+    assert!(trade.get("scale_in_count").is_none());
+    assert_eq!(trade["quantity"], json!(first_qty));
+}
+
+#[tokio::test]
+async fn scale_in_also_applies_in_dry_run() {
+    let root = temp_dir("scale_in_dry");
+    let mut extra = HashMap::new();
+    extra.insert("entry_mode".to_string(), json!("trend"));
+    extra.insert("scale_in_enabled".to_string(), json!(true));
+    extra.insert("stop_ma_period".to_string(), json!(0));
+    extra.insert("emergency_stop_roi_percent".to_string(), json!(0));
+    extra.insert("margin_fraction".to_string(), json!("0.1"));
+    let mut h = Harness::new(&root, false, "testnet", 86_000.0, extra);
+    h.rows = between_rows();
+    h.fake
+        .bars
+        .lock()
+        .unwrap()
+        .insert("1h".to_string(), h.rows.clone());
+    h.now_ms = now_after_default(&h.rows);
+    h.set_time_from_now();
+    h.fake.with_state(|s| s.mark = 104.0);
+    let entered = h.run().await;
+    assert_eq!(entered["action"], json!("entered"), "{entered}");
+    let trade0 = h.state("DRY_RUN")["trade"].as_object().cloned().unwrap();
+    let first_qty: f64 = trade0["quantity"].as_str().unwrap().parse().unwrap();
+    let old_stop = trade0["stop_price"].as_str().unwrap().to_string();
+
+    h.fake.with_state(|s| s.mark = 106.2);
+    push_bar(&mut h, 106.2);
+    h.run().await;
+    let trade = h.state("DRY_RUN")["trade"].as_object().cloned().unwrap();
+    assert_eq!(trade["scale_in_count"], json!(1));
+    let qty: f64 = trade["quantity"].as_str().unwrap().parse().unwrap();
+    assert!(qty > 1.49 * first_qty, "{qty} vs {first_qty}");
+    assert_ne!(trade["stop_price"].as_str().unwrap(), old_stop);
+    // No real order is ever sent in DRY_RUN.
+    assert!(h.fake.with_state(|s| s.position.is_none()));
+}

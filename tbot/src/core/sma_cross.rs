@@ -295,3 +295,52 @@ pub fn emergency_stop_price(
     let direction = if side == "LONG" { 1.0 } else { -1.0 };
     Some(entry_price * (1.0 - direction * roi_percent / (leverage * 100.0)))
 }
+
+/// Averaging in: (margin loss % vs the first entry at a bar close, fraction of the first quantity).
+pub const SCALE_IN_STEPS: &[(f64, f64)] = &[(10.0, 0.5), (20.0, 0.5)];
+/// With averaging in, the stop closes everything at this loss in % of the first margin.
+pub const SCALE_IN_MAX_LOSS_ROI: f64 = 50.0;
+
+/// Loss budget (% of the first margin): the emergency stop if tighter, else 50.
+pub fn scale_in_loss_roi(emergency_roi: f64) -> f64 {
+    if emergency_roi > 0.0 && emergency_roi < SCALE_IN_MAX_LOSS_ROI {
+        emergency_roi
+    } else {
+        SCALE_IN_MAX_LOSS_ROI
+    }
+}
+
+/// Fraction of the first quantity to add at this close after `done` adds, or `None`.
+pub fn scale_in_fraction(
+    side: &str,
+    first_entry: f64,
+    close: f64,
+    leverage: f64,
+    done: usize,
+) -> Option<f64> {
+    let (step, fraction) = SCALE_IN_STEPS.get(done)?;
+    let roi = margin_roi(side, first_entry, close, leverage);
+    if roi <= -*step + 1e-9 {
+        Some(*fraction)
+    } else {
+        None
+    }
+}
+
+/// Price at which the whole position has lost `loss_roi` % of the first margin.
+pub fn scale_in_stop_price(
+    side: &str,
+    avg_entry: f64,
+    quantity: f64,
+    first_entry: f64,
+    first_quantity: f64,
+    leverage: f64,
+    loss_roi: f64,
+) -> Option<f64> {
+    if quantity <= 0.0 || leverage <= 0.0 {
+        return None;
+    }
+    let direction = if side == "LONG" { 1.0 } else { -1.0 };
+    let first_margin = first_entry * first_quantity / leverage;
+    Some(avg_entry - direction * (loss_roi / 100.0 * first_margin) / quantity)
+}

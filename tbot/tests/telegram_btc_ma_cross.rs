@@ -857,3 +857,59 @@ async fn adopt_button_only_in_live_and_refuses_without_a_position() {
     assert!(text.contains("열린 포지션이 없습니다"), "{text}");
     assert!(!callbacks(&markup).contains(&"bm:confirm_adopt".to_string()));
 }
+
+#[tokio::test]
+async fn stop_lock_and_margin_buttons_save_the_config() {
+    let tmp = common::temp_dir("tg_stoplockmf");
+    let ctx = controller(&tmp);
+    let (_, markup) = press(&ctx, "status").await;
+    let cbs = callbacks(&markup);
+    for cb in [
+        "bm:stopma:off",
+        "bm:plock:off",
+        "bm:mf:10",
+        "bm:mf:20",
+        "bm:mf:30",
+        "bm:mf:50",
+    ] {
+        assert!(cbs.contains(&cb.to_string()), "{cb} missing");
+    }
+
+    let (text, markup) = press(&ctx, "stopma:off").await;
+    assert_eq!(ctx.section()["stop_ma_period"], json!(0));
+    assert!(text.contains("SMA25 손절: 끔"));
+    assert!(callbacks(&markup).contains(&"bm:stopma:on".to_string()));
+
+    let (_, markup) = press(&ctx, "stopma:on").await;
+    assert_eq!(ctx.section()["stop_ma_period"], json!(25));
+    assert!(callbacks(&markup).contains(&"bm:stopma:off".to_string()));
+
+    let (text, _) = press(&ctx, "plock:off").await;
+    assert_eq!(ctx.section()["profit_lock_enabled"], json!(false));
+    assert!(text.contains("수익 잠금: 끔"));
+
+    let (text, _) = press(&ctx, "mf:20").await;
+    assert_eq!(ctx.section()["margin_fraction"], json!("0.2"));
+    assert!(text.contains("잔고의 20%"));
+
+    press(&ctx, "mf:7").await;
+    assert_eq!(ctx.section()["margin_fraction"], json!("0.2"));
+}
+
+#[tokio::test]
+async fn scale_in_button_toggles() {
+    let tmp = common::temp_dir("tg_scalein");
+    let ctx = controller(&tmp);
+    let (_, markup) = press(&ctx, "status").await;
+    let cbs = callbacks(&markup);
+    assert!(cbs.contains(&"bm:scalein:on".to_string()));
+
+    let (text, markup) = press(&ctx, "scalein:on").await;
+    assert_eq!(ctx.section()["scale_in_enabled"], json!(true));
+    assert!(text.contains("물타기: 켬"), "{text}");
+    assert!(callbacks(&markup).contains(&"bm:scalein:off".to_string()));
+
+    let (text, _) = press(&ctx, "scalein:off").await;
+    assert_eq!(ctx.section()["scale_in_enabled"], json!(false));
+    assert!(text.contains("물타기: 끔"), "{text}");
+}
