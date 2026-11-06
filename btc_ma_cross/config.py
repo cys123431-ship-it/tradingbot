@@ -48,6 +48,15 @@ PROFIT_LOCK_SWITCH_CHOICES = (0, 1, 2, 3, 4, 5)
 # Leverage is a Telegram choice (2x..5x); 5 is the default.
 LEVERAGE_CHOICES = (2, 3, 4, 5)
 DEFAULT_LEVERAGE = 5
+# Custom exit line (추가 청산 조건): SMA(fast) crossing SMA(exit) closes the
+# position before the opposite SMA(fast)/SMA(slow) cross.  OFF by default.
+# While it is ON, a cross exit is close-only: no reverse entry until the
+# original SMA(fast)/SMA(slow) cross closes a fresh candle.
+EXIT_MA_ENABLED_DEFAULT = False
+EXIT_MA_DEFAULT_PERIOD = 25
+EXIT_MA_PRESETS = (25, 69)
+EXIT_MA_MIN_PERIOD = 2
+EXIT_MA_MAX_PERIOD = 500
 
 
 def default_btc_ma_cross_config() -> dict:
@@ -91,6 +100,9 @@ def default_btc_ma_cross_config() -> dict:
         # Share of the available futures balance used as margin per entry.
         "margin_fraction": "0.5",
         "emergency_stop_roi_percent": 30,
+        # Optional extra exit: SMA(fast) against SMA(exit_ma_period).
+        "exit_ma_enabled": EXIT_MA_ENABLED_DEFAULT,
+        "exit_ma_period": EXIT_MA_DEFAULT_PERIOD,
         # Profit lock (margin ROI): at +5% keep +4%, then every +5% one more
         # step, always lock_gap below the step reached.
         "lock_start_roi_percent": "5",
@@ -161,6 +173,23 @@ def normalize_btc_ma_cross_config(raw=None) -> dict:
     # candle_history is lifted automatically when the slow line needs more bars.
     apply_periods(cfg, default_fast=3, default_slow=200)
     cfg["candle_history"] = _int(cfg.get("candle_history"), 260, 210, 1500)
+    # The exit line is optional and independent from the entry pair; when it
+    # is on it must fit inside the candles we fetch, otherwise the signal
+    # would silently never compute.
+    cfg["exit_ma_enabled"] = _bool(cfg.get("exit_ma_enabled"), EXIT_MA_ENABLED_DEFAULT)
+    # A corrupted period must fall back to the default, never be silently
+    # clamped (a clamped value would quietly change the exit rule).
+    try:
+        exit_period = int(float(cfg.get("exit_ma_period")))
+    except (TypeError, ValueError):
+        exit_period = EXIT_MA_DEFAULT_PERIOD
+    if exit_period < EXIT_MA_MIN_PERIOD or exit_period > EXIT_MA_MAX_PERIOD:
+        exit_period = EXIT_MA_DEFAULT_PERIOD
+    cfg["exit_ma_period"] = exit_period
+    if cfg["exit_ma_enabled"] and exit_period > int(cfg["candle_history"]) - 2:
+        # Not enough candles to compute the line: the signal would never
+        # fire, so keep the feature off rather than pretend it is active.
+        cfg["exit_ma_enabled"] = False
     try:
         leverage = int(float(cfg.get("leverage")))
     except (TypeError, ValueError):
@@ -206,6 +235,11 @@ __all__ = (
     "CONFIG_KEY",
     "DEFAULT_LEVERAGE",
     "EMERGENCY_STOP_CHOICES",
+    "EXIT_MA_DEFAULT_PERIOD",
+    "EXIT_MA_ENABLED_DEFAULT",
+    "EXIT_MA_MAX_PERIOD",
+    "EXIT_MA_MIN_PERIOD",
+    "EXIT_MA_PRESETS",
     "ENTRY_MODES",
     "LEVERAGE_CHOICES",
     "PROFIT_LOCK_SWITCH_CHOICES",

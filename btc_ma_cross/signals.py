@@ -24,6 +24,24 @@ def _timeframe_scale(timeframe):
     return (TIMEFRAME_MS.get(timeframe, 3_600_000) / 3_600_000) ** 0.5
 
 
+def _exit_period(cfg, slow_period):
+    """Validated exit SMA period, or None when the feature is off/invalid.
+
+    The exit line must be a real line (>= 2) and needs at least two of its
+    own values to detect a cross, so 1 or a corrupt value disables it
+    instead of raising: a bad config must never stop the bot.
+    """
+    if not cfg.get("exit_ma_enabled"):
+        return None
+    try:
+        period = int(float(cfg.get("exit_ma_period")))
+    except (TypeError, ValueError):
+        return None
+    if period < 2 or period > max(500, int(slow_period)):
+        return None
+    return period
+
+
 def market_is_flat(closed, cfg, lookback=100):
     """True for a frozen / untraded market (a horizontal-line chart)."""
     recent = closed[-lookback:]
@@ -44,6 +62,13 @@ def evaluate_cross(rows, cfg, now_ms, symbol="BTCUSDT", ccxt_symbol=None):
 
     ``side`` is set only on a fresh cross; ``trend_side`` always reports
     whether SMA(fast) is above (LONG) or below (SHORT) SMA(slow).
+
+    When the optional exit line is enabled (``exit_ma_enabled``), the same
+    closed candle is also tested against SMA(exit_ma_period):
+    ``exit_side`` is ``"LONG"`` / ``"SHORT"`` when SMA(fast) crossed the
+    exit line from below / above, and ``exit_trend_side`` reports which
+    side SMA(fast) currently sits on.  These fields are always present
+    (``None`` when the feature is off) so callers never KeyError.
     """
     timeframe = cfg["timeframe"]
     fast_p, slow_p = int(cfg["fast_period"]), int(cfg["slow_period"])
@@ -57,6 +82,10 @@ def evaluate_cross(rows, cfg, now_ms, symbol="BTCUSDT", ccxt_symbol=None):
         "side": None,
         "trend_side": None,
         "stale": False,
+        "exit_ma_enabled": bool(cfg.get("exit_ma_enabled")),
+        "exit_ma_period": None,
+        "exit_side": None,
+        "exit_trend_side": None,
     }
     if len(closed) < slow_p + 1:
         result["skip_reason"] = f"INSUFFICIENT_CANDLES:{len(closed)}<{slow_p + 1}"
@@ -68,6 +97,9 @@ def evaluate_cross(rows, cfg, now_ms, symbol="BTCUSDT", ccxt_symbol=None):
     closes = [r[4] for r in closed]
     fast, slow = sma(closes, fast_p), sma(closes, slow_p)
     bar = closed[-1]
+    exit_p = _exit_period(cfg, slow_p)
+    if exit_p is not None and len(closed) < exit_p + 1:
+        exit_p = None  # not enough history: never trade on a half-computed line
     result.update(
         bar_open_ms=bar[0],
         close=bar[4],
@@ -78,6 +110,15 @@ def evaluate_cross(rows, cfg, now_ms, symbol="BTCUSDT", ccxt_symbol=None):
         signal_age_seconds=(int(now_ms) - bar[0] - TIMEFRAME_MS[timeframe]) / 1000.0,
     )
     result["trend_side"] = "LONG" if fast[-1] > slow[-1] else ("SHORT" if fast[-1] < slow[-1] else None)
+    if exit_p is not None:
+        exit_line = sma(closes, exit_p)
+        result.update(exit_ma_period=exit_p, sma_exit=exit_line[-1], sma_exit_prev=exit_line[-2])
+        result["exit_trend_side"] = ("LONG" if fast[-1] > exit_line[-1]
+                                     else ("SHORT" if fast[-1] < exit_line[-1] else None))
+        if fast[-2] <= exit_line[-2] and fast[-1] > exit_line[-1]:
+            result["exit_side"] = "LONG"
+        elif fast[-2] >= exit_line[-2] and fast[-1] < exit_line[-1]:
+            result["exit_side"] = "SHORT"
     # On 3m/5m candles a signal older than half a candle is no longer fresh.
     max_age = min(float(cfg["signal_max_age_seconds"]), TIMEFRAME_MS[timeframe] / 2000.0)
     result["stale"] = result["signal_age_seconds"] > max_age
@@ -129,6 +170,7 @@ def emergency_stop_price(side, entry_price, leverage, roi_percent):
 __all__ = (
     "emergency_stop_price",
     "evaluate_cross",
+    "_exit_period",
     "market_is_flat",
     "margin_roi",
     "profit_lock_target",

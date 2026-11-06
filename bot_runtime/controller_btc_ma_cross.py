@@ -15,6 +15,10 @@ from btc_ma_cross.config import (
     CONFIG_KEY,
     DEFAULT_LEVERAGE,
     EMERGENCY_STOP_CHOICES,
+    EXIT_MA_DEFAULT_PERIOD,
+    EXIT_MA_MAX_PERIOD,
+    EXIT_MA_MIN_PERIOD,
+    EXIT_MA_PRESETS,
     LEVERAGE_CHOICES,
     REENTRY_WAIT_CHOICES,
     SLOW_PERIOD_CHOICES,
@@ -91,6 +95,71 @@ def _us_session_text(session):
 
 PICK_LIST_SIZE = 12
 DEFAULT_PROFIT_LOCK_SWITCH_COUNT = 3
+
+
+def _exit_ma_setting(cfg, state=None):
+    """(enabled, period) of the custom exit line from the normalized config."""
+    return bool(cfg.get("exit_ma_enabled")), int(cfg.get("exit_ma_period") or EXIT_MA_DEFAULT_PERIOD)
+
+
+def _exit_ma_text(cfg, state=None):
+    """One-line 상태 화면 설명 (켰을 때만 동작을 덧붙인다)."""
+    enabled, period = _exit_ma_setting(cfg)
+    if not enabled:
+        return "OFF (반대 크로스에서만 청산 · 반대 방향 즉시 진입)"
+    return (f"ON · SMA{cfg.get('fast_period', 3)}가 SMA{period}을(를) 반대로 돌파하면 청산 "
+            f"· 청산 후 반대 진입 없이 다음 SMA{cfg.get('fast_period', 3)}/"
+            f"SMA{cfg.get('slow_period', 200)} 크로스 마감까지 현금 대기")
+
+
+def _exit_ma_button(cfg, state=None):
+    enabled, period = _exit_ma_setting(cfg)
+    return f"🔻 청산 MA: {('SMA' + str(period)) if enabled else 'OFF'}"
+
+
+def _entry_mode_text_with_exit_ma(cfg):
+    """Entry description that reflects the custom-exit rule when it is on."""
+    enabled, period = _exit_ma_setting(cfg)
+    fast = cfg.get("fast_period", 3)
+    slow = cfg.get("slow_period", 200)
+    if enabled:
+        return (f"크로스 마감 진입만 (SMA{fast}이 SMA{slow}을 상향 돌파한 봉 마감=롱 / "
+                f"하향 돌파한 봉 마감=숏) — 청산 MA ON 중에는 방향 유지 진입·즉시 반대 진입 없음")
+    return _entry_mode_text(cfg)
+
+
+def _rotation_text_with_exit_ma(cfg):
+    if cfg.get("exit_ma_enabled"):
+        return "OFF (청산 MA ON 중에는 청산 직후 다른 코인으로 바로 진입하지 않음)"
+    return _rotation_text(cfg)
+
+
+def parse_exit_ma_command(args):
+    """(enabled, period) from "exit 25" / "off" / "on 69" — PeriodError-ready."""
+    tokens = [str(a).strip().lower() for a in list(args or []) if str(a).strip()]
+    # "/btcma exit 25" passes the leading keyword through; it is not a value.
+    while tokens and tokens[0] in ("exit", "xma", "exitma", "청산"):
+        tokens.pop(0)
+    if not tokens:
+        raise PeriodError("값이 없습니다. 예) /btcma exit 25 · /btcma exit off")
+    head = tokens[0]
+    if head[:1].isdigit() and len(tokens) > 1:
+        raise PeriodError("값이 너무 많습니다. 예) /btcma exit 25")
+    if head in ("off", "0"):
+        return False, EXIT_MA_DEFAULT_PERIOD
+    if head == "on":
+        if len(tokens) > 2:
+            raise PeriodError("값이 너무 많습니다. 예) /btcma exit on 25")
+        if len(tokens) < 2:
+            return True, EXIT_MA_DEFAULT_PERIOD
+        head = tokens[1]
+    try:
+        period = int(float(head))
+    except (TypeError, ValueError):
+        raise PeriodError(f"숫자가 아닙니다: {head} — 예) /btcma exit 25") from None
+    if period < EXIT_MA_MIN_PERIOD or period > EXIT_MA_MAX_PERIOD:
+        raise PeriodError(f"청산 MA는 {EXIT_MA_MIN_PERIOD}~{EXIT_MA_MAX_PERIOD} 사이여야 합니다 (입력: {period}).")
+    return True, period
 
 
 def _profit_lock_switch_text(cfg, state=None):
@@ -226,6 +295,19 @@ class ControllerBtcMaCrossMixin:
                 InlineKeyboardButton(mark(cfg.get("entry_mode") == "trend", "📈 방향 유지 중 진입"), callback_data="bm:entry:trend"),
             ],
             [
+                InlineKeyboardButton(_exit_ma_button(cfg, state),
+                                     callback_data="bm:xma:" + ("off" if cfg.get("exit_ma_enabled") else "on")),
+            ],
+            [
+                InlineKeyboardButton(
+                    mark(cfg.get("exit_ma_enabled") and int(cfg.get("exit_ma_period") or 0) == period,
+                         f"청산 MA {period}"),
+                    callback_data=f"bm:xmap:{period}",
+                )
+                for period in EXIT_MA_PRESETS
+            ]
+            + [InlineKeyboardButton("✏️ 청산 MA 직접 입력", callback_data="bm:xma_help")],
+            [
                 InlineKeyboardButton(
                     _profit_lock_switch_button(cfg, state),
                     callback_data="bm:pls:" + ("off" if int(cfg.get("profit_lock_switch_count") or 0) else "on"),
@@ -343,6 +425,29 @@ class ControllerBtcMaCrossMixin:
             f"• 봉 {cfg['timeframe']} 기준 · 신호 계산에 {cfg['candle_history']}봉 사용{note}"
         )
 
+    async def _set_btc_ma_cross_exit_ma(self, enabled, period):
+        """Store the custom exit line; clears stale blocks when switching off."""
+        service = self._btc_ma_cross_service()
+        await self._set_btc_ma_cross_value("exit_ma_period", int(period))
+        await self._set_btc_ma_cross_value("exit_ma_enabled", bool(enabled))
+        cfg = service.config()
+        network = service.current_network(cfg)
+        if not network:
+            return
+        mode = service.mode(cfg)
+        state = service.load_state(network, mode)
+        changed = False
+        if not enabled and state.get("reentry_block"):
+            state["reentry_block"] = {}
+            changed = True
+        if enabled and mode == TRADING_MODE_LIVE:
+            # Re-evaluate the newest closed candle against the new line.
+            if state.get("last_evaluated_bar"):
+                state["last_evaluated_bar"] = 0
+                changed = True
+        if changed:
+            service.save_state(network, mode, state)
+
     async def _set_btc_ma_cross_coin(self, network, text):
         service = self._btc_ma_cross_service()
         try:
@@ -383,9 +488,10 @@ class ControllerBtcMaCrossMixin:
             f"거래소: {NETWORK_LABELS.get(network, network)} (/setup 선택을 따름) · API 키: {'있음' if status['has_credentials'] else '없음'}",
             f"메인 선물 자동매매: {'일시정지' if getattr(self, 'is_paused', False) else '동작 중'} (선물 전략은 하나만 켜짐)",
             f"종목: {_scope_text(cfg)}",
-            f"진입: {_entry_mode_text(cfg)}",
+            f"진입: {_entry_mode_text_with_exit_ma(cfg)}",
+            f"청산 MA: {_exit_ma_text(cfg, state)}",
             f"익절 자동 전환: {_profit_lock_switch_text(cfg, state)}",
-            f"청산 후 다른 코인 전환: {_rotation_text(cfg)}",
+            f"청산 후 다른 코인 전환: {_rotation_text_with_exit_ma(cfg)}",
             f"봉: {TIMEFRAME_LABELS[cfg['timeframe']]} (마감봉 기준) · SMA {cfg['fast_period']}/{cfg['slow_period']}",
             f"레버리지 {cfg['leverage']}x ISOLATED (2~5x 선택, 다음 진입부터) · 증거금: 가용 잔고의 {_n(cfg['margin_fraction']) * 100:.0f}%",
             f"비상손절: {'OFF' if stop == 0 else f'증거금 -{stop}% (Mark 기준)'}",
@@ -404,7 +510,9 @@ class ControllerBtcMaCrossMixin:
                 "",
                 f"보유: {trade.get('market_id') or 'BTCUSDT'} {trade.get('side')} {trade.get('quantity')} @ {trade.get('entry_price')} "
                 f"(증거금 {_n(trade.get('margin_used')):.2f} USDT)",
-                f"비상손절 {trade.get('stop_price') or 'OFF'} · 수익 확보 "
+                f"청산 기준 SMA{trade.get('fast_period', 3)}"
+                + (f"/SMA{trade.get('exit_ma_period')} (청산 MA)" if trade.get("exit_ma_enabled") else f"/SMA{trade.get('slow_period', 200)} (반대 크로스)")
+                + f" · 비상손절 {trade.get('stop_price') or 'OFF'} · 수익 확보 "
                 + (f"+{_n(trade.get('lock_roi')):g}% @ {trade.get('lock_price')}" if trade.get("lock_price") else "아직 없음 (+5% 도달 전)"),
             ]
         else:
@@ -469,22 +577,37 @@ class ControllerBtcMaCrossMixin:
 
     def _btc_ma_cross_rules_text(self, cfg):
         stop = int(cfg["emergency_stop_roi_percent"])
-        return (
-            f"📘 {cfg['fast_period']}/{cfg['slow_period']} SMA 크로스 규칙 (기간은 /btcma 또는 버튼으로 변경)\n"
-            f"• 종목: {_scope_text(cfg)} (TradFi·스테이블코인 제외, 🎯 코인 지정 또는 /macoin SOL 로 1개 지정)\n"
-            f"• 진입: {_entry_mode_text(cfg)}\n"
-            f"• 익절 자동 전환: {_profit_lock_switch_text(cfg)}\n"
-            f"• 청산 후 다른 코인 전환: {_rotation_text(cfg)}\n"
-            f"• 봉: {TIMEFRAME_LABELS[cfg['timeframe']]} 마감봉 기준, 진입·청산(반대 크로스) 모두 같은 봉 (3분~4시간 선택)\n"
-            "• 보유 중 반대 크로스(또는 봉 마감 때 SMA3이 반대편): 시장가(reduce-only) 청산 후 즉시 반대 방향 진입\n"
-            f"• 수익 확보(증거금 기준): {self._btc_ma_cross_lock_table(cfg)} (항상 도달 칸 {cfg['lock_gap_percent']}% 아래, 한 번 올라간 손절은 내려가지 않음)\n"
-            "• 수익 확보 손절로 청산되면 다음 크로스까지 대기\n"
-            f"• 비상손절: {'OFF' if stop == 0 else f'증거금 -{stop}%'} (메뉴에서 선택, 거래소에 Mark 기준으로 걸림)\n"
-            f"• 레버리지 {cfg['leverage']}배 ISOLATED 선택(2~5배, 다음 진입부터), 가용 증거금의 {_n(cfg['margin_fraction']) * 100:.0f}% 사용, 계좌 전체 1포지션\n"
-            "• 🏦 TradFi만: 바이낸스 메인넷 전용 · 미국주식 TradFi + 금만 · 미국 정규장 시간에만 신규 진입\n"
-            "• 거래소는 /setup 선택을 따르고, 켜면 다른 선물 자동전략은 멈춤\n"
-            "• 수익을 보장하지 않는 전략입니다."
+        exit_ma_on = bool(cfg.get("exit_ma_enabled"))
+        cross_line = (
+            f"• 청산: 반대 크로스(SMA{cfg['fast_period']} ↓/↑ SMA{cfg['slow_period']})에서 시장가 청산"
+            + (" (반대 진입 없음, 다음 크로스 마감까지 대기)" if exit_ma_on else " 후 즉시 반대 방향 진입")
         )
+        hold_line = (
+            "• 청산 MA ON: 청산 MA 크로스와 반대 크로스 중 먼저 닿는 쪽에서 시장가(reduce-only) 청산, "
+            "반대 진입은 하지 않고 다음 크로스 마감까지 현금 대기"
+            if exit_ma_on
+            else "• 보유 중 반대 크로스(또는 봉 마감 때 SMA가 반대편): 시장가(reduce-only) 청산 후 즉시 반대 방향 진입"
+        )
+        return "\n".join([
+            f"📘 {cfg['fast_period']}/{cfg['slow_period']} SMA 크로스 규칙 (기간은 /btcma 또는 버튼으로 변경)",
+            f"• 종목: {_scope_text(cfg)} (TradFi·스테이블코인 제외, 🎯 코인 지정 또는 /macoin SOL 로 1개 지정)",
+            f"• 진입: {_entry_mode_text_with_exit_ma(cfg)}",
+            cross_line,
+            f"• 추가 청산 MA: {_exit_ma_text(cfg)}",
+            f"• 익절 자동 전환: {_profit_lock_switch_text(cfg)}",
+            f"• 청산 후 다른 코인 전환: {_rotation_text_with_exit_ma(cfg)}",
+            f"• 봉: {TIMEFRAME_LABELS[cfg['timeframe']]} 마감봉 기준, 진입·청산 모두 같은 봉 (3분~4시간 선택)",
+            hold_line,
+            f"• 수익 확보(증거금 기준): {self._btc_ma_cross_lock_table(cfg)} "
+            f"(항상 도달 칸 {cfg['lock_gap_percent']}% 아래, 한 번 올라간 손절은 내려가지 않음)",
+            "• 수익 확보 손절로 청산되면 다음 크로스까지 대기",
+            f"• 비상손절: {'OFF' if stop == 0 else f'증거금 -{stop}%'} (메뉴에서 선택, 거래소에 Mark 기준으로 걸림)",
+            f"• 레버리지 {cfg['leverage']}배 ISOLATED 선택(2~5배, 다음 진입부터), "
+            f"가용 증거금의 {_n(cfg['margin_fraction']) * 100:.0f}% 사용, 계좌 전체 1포지션",
+            "• 🏦 TradFi만: 바이낸스 메인넷 전용 · 미국주식 TradFi + 금만 · 미국 정규장 시간에만 신규 진입",
+            "• 거래소는 /setup 선택을 따르고, 켜면 다른 선물 자동전략은 멈춤",
+            "• 수익을 보장하지 않는 전략입니다.",
+        ])
 
     async def _edit_btc_ma_cross(self, query, text, keyboard):
         try:
@@ -610,6 +733,44 @@ class ControllerBtcMaCrossMixin:
                 await self._set_btc_ma_cross_value("scan_scope", scope)
             note = "\n(보유 중인 포지션은 그대로 관리, 다음 진입부터 적용)" if holding else ""
             return f"🔎 종목: {_scope_text(service.config())}{note}\n\n" + await self._format_btc_ma_cross_status(), keyboard()
+        if action.startswith("xma:"):
+            enable = action.split(":", 1)[1] == "on"
+            await self._set_btc_ma_cross_exit_ma(enable, int(cfg.get("exit_ma_period") or EXIT_MA_DEFAULT_PERIOD))
+            cfg_now = service.config()
+            state = service.load_state(network, service.mode(cfg_now))
+            note = ""
+            if holding:
+                enabled_now, period_now = _exit_ma_setting(cfg_now)
+                note = (f"\n보유 중 포지션에도 다음 봉 마감부터 SMA{period_now} 청산 기준을 적용합니다 "
+                        "— 조건이 먼저 닿으면 청산하고, 다음 크로스 마감까지 재진입하지 않습니다.") if enabled_now else \
+                       "\n보유 중 포지션은 다시 반대 크로스 청산 + 즉시 반대 진입 방식으로 관리합니다."
+            return (f"🔻 청산 MA: {_exit_ma_text(cfg_now)}{note}\n\n"
+                    + await self._format_btc_ma_cross_status()), keyboard()
+        if action.startswith("xmap:"):
+            try:
+                period = int(action.split(":", 1)[1])
+            except ValueError:
+                period = -1
+            if period < EXIT_MA_MIN_PERIOD or period > EXIT_MA_MAX_PERIOD:
+                return "⚠️ 청산 MA 값이 올바르지 않습니다.", keyboard()
+            await self._set_btc_ma_cross_exit_ma(True, period)
+            note = "\n(보유 중 포지션은 다음 봉 마감부터 적용)" if holding else ""
+            return (f"🔻 청산 MA {period} ON: {_exit_ma_text(service.config())}{note}\n\n"
+                    + await self._format_btc_ma_cross_status()), keyboard()
+        if action == "xma_help":
+            enabled_now, period_now = _exit_ma_setting(cfg)
+            return (
+                "✏️ 청산 MA 직접 입력\n"
+                f"지금: {'SMA' + str(period_now) + ' (ON)' if enabled_now else 'OFF'}\n\n"
+                "명령: /btcma exit <기간>\n"
+                "예) /btcma exit 25 → SMA3 / SMA25 크로스에서 청산\n"
+                "예) /btcma exit 69 → SMA3 / SMA69 크로스에서 청산\n"
+                "끄기: /btcma exit off (기본값)\n\n"
+                f"• {EXIT_MA_MIN_PERIOD}~{EXIT_MA_MAX_PERIOD} 사이, 기본 {EXIT_MA_DEFAULT_PERIOD}\n"
+                "• 켜면 청산은 그대로 하되(수익확보·비상손절도 그대로), 반대 크로스에서도 "
+                "반대 진입을 하지 않고 다음 크로스 마감까지 대기합니다.",
+                keyboard(),
+            )
         if action.startswith("lev:"):
             try:
                 choice = int(action.split(":", 1)[1])
@@ -727,6 +888,10 @@ class ControllerBtcMaCrossMixin:
             return (f"⚠️ 이 전략의 {held.get('market_id') or 'BTCUSDT'} 포지션을 시장가(reduce-only)로 청산할까요?",
                     keyboard(("✅ 청산 확인", "bm:confirm_close")))
         if action == "confirm_close":
+            live_state = service.load_state(network, service.mode(service.config()))
+            if live_state.get("reentry_block"):
+                live_state["reentry_block"] = {}
+                service.save_state(network, service.mode(service.config()), live_state)
             result = await service.close_position()
             return f"🔻 청산 요청: {result.get('action')} {result.get('reason') or ''}\n\n" + await self._format_btc_ma_cross_status(), keyboard()
         return await self._format_btc_ma_cross_status(), keyboard()
@@ -772,6 +937,21 @@ class ControllerBtcMaCrossMixin:
         async def btc_ma_period_cmd(update, context):
             service = self._btc_ma_cross_service()
             args = list(getattr(context, "args", None) or [])
+            if args and str(args[0]).strip().lower() in ("exit", "xma", "exitma"):
+                try:
+                    enabled, period = parse_exit_ma_command(args[1:])
+                except PeriodError as exc:
+                    await update.message.reply_text(
+                        f"⚠️ 청산 MA 설정 실패: {exc}\n예) /btcma exit 25 · /btcma exit off")
+                    return
+                await self._set_btc_ma_cross_exit_ma(enabled, period)
+                cfg = service.config()
+                await update.message.reply_text(
+                    f"🔻 청산 MA: {_exit_ma_text(cfg)}\n\n" + await self._format_btc_ma_cross_status(),
+                    reply_markup=self._build_btc_ma_cross_keyboard(
+                        cfg, state=self._btc_ma_cross_state()),
+                )
+                return
             if not args:
                 _, help_text = await self._handle_btc_ma_cross_action("sma_help")
                 await update.message.reply_text(

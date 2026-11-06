@@ -8,6 +8,9 @@ exit logic differ:
 * entry: a fresh SMA3/SMA200 cross on a closed candle, or (trend mode) the
   SMA3 already above / below SMA200; one position, highest volume first
 * opposite cross while holding: close (reduce-only) and enter the other way
+* optional custom exit line (SMA(fast) vs SMA(exit_ma_period)): when it is on,
+  any exit closes only -- the coin waits for the next SMA(fast)/SMA(slow)
+  cross (long: close above, short: close below) before entering again
 * profit lock: margin ROI +5% -> stop at +4%, then one step per +5%
 * optional emergency stop (margin-ROI loss, closePosition on mark price)
 * after a profit-lock / emergency / manual exit: that coin waits for its
@@ -73,6 +76,8 @@ TRADFI_MAINNET_ONLY_REASON = "TRADFI_MAINNET_ONLY"
 TRADFI_SESSION_CLOSED_REASON = "TRADFI_US_SESSION_CLOSED"
 
 PROFIT_LOCK_EXIT_REASON = "PROFIT_LOCK"
+CUSTOM_EXIT_REASON = "CUSTOM_MA_EXIT"
+CROSS_EXIT_REASON = "CROSS_EXIT"
 FORCED_ENTRY_MODE = "cross"
 ENTRY_MODE_SWITCH_STATE_KEYS = ("pending_entry_mode_switch", "last_entry_mode_switch")
 
@@ -507,6 +512,30 @@ class BtcMaCrossService(BtcEmaPullbackService):
                 lines.append(f"{market} {side_text} 재진입 대기: {waited}/{needed}봉 (반대 크로스 시 즉시 해제)")
         return lines
 
+    def _custom_exit_signal(self, cfg, trade, signal):
+        """Close-only signal from the optional exit line, or None.
+
+        A fresh SMA(fast)/SMA(exit) cross against the position, or SMA(fast)
+        already sitting on the other side of the exit line at a candle close
+        (a cross missed while the bot was down).
+        """
+        if not signal or not cfg.get("exit_ma_enabled"):
+            return None
+        side = signal.get("exit_side")
+        if side and side != trade["side"]:
+            kind = "cross"
+        else:
+            trend = signal.get("exit_trend_side")
+            if not trend or trend == trade["side"] or signal.get("flat"):
+                return None
+            side, kind = trend, "realign"
+        custom = dict(signal)
+        custom.update(side=side, entry_type="CUSTOM_EXIT", skip_reason="", exit_kind=kind,
+                      signal_id=(f"{signal.get('market_id')}:SMA{cfg['fast_period']}/"
+                                 f"SMA{cfg['exit_ma_period']}:CUSTOM_EXIT:{kind}:{side}:"
+                                 f"{signal.get('bar_open_ms')}"))
+        return custom
+
     def _opposite_signal(self, cfg, trade, signal):
         """Signal to reverse the held position on, or None.
 
@@ -514,24 +543,45 @@ class BtcMaCrossService(BtcEmaPullbackService):
         sitting on the other side of the selected SMA at a candle close -- after
         switching SMA200 <-> SMA120 while holding, or a cross missed while the
         bot was down -- so the position always follows the chosen line.
+
+        With the custom exit line ON a cross exit is close-only: the signal is
+        returned with ``close_only=True`` and the service does not reverse.
         """
         if not signal:
             return None
         if signal.get("side") and signal["side"] != trade["side"]:
+            if cfg.get("exit_ma_enabled"):
+                close_only = dict(signal, close_only=True, entry_type="CROSS_EXIT")
+                return close_only
             return signal
         trend = signal.get("trend_side")
         if not trend or trend == trade["side"] or signal.get("flat"):
             return None
         realigned = dict(signal)
-        realigned.update(side=trend, entry_type="REALIGN", skip_reason="",
+        realigned.update(side=trend, skip_reason="",
                          signal_id=(f"{signal['market_id']}:SMA{cfg['fast_period']}/{cfg['slow_period']}:"
                                     f"{cfg['timeframe']}:REALIGN:{trend}:{signal.get('bar_open_ms')}"))
+        if cfg.get("exit_ma_enabled"):
+            # Custom exit ON: the line-choice realign also closes only.
+            realigned.update(close_only=True, entry_type="CROSS_EXIT")
+        else:
+            realigned.update(entry_type="REALIGN")
         return realigned
 
     def _entry_signal(self, cfg, state, result):
-        """Entry signal for one scanned coin, or None."""
+        """Entry signal for one scanned coin, or None.
+
+        With the custom exit line ON the re-entry rule is stricter: only the
+        original SMA(fast)/SMA(slow) cross may open a position (long: closed
+        above, short: closed below).  The trend-mode "already above/below"
+        entry would re-enter right after the custom exit, so it is off.
+        """
         if result.get("side"):
             return result
+        if cfg.get("exit_ma_enabled"):
+            if result.get("trend_side"):
+                result["skip_reason"] = "CUSTOM_EXIT_ONLY_CROSS_ENTRY"
+            return None
         if cfg["entry_mode"] != "trend" or result.get("stale") or not result.get("trend_side"):
             return None
         blocked, waited, needed = self._reentry_wait(cfg, state, result)
@@ -812,6 +862,8 @@ class BtcMaCrossService(BtcEmaPullbackService):
         return decision, "", context
 
     def _new_trade(self, network, mode, signal, decision, context, *, trade_id, entry_price, quantity, entry_ms, rules, cfg):
+        # A custom-exit close records which line triggered it (shown in the exit text).
+        custom_exit_kind = (signal.get("exit_kind") or "") if signal.get("entry_type") == "CUSTOM_EXIT" else ""
         entry = D(entry_price)
         qty = D(quantity)
         leverage = int(cfg["leverage"])
@@ -856,21 +908,34 @@ class BtcMaCrossService(BtcEmaPullbackService):
             "timeframe": cfg["timeframe"],
             "slow_period": cfg["slow_period"],
             "fast_period": cfg["fast_period"],
+            "exit_ma_enabled": bool(cfg.get("exit_ma_enabled")),
+            "exit_ma_period": int(cfg.get("exit_ma_period") or 0) if cfg.get("exit_ma_enabled") else None,
+            "custom_exit_kind": custom_exit_kind,
             "tick_size": str(rules.tick_size),
         }
 
     def _on_trade_closed(self, network, mode, state, trade):
-        """After a profit-lock / stop / manual exit the coin waits for its next cross."""
+        """After a profit-lock / stop / manual exit the coin waits for its next cross.
+
+        Only a real stop-and-reverse (CROSS_REVERSE) releases the wait.  With the
+        custom exit line ON a cross exit is close-only (CROSS_EXIT), so it blocks
+        re-entry just like a profit-lock exit: the coin stays flat until the next
+        SMA(fast)/SMA(slow) cross closes.
+        """
         self._count_profit_lock_exits(state, trade)
         blocks = dict(state.get("reentry_block") or {})
         market = trade.get("market_id") or trade.get("symbol") or MARKET_ID
-        if trade.get("exit_reason") == "CROSS_REVERSE":
+        cfg_now = self.config()
+        if trade.get("exit_reason") == "CROSS_REVERSE" and not cfg_now.get("exit_ma_enabled"):
             blocks.pop(market, None)
         else:
             blocks[market] = {"side": trade.get("side"), "exit_ms": self.now_ms(),
                               "exit_reason": trade.get("exit_reason")}
-            cfg = self.config()
-            if cfg["entry_mode"] == "trend" and cfg["rotate_after_exit"] and cfg["scan_scope"] != "single":
+            cfg = cfg_now
+            # With the custom exit line ON entries are cross-only, so the
+            # rotate-after-exit "enter the other coin at once" is off too.
+            if (not cfg.get("exit_ma_enabled") and cfg["entry_mode"] == "trend"
+                    and cfg["rotate_after_exit"] and cfg["scan_scope"] != "single"):
                 state["rotation_pending"] = {"exclude": market, "exit_ms": self.now_ms(),
                                              "exit_reason": trade.get("exit_reason")}
         state["reentry_block"] = blocks
@@ -1108,6 +1173,9 @@ class BtcMaCrossService(BtcEmaPullbackService):
             return await self._reverse_live(network, cfg, state, pending)
         signal, _ = await self._evaluate_new_bar(network, cfg, mode, state, trade)
         trade = state["trade"]
+        custom = self._custom_exit_signal(cfg, trade, signal)
+        if custom:
+            return await self._reverse_live(network, cfg, state, custom)
         opposite = self._opposite_signal(cfg, trade, signal)
         if opposite:
             return await self._reverse_live(network, cfg, state, opposite)
@@ -1129,7 +1197,21 @@ class BtcMaCrossService(BtcEmaPullbackService):
         return {"action": "managed"}
 
     async def _reverse_live(self, network, cfg, state, signal):
-        """Opposite cross: close the position, then enter the other way."""
+        """Opposite cross: close the position, then enter the other way.
+
+        Custom exit ON: the close is booked as CROSS_EXIT / CUSTOM_MA_EXIT and
+        no opposite position is opened; the coin waits for its next cross.
+        """
+        if cfg.get("exit_ma_enabled"):
+            custom = signal.get("entry_type") == "CUSTOM_EXIT"
+            reason = CUSTOM_EXIT_REASON if custom else CROSS_EXIT_REASON
+            if custom:
+                # _close_live -> finalize_live reloads the state from disk, so the
+                # reason detail must be written before the close (same pattern as
+                # pending_reverse below).
+                state["trade"]["custom_exit_kind"] = signal.get("exit_kind") or "cross"
+                self.save_state(network, TRADING_MODE_LIVE, state)
+            return await self._close_live(network, cfg, state, reason.lower(), reason)
         trade = state["trade"]
         trade["pending_reverse"] = signal
         state["trade"] = trade
@@ -1247,6 +1329,15 @@ class BtcMaCrossService(BtcEmaPullbackService):
         state["trade"] = trade
         self.save_state(network, mode, state)
         signal, _ = await self._evaluate_new_bar(network, cfg, mode, state, trade)
+        custom = self._custom_exit_signal(cfg, trade, signal)
+        if custom:
+            try:
+                price = (await self.premium_index(network, market))["mark_price"]
+            except Exception:
+                price = _f(custom.get("close"))
+            price = price * (1 - slip) if long else price * (1 + slip)
+            await self.finalize_paper(network, cfg, state, price, CUSTOM_EXIT_REASON, now)
+            return {"action": "exited", "reason": CUSTOM_EXIT_REASON}
         signal = self._opposite_signal(cfg, trade, signal)
         if signal:
             try:
@@ -1254,10 +1345,11 @@ class BtcMaCrossService(BtcEmaPullbackService):
             except Exception:
                 price = _f(signal.get("close"))
             price = price * (1 - slip) if long else price * (1 + slip)
-            await self.finalize_paper(network, cfg, state, price, "CROSS_REVERSE", now)
+            reason = CROSS_EXIT_REASON if cfg.get("exit_ma_enabled") else "CROSS_REVERSE"
+            await self.finalize_paper(network, cfg, state, price, reason, now)
             state = self.load_state(network, mode)
-            if not cfg["enabled"]:
-                return {"action": "exited", "reason": "CROSS_REVERSE"}
+            if not cfg["enabled"] or cfg.get("exit_ma_enabled"):
+                return {"action": "exited", "reason": reason}
             entered = await self._enter_on_signal(network, cfg, mode, state, signal)
             return {"action": "reversed", "entry": entered}
         return {"action": "managed"}
@@ -1281,8 +1373,16 @@ class BtcMaCrossService(BtcEmaPullbackService):
     def _exit_text(self, trade, mode):
         tag = "🧪 DRY_RUN" if mode == TRADING_MODE_DRY_RUN else "💥 LIVE"
         roi = _f(trade.get("net_pnl")) / max(_f(trade.get("margin_used")), 1e-9) * 100
+        reason = trade["exit_reason"]
+        if reason == CUSTOM_EXIT_REASON:
+            reason = (f"{reason} — SMA{trade.get('fast_period', 3)} / "
+                      f"SMA{trade.get('exit_ma_period') or '?'} {trade.get('custom_exit_kind') or 'cross'}, "
+                      "재진입은 다음 크로스 마감까지 대기")
+        elif reason == CROSS_EXIT_REASON:
+            reason = (f"{reason} — SMA{trade.get('fast_period', 3)} / "
+                      f"SMA{trade.get('slow_period', 200)} 반대 크로스, 재진입은 다음 크로스 마감까지 대기")
         return (
-            f"🏁 {self.LABEL} 청산 ({tag} · {trade['network']}) — {trade['exit_reason']}\n"
+            f"🏁 {self.LABEL} 청산 ({tag} · {trade['network']}) — {reason}\n"
             f"{trade.get('market_id') or MARKET_ID} {trade['side']} {trade['entry_price']} → {_fmt(trade['exit_price'])}\n"
             f"순손익 {_f(trade['net_pnl']):+.4f} USDT (증거금 대비 {roi:+.2f}%, 수수료 {_f(trade['commission']):.4f}, "
             f"펀딩 {_f(trade['funding']):+.4f})"
