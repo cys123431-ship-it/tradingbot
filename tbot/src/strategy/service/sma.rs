@@ -50,6 +50,9 @@ pub(crate) const TRANSIENT_ENTRY_BLOCKS: &[&str] = &[
 
 /// Exit reason when the close crosses the stop SMA against the position.
 pub(crate) const STOP_MA_EXIT: &str = "SMA25_STOP";
+/// Close-only exits used while the custom exit line is ON.
+pub(crate) const CUSTOM_MA_EXIT: &str = "CUSTOM_MA_EXIT";
+pub(crate) const CROSS_EXIT: &str = "CROSS_EXIT";
 const STOP_MA_SIDE_MISMATCH: &str = "STOP_MA_SIDE_MISMATCH";
 const MIN_BALANCE_BLOCK: &str = "MIN_BALANCE";
 const DAILY_LOSS_BLOCK: &str = "DAILY_LOSS_LIMIT";
@@ -1409,6 +1412,64 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         lines
     }
 
+    /// Python `_custom_exit_signal`: close-only signal from the optional exit
+    /// line, or None.
+    ///
+    /// A fresh SMA(fast)/SMA(exit) cross against the position -- or SMA(fast)
+    /// already sitting on the other side of the exit line at a candle close (a
+    /// cross missed while the bot was down) -- closes without reversing.
+    pub(crate) fn custom_exit_signal(
+        &self,
+        cfg: &Value,
+        trade: &Map<String, Value>,
+        signal: Option<&Value>,
+    ) -> Option<Value> {
+        let signal = signal?;
+        if signal.is_null() || !cfg.get("exit_ma_enabled").map(value_truthy).unwrap_or(false) {
+            return None;
+        }
+        let trade_side = trade.get("side").and_then(|v| v.as_str()).unwrap_or("");
+        let exit_side = signal
+            .get("exit_side")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let (side, kind) = if !exit_side.is_empty() && exit_side != trade_side {
+            (exit_side.to_string(), "cross")
+        } else {
+            let trend = signal
+                .get("exit_trend_side")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let flat = signal.get("flat").map(value_truthy).unwrap_or(false);
+            if trend.is_empty() || trend == trade_side || flat {
+                return None;
+            }
+            (trend.to_string(), "realign")
+        };
+        let mut custom = signal.as_object().cloned().unwrap_or_default();
+        let fast = int_or_zero(cfg.get("fast_period"));
+        let exit_p = int_or_zero(cfg.get("exit_ma_period"));
+        let market = signal
+            .get("market_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let bar = int_or_zero(signal.get("bar_open_ms"));
+        custom.insert("side".to_string(), Value::String(side.clone()));
+        custom.insert(
+            "entry_type".to_string(),
+            Value::String("CUSTOM_EXIT".to_string()),
+        );
+        custom.insert("skip_reason".to_string(), Value::String(String::new()));
+        custom.insert("exit_kind".to_string(), Value::String(kind.to_string()));
+        custom.insert(
+            "signal_id".to_string(),
+            Value::String(format!(
+                "{market}:SMA{fast}/SMA{exit_p}:CUSTOM_EXIT:{kind}:{side}:{bar}"
+            )),
+        );
+        Some(Value::Object(custom))
+    }
+
     pub(crate) fn opposite_signal(
         &self,
         cfg: &Value,
@@ -1421,7 +1482,19 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         }
         let trade_side = trade.get("side").and_then(|v| v.as_str()).unwrap_or("");
         let sig_side = signal.get("side").and_then(|v| v.as_str()).unwrap_or("");
+        let exit_on = cfg.get("exit_ma_enabled").map(value_truthy).unwrap_or(false);
         if !sig_side.is_empty() && sig_side != trade_side {
+            if exit_on {
+                // Custom exit ON: a cross exit closes only (CROSS_EXIT); the
+                // coin then waits for its next cross before re-entering.
+                let mut close_only = signal.as_object().cloned().unwrap_or_default();
+                close_only.insert("close_only".to_string(), Value::Bool(true));
+                close_only.insert(
+                    "entry_type".to_string(),
+                    Value::String(CROSS_EXIT.to_string()),
+                );
+                return Some(Value::Object(close_only));
+            }
             return Some(signal.clone());
         }
         let trend = signal
@@ -1453,10 +1526,19 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             }
         };
         realigned.insert("side".to_string(), Value::String(trend.to_string()));
-        realigned.insert(
-            "entry_type".to_string(),
-            Value::String("REALIGN".to_string()),
-        );
+        if exit_on {
+            // Custom exit ON: the line-choice realign also closes only.
+            realigned.insert("close_only".to_string(), Value::Bool(true));
+            realigned.insert(
+                "entry_type".to_string(),
+                Value::String(CROSS_EXIT.to_string()),
+            );
+        } else {
+            realigned.insert(
+                "entry_type".to_string(),
+                Value::String("REALIGN".to_string()),
+            );
+        }
         realigned.insert("skip_reason".to_string(), Value::String(String::new()));
         realigned.insert(
             "signal_id".to_string(),
@@ -1547,6 +1629,23 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         }
         if let Some(late) = self.late_cross_signal(cfg, state, result) {
             return Some(late);
+        }
+        if cfg.get("exit_ma_enabled").map(value_truthy).unwrap_or(false) {
+            // Only the original SMA(fast)/SMA(slow) cross may open a position.
+            let has_trend = result
+                .get("trend_side")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            if has_trend {
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert(
+                        "skip_reason".to_string(),
+                        Value::String("CUSTOM_EXIT_ONLY_CROSS_ENTRY".to_string()),
+                    );
+                }
+            }
+            return None;
         }
         let mode = cfg.get("entry_mode").and_then(|v| v.as_str()).unwrap_or("");
         let stale = result.get("stale").map(value_truthy).unwrap_or(false);
@@ -2594,6 +2693,23 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             "fast_period".to_string(),
             cfg.get("fast_period").cloned().unwrap_or(Value::Null),
         );
+        let exit_enabled = cfg.get("exit_ma_enabled").map(value_truthy).unwrap_or(false);
+        trade.insert("exit_ma_enabled".to_string(), Value::Bool(exit_enabled));
+        trade.insert(
+            "exit_ma_period".to_string(),
+            if exit_enabled {
+                cfg.get("exit_ma_period").cloned().unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            },
+        );
+        trade.insert(
+            "custom_exit_kind".to_string(),
+            signal
+                .get("exit_kind")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
         trade.insert(
             "tick_size".to_string(),
             Value::String(rules.tick_size.to_string()),
@@ -2629,7 +2745,12 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             .get("exit_reason")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if exit_reason == "CROSS_REVERSE" {
+        let exit_on = self
+            .config()
+            .get("exit_ma_enabled")
+            .map(value_truthy)
+            .unwrap_or(false);
+        if exit_reason == "CROSS_REVERSE" && !exit_on {
             blocks.remove(&market);
         } else {
             let mut block = Map::new();
@@ -2653,7 +2774,14 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
                 .map(value_truthy)
                 .unwrap_or(false);
             let scope = cfg.get("scan_scope").and_then(|v| v.as_str()).unwrap_or("");
-            if entry_mode == "trend" && rotate && scope != "single" && exit_reason != STOP_MA_EXIT {
+            // With the exit line ON entries are cross-only, so
+            // rotate-after-exit is off too.
+            if entry_mode == "trend"
+                && rotate
+                && scope != "single"
+                && exit_reason != STOP_MA_EXIT
+                && !exit_on
+            {
                 let mut rotation = Map::new();
                 rotation.insert("exclude".to_string(), Value::String(market));
                 rotation.insert("exit_ms".to_string(), json!(self.now_ms()));

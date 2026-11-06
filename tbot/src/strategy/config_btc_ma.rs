@@ -27,6 +27,15 @@ pub const LEVERAGE_CHOICES: &[i64] = &[2, 3, 4, 5];
 pub const DEFAULT_LEVERAGE: i64 = 5;
 /// Fixed stop line: close beyond SMA25 against the position exits it.
 pub const STOP_MA_PERIOD: i64 = 25;
+
+/// Optional custom exit line (추가 청산 조건): SMA(fast) crossing
+/// SMA(exit_ma_period) closes the position before the opposite
+/// SMA(fast)/SMA(slow) cross. While it is ON a cross exit is close-only:
+/// no reverse entry until the original cross closes a fresh candle.
+pub const EXIT_MA_ENABLED_DEFAULT: bool = false;
+pub const EXIT_MA_DEFAULT_PERIOD: i64 = 25;
+pub const EXIT_MA_MIN_PERIOD: i64 = 2;
+pub const EXIT_MA_MAX_PERIOD: i64 = 500;
 /// SMA25 stop on (25) / off (0).
 pub const STOP_MA_CHOICES: &[i64] = &[25, 0];
 /// Margin per entry in % of the available balance (Telegram buttons).
@@ -76,6 +85,8 @@ pub fn default_btc_ma_cross_config() -> Value {
         "scale_in_enabled": false,
         "stop_ma_period": STOP_MA_PERIOD,
         "cross_lookback_bars": 1,
+        "exit_ma_enabled": EXIT_MA_ENABLED_DEFAULT,
+        "exit_ma_period": EXIT_MA_DEFAULT_PERIOD,
         "min_balance_usdt": DEFAULT_MIN_BALANCE,
         "daily_loss_limit_pct": DEFAULT_DAILY_LOSS_LIMIT,
         "max_loss_streak": DEFAULT_LOSS_STREAK,
@@ -337,6 +348,25 @@ pub fn normalize_btc_ma_cross_config(raw: Option<&Value>) -> Value {
     let lookback =
         crate::strategy::config_base::py_int(cfg_obj.get("cross_lookback_bars"), 1, 1, 2);
     cfg_obj.insert("cross_lookback_bars".into(), json!(lookback));
+    // The exit line is optional and independent from the entry pair. A
+    // corrupted period falls back to the default instead of being clamped:
+    // a clamped value would quietly change the exit rule.
+    let exit_enabled = py_bool(cfg_obj.get("exit_ma_enabled"), EXIT_MA_ENABLED_DEFAULT);
+    let exit_period = match cfg_obj.get("exit_ma_period").and_then(int_of_value) {
+        Some(p) if (EXIT_MA_MIN_PERIOD..=EXIT_MA_MAX_PERIOD).contains(&p) => p,
+        _ => EXIT_MA_DEFAULT_PERIOD,
+    };
+    cfg_obj.insert("exit_ma_period".into(), json!(exit_period));
+    // Not enough candles to compute the line: the signal would never fire, so
+    // keep the feature off rather than pretend it is active.
+    let history = cfg_obj
+        .get("candle_history")
+        .and_then(int_of_value)
+        .unwrap_or(260);
+    cfg_obj.insert(
+        "exit_ma_enabled".into(),
+        Value::Bool(exit_enabled && exit_period <= history - 2),
+    );
     let min_balance = crate::strategy::config_base::py_int(
         cfg_obj.get("min_balance_usdt"),
         DEFAULT_MIN_BALANCE,

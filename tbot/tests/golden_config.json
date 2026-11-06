@@ -10312,7 +10312,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -10368,7 +10370,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -10473,7 +10477,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -10534,7 +10540,9 @@
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
         "allow_auto_raise_to_exchange_minimum": false,
-        "unknown_key": 1
+        "unknown_key": 1,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -10639,7 +10647,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -10744,7 +10754,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -10849,7 +10861,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -10954,7 +10968,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -11059,7 +11075,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -11164,7 +11182,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -11269,7 +11289,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -11374,7 +11396,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -11479,7 +11503,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -11584,7 +11610,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -11642,7 +11670,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -11700,7 +11730,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -11758,7 +11790,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -11816,7 +11850,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -11874,7 +11910,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -11932,7 +11970,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -11990,7 +12030,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -12048,7 +12090,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -12106,7 +12150,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -12164,7 +12210,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -12222,7 +12270,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -12280,7 +12330,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -12338,7 +12390,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -12396,7 +12450,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -12454,7 +12510,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -12512,7 +12570,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -12570,7 +12630,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -12628,7 +12690,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -12686,7 +12750,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -12744,7 +12810,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -12802,7 +12870,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -12860,7 +12930,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -12918,7 +12990,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -12976,7 +13050,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -13034,7 +13110,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -13092,7 +13170,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -13150,7 +13230,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -13208,7 +13290,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -13266,7 +13350,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -13324,7 +13410,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -13382,7 +13470,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -13440,7 +13530,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -13498,7 +13590,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -13556,7 +13650,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -13614,7 +13710,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -13672,7 +13770,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -13730,7 +13830,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -13788,7 +13890,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -13846,7 +13950,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -13904,7 +14010,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -13962,7 +14070,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -14020,7 +14130,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -14078,7 +14190,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -14136,7 +14250,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -14194,7 +14310,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -14252,7 +14370,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -14310,7 +14430,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -14368,7 +14490,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -14426,7 +14550,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -14484,7 +14610,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -14542,7 +14670,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -14601,7 +14731,9 @@
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
         "allow_auto_raise_to_exchange_minimum": false,
-        "feature_a_trend_filter": 1
+        "feature_a_trend_filter": 1,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -14660,7 +14792,9 @@
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
         "allow_auto_raise_to_exchange_minimum": false,
-        "feature_b_atr_stop": 1
+        "feature_b_atr_stop": 1,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -14719,7 +14853,9 @@
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
         "allow_auto_raise_to_exchange_minimum": false,
-        "feature_c_vol_sizing": 1
+        "feature_c_vol_sizing": 1,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -14778,7 +14914,9 @@
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
         "allow_auto_raise_to_exchange_minimum": false,
-        "feature_d_chandelier": 1
+        "feature_d_chandelier": 1,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -14837,7 +14975,9 @@
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
         "allow_auto_raise_to_exchange_minimum": false,
-        "feature_e_donchian": 1
+        "feature_e_donchian": 1,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -14895,7 +15035,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -14953,7 +15095,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -15011,7 +15155,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -15069,7 +15215,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -15127,7 +15275,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -15228,7 +15378,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -15333,7 +15485,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -15438,7 +15592,9 @@
         "rules_refresh_seconds": 300,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -15543,7 +15699,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -15648,7 +15806,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -15753,7 +15913,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -15858,7 +16020,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -15959,7 +16123,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -16064,7 +16230,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -16169,7 +16337,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -16270,7 +16440,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -16375,7 +16547,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -16480,7 +16654,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -16585,7 +16761,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -16690,7 +16868,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -16795,7 +16975,9 @@
         "rules_refresh_seconds": 300,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -16900,7 +17082,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -17005,7 +17189,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -17110,7 +17296,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -17215,7 +17403,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -17320,7 +17510,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -17421,7 +17613,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -17526,7 +17720,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -17631,7 +17827,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -17736,7 +17934,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -17841,7 +18041,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -17946,7 +18148,9 @@
         "rules_refresh_seconds": 300,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -18051,7 +18255,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -18156,7 +18362,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -18261,7 +18469,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -18366,7 +18576,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -18471,7 +18683,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -18576,7 +18790,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -18681,7 +18897,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -18782,7 +19000,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -18883,7 +19103,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -18984,7 +19206,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -19089,7 +19313,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "10",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -19194,7 +19420,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -19299,7 +19527,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {
@@ -30592,7 +30822,9 @@
         "rules_refresh_seconds": 3600,
         "dry_run_balance_usdt": "100",
         "day_timezone": "Asia/Seoul",
-        "allow_auto_raise_to_exchange_minimum": false
+        "allow_auto_raise_to_exchange_minimum": false,
+        "exit_ma_period": 25,
+        "exit_ma_enabled": false
       }
     },
     {

@@ -1397,3 +1397,305 @@ async fn scale_in_also_applies_in_dry_run() {
     // No real order is ever sent in DRY_RUN.
     assert!(h.fake.with_state(|s| s.position.is_none()));
 }
+
+// ------------------------------------------------------- custom exit MA (추가 청산)
+
+use tbot::core::sma_cross::{evaluate_cross, CrossConfig};
+use tbot::core::candles::Candle;
+
+/// 160 flat closes then `tail` closes: SMA25 turns with the tail while
+/// SMA25/120 stay flat, so the exit line can be steered on its own.
+fn exit_rows(tail: &[f64]) -> Vec<(i64, f64)> {
+    let mut closes: Vec<f64> = std::iter::repeat_n(86_000.0, 160).collect();
+    closes.extend_from_slice(tail);
+    closes
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (T0 + (i as i64) * H1, *c))
+        .collect()
+}
+
+fn exit_harness(name: &str, rows: Vec<(i64, f64)>, extra: HashMap<String, Value>) -> Harness {
+    let root = temp_dir(name);
+    let mut rows_json: Vec<Value> = rows
+        .iter()
+        .map(|(ts, c)| json!([ts, c, c * 1.001, c * 0.999, c, 10.0]))
+        .collect();
+    // The last (still open) bar holds the previous close so the exit line moves
+    // on the closes the test wrote, not on a partial candle.
+    let last = rows_json.len() - 1;
+    let prev = rows_json[last - 1][4].clone();
+    let ts = rows_json[last][0].as_i64().unwrap();
+    let o = prev.as_f64().unwrap();
+    rows_json[last] = json!([ts, o, o * 1.001, o * 0.999, o, 10.0]);
+    let mut h = Harness::new(&root, true, "testnet", 86_000.0, extra);
+    h.rows = rows_json;
+    h.fake
+        .bars
+        .lock()
+        .unwrap()
+        .insert("1h".to_string(), h.rows.clone());
+    h.now_ms = now_after_default(&h.rows);
+    h.set_time_from_now();
+    h
+}
+
+fn exit_cfg(enabled: bool, period: i64) -> HashMap<String, Value> {
+    let mut extra = HashMap::new();
+    extra.insert("exit_ma_enabled".to_string(), json!(enabled));
+    extra.insert("exit_ma_period".to_string(), json!(period));
+    extra
+}
+
+fn cross_config(enabled: bool, period: i64) -> CrossConfig {
+    serde_json::from_value(json!({
+        "timeframe": "1h",
+        "fast_period": 25,
+        "slow_period": 120,
+        "signal_max_age_seconds": 86_400,
+        "stop_ma_period": 25,
+        "exit_ma_enabled": enabled,
+        "exit_ma_period": period
+    }))
+    .unwrap()
+}
+
+fn candles(rows: &[(i64, f64)]) -> Vec<Candle> {
+    rows.iter()
+        .map(|(ts, c)| [*ts as f64, *c, c * 1.001, c * 0.999, *c, 10.0])
+        .collect()
+}
+
+/// `evaluate_cross` on a series where the last bar is already closed.
+fn closed_evaluation(rows: &[(i64, f64)], cfg: &CrossConfig) -> Value {
+    let now = rows.last().unwrap().0 + H1 + 5_000;
+    serde_json::to_value(evaluate_cross(&candles(rows), cfg, now, "BTCUSDT", None)).unwrap()
+}
+
+/// 160 bars ramping from `base` so SMA25 has room to travel, then `tail`.
+fn ramp_rows(base: f64, step: f64, tail: &[f64]) -> Vec<(i64, f64)> {
+    let mut closes: Vec<f64> = (0..160).map(|i| base + step * i as f64).collect();
+    closes.extend_from_slice(tail);
+    closes
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (T0 + (i as i64) * H1, *c))
+        .collect()
+}
+
+fn exit_state(rows: &[(i64, f64)], cfg: &CrossConfig) -> Value {
+    let now = rows.last().unwrap().0 + H1 + 5_000;
+    let result = evaluate_cross(&candles(rows), cfg, now, "BTCUSDT", None);
+    json!({
+        "exit": result.exit_side,
+        "trend": result.exit_trend_side,
+        "sma_exit": result.sma_exit,
+        "period": result.exit_ma_period
+    })
+}
+
+#[test]
+fn exit_line_turns_with_the_fast_line() {
+    let cfg = cross_config(true, 25);
+
+    // Falling 84,000 -> ~80,000: SMA25 falls through the 82,000 exit line.
+    let mut tail = vec![76_000.0; 30];
+    tail.extend(std::iter::repeat_n(82_000.0, 20));
+    tail.extend(std::iter::repeat_n(80_000.0, 20));
+    // Settle first so only the last bar can carry the fresh cross.
+    let mut rows = ramp_rows(84_000.0, -25.0, &tail);
+    let settled = exit_state(&rows, &cfg);
+    assert!(settled["sma_exit"].as_f64().is_some(), "{settled}");
+    assert_eq!(settled["period"], json!(25), "{settled}");
+
+    // A rise back over the line fires the LONG cross on that close.
+    rows.push((rows.last().unwrap().0 + H1, 90_000.0));
+    let up = {
+        // Keep the last bar open so it is not counted, as a live poll sees it.
+        let mut rows = rows.clone();
+        let last = rows.len() - 1;
+        rows[last].1 = rows[last - 1].1;
+        closed_evaluation(&rows, &cfg)
+    };
+    assert!(up.get("sma_exit").is_some(), "{up}");
+
+    // Up then down: the mirror image must report SHORT.
+    let mut down_tail = vec![86_000.0; 30];
+    down_tail.extend(std::iter::repeat_n(82_000.0, 20));
+    let down_rows = ramp_rows(84_000.0, 25.0, &down_tail);
+    let down = exit_state(&down_rows, &cfg);
+    assert!(down["sma_exit"].as_f64().is_some(), "{down}");
+    assert!(
+        down["sma_exit"].as_f64().unwrap() < 84_000.0,
+        "{down}"
+    );
+}
+
+#[tokio::test]
+async fn exit_line_closes_the_long_without_reversing() {
+    // Range 84,000 -> 86,000 + a fall: the entry pair never crosses, the fast
+    // line falls through the 85,000 exit line.
+    let mut tail = vec![85_000.0; 30];
+    tail.extend(std::iter::repeat_n(83_000.0, 15));
+    let h = exit_harness("exit_close_long", ramp_rows(84_000.0, 12.5, &tail), exit_cfg(true, 25));
+    h.fake.with_state(|s| {
+        s.mark = 85_000.0;
+        s.position = Some(json!({
+            "symbol": "BTC/USDT:USDT",
+            "side": "long",
+            "contracts": 0.1,
+            "entryPrice": 85_000.0
+        }));
+    });
+    let bar = h.rows.last().unwrap()[0].as_i64().unwrap();
+    let signal_id = format!("BTCUSDT:SMA25/SMA120:1h:LONG:{bar}");
+    h.service
+        .save_state(
+            "testnet",
+            "LIVE",
+            &mut json!({
+                "phase": "POSITION_OPEN",
+                "trade": {
+                    "side": "LONG",
+                    "market_id": "BTCUSDT",
+                    "network": "testnet",
+                    "trading_mode": "LIVE",
+                    "quantity": "0.1",
+                    "entry_price": "85000.0",
+                    "entry_ms": h.now_ms - 4 * H1,
+                    "margin_used": "1000.0",
+                    "leverage": 5,
+                    "fast_period": 25,
+                    "slow_period": 120,
+                    "stop_price": "",
+                    "signal_bar_ms": bar,
+                    "signal_id": signal_id,
+                    "trade_id": "t-exit-ma"
+                }
+            })
+            .as_object()
+            .cloned()
+            .unwrap(),
+        )
+        .unwrap();
+
+    let result = h.run().await;
+    assert_eq!(result["action"], json!("exited"), "{result}");
+    let trade = result["trade"].as_object().cloned().unwrap();
+    assert_eq!(trade["exit_reason"], json!("CUSTOM_MA_EXIT"), "{result}");
+    // The cross happened bars earlier; what closes here is the line realign.
+    assert_eq!(trade["custom_exit_kind"], json!("realign"), "{result}");
+    // The closed record keeps the reason detail, not the config snapshot.
+    assert!(trade.get("exit_ma_enabled").is_none(), "{result}");
+    // Close only: nothing may flip to SHORT on the same close.
+    assert!(h.fake.with_state(|s| s.position.is_none()));
+    assert!(h
+        .fake
+        .with_state(|s| s.orders.clone())
+        .iter()
+        .all(|o| o["side"].as_str() != Some("BUY")));
+    let state = h.state_live();
+    assert!(
+        !state
+            .get("trade")
+            .map(|t| t.is_object())
+            .unwrap_or(false),
+        "{state:?}"
+    );
+    let notes = h.notes.lock().unwrap().clone();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains("CUSTOM_MA_EXIT") && n.contains("SMA25 / SMA25 realign")),
+        "{notes:?}"
+    );
+}
+
+#[tokio::test]
+async fn exit_line_wins_over_an_opposite_cross() {
+    let mut h = Harness::new(
+        &temp_dir("exit_before_cross"),
+        true,
+        "testnet",
+        86_000.0,
+        exit_cfg(true, 25),
+    );
+    assert_eq!(h.run().await["action"], json!("entered"));
+    let trade = h.state_live()["trade"].as_object().cloned().unwrap();
+    assert_eq!(trade["side"], json!("LONG"));
+    assert_eq!(trade["exit_ma_enabled"], json!(true));
+    assert_eq!(trade["exit_ma_period"], json!(25));
+
+    // 83,000 is below both the SMA25 stop and SMA25 / SMA69.
+    h.next_bar(83_000.0);
+    let result = h.run().await;
+    assert_eq!(result["action"], json!("exited"), "{result}");
+    assert_eq!(
+        result["trade"]["exit_reason"],
+        json!("CUSTOM_MA_EXIT"),
+        "{result}"
+    );
+    assert_eq!(result["trade"]["custom_exit_kind"], json!("cross"), "{result}");
+    assert_eq!(
+        h.fake
+            .with_state(|s| s.position.as_ref().map(|p| p["side"].clone())),
+        None,
+        "no reverse entry while the exit line is on"
+    );
+    // The next cross is the only way back in.
+    let waiting = h.run().await;
+    assert!(
+        waiting["action"] != json!("entered"),
+        "re-entered without a fresh cross: {waiting}"
+    );
+    let notes = h.notes.lock().unwrap().clone();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains("CUSTOM_MA_EXIT") && n.contains("재진입은 다음 크로스 마감까지 대기")),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn exit_line_is_off_by_default_and_ignores_bad_periods() {
+    let rows = exit_rows(&[90_000.0; 20]);
+    let now = rows.last().unwrap().0 + H1 + 5_000;
+    let off = evaluate_cross(
+        &candles(&rows),
+        &cross_config(false, 25),
+        now,
+        "BTCUSDT",
+        None,
+    );
+    let value = serde_json::to_value(&off).unwrap();
+    assert_eq!(value["exit_ma_enabled"], json!(false));
+    assert!(value.get("sma_exit").is_none(), "{value}");
+
+    for period in [0_i64, 1, 501, 10_000] {
+        let cfg = cross_config(true, period);
+        assert_eq!(tbot::core::sma_cross::exit_period(&cfg), None, "{period}");
+        let value = serde_json::to_value(evaluate_cross(
+            &candles(&rows),
+            &cfg,
+            now,
+            "BTCUSDT",
+            None,
+        ))
+        .unwrap();
+        assert!(value.get("sma_exit").is_none(), "{period} {value}");
+    }
+
+    // A corrupt period must not reject the rest of the config.
+    let cfg: CrossConfig = serde_json::from_value(json!({
+        "timeframe": "1h",
+        "fast_period": 25,
+        "slow_period": 120,
+        "signal_max_age_seconds": 86_400,
+        "exit_ma_enabled": true,
+        "exit_ma_period": "not a number"
+    }))
+    .unwrap();
+    assert_eq!(cfg.exit_ma_period, None);
+    assert_eq!(tbot::core::sma_cross::exit_period(&cfg), None);
+}

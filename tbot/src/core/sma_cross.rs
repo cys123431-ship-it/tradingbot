@@ -26,6 +26,11 @@ pub struct CrossConfig {
     /// 2 = also report a cross on the bar before the last one.
     #[serde(default)]
     pub cross_lookback_bars: Option<i64>,
+    /// Optional exit line: SMA(fast) against SMA(exit_ma_period).
+    #[serde(default)]
+    pub exit_ma_enabled: Option<bool>,
+    #[serde(default, deserialize_with = "de_lenient_opt_i64")]
+    pub exit_ma_period: Option<i64>,
 }
 
 /// Result of `evaluate_cross`.
@@ -55,6 +60,20 @@ pub struct CrossResult {
     pub sma_slow_prev: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sma_stop: Option<f64>,
+    /// Exit line state (`exit_ma_enabled`); always present like Python.
+    pub exit_ma_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_ma_period: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sma_exit: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sma_exit_prev: Option<f64>,
+    /// SMA(fast) crossed the exit line against the held side on this close.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_side: Option<String>,
+    /// Which side SMA(fast) currently sits on relative to the exit line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_trend_side: Option<String>,
     /// Cross on the bar before the last one that still holds on the last bar.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prev_cross_side: Option<String>,
@@ -66,6 +85,21 @@ pub struct CrossResult {
     pub skip_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signal_id: Option<String>,
+}
+
+/// Lenient integer read: a JSON number or a numeric string, anything else is
+/// `None`. A corrupt value must disable the feature, never reject the whole
+/// config (which would stop the bot on every poll).
+fn de_lenient_opt_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::Number(n)) => n.as_i64(),
+        Some(serde_json::Value::String(s)) => s.trim().parse::<f64>().ok().map(|f| f as i64),
+        _ => None,
+    })
 }
 
 /// Simple moving average; length equals `values.len()` once `period` is met.
@@ -88,6 +122,21 @@ pub fn sma_opt(values: &[f64], period: usize) -> Vec<Option<f64>> {
 /// Same as `sma_opt` but returns only the finite values (drop the leading None).
 pub fn sma(values: &[f64], period: usize) -> Vec<f64> {
     sma_opt(values, period).into_iter().flatten().collect()
+}
+
+/// Python `_exit_period`: the validated exit SMA period, or `None` when the
+/// feature is off or the value is unusable. The line must be a real average
+/// (>= 2) and needs two of its own values to detect a cross, so a bad config
+/// disables it instead of raising.
+pub fn exit_period(cfg: &CrossConfig) -> Option<i64> {
+    if !cfg.exit_ma_enabled.unwrap_or(false) {
+        return None;
+    }
+    let period = cfg.exit_ma_period?;
+    if period < 2 || period > 500.max(cfg.slow_period) {
+        return None;
+    }
+    Some(period)
 }
 
 fn timeframe_scale(timeframe: &str) -> f64 {
@@ -149,6 +198,12 @@ pub fn evaluate_cross(
         sma_fast_prev: None,
         sma_slow_prev: None,
         sma_stop: None,
+        exit_ma_enabled: cfg.exit_ma_enabled.unwrap_or(false),
+        exit_ma_period: None,
+        sma_exit: None,
+        sma_exit_prev: None,
+        exit_side: None,
+        exit_trend_side: None,
         prev_cross_side: None,
         prev_cross_bar_ms: None,
         signal_age_seconds: None,
@@ -189,6 +244,31 @@ pub fn evaluate_cross(
         }
     }
     result.signal_age_seconds = Some((now_ms - bar[0] as i64 - span) as f64 / 1000.0);
+    // Exit line: not enough history means never trade on a half-computed line.
+    if let Some(p) = exit_period(cfg).filter(|p| closed.len() > *p as usize) {
+        let line = sma(&closes, p as usize);
+        if line.len() >= 2 {
+            let now = line[line.len() - 1];
+            let prev = line[line.len() - 2];
+            result.exit_ma_period = Some(p);
+            result.sma_exit = Some(now);
+            result.sma_exit_prev = Some(prev);
+            result.exit_trend_side = if f_now > now {
+                Some("LONG".to_string())
+            } else if f_now < now {
+                Some("SHORT".to_string())
+            } else {
+                None
+            };
+            result.exit_side = if f_prev <= prev && f_now > now {
+                Some("LONG".to_string())
+            } else if f_prev >= prev && f_now < now {
+                Some("SHORT".to_string())
+            } else {
+                None
+            };
+        }
+    }
     result.trend_side = if f_now > s_now {
         Some("LONG".to_string())
     } else if f_now < s_now {

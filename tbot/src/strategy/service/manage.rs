@@ -24,7 +24,9 @@ use crate::strategy::service::{
 
 // Re-exported helper used by the service (from trading.rs).
 use crate::strategy::config_base::TRADING_MODE_LIVE;
-use crate::strategy::service::sma::{STOP_MA_EXIT, TRANSIENT_ENTRY_BLOCKS};
+use crate::strategy::service::sma::{
+    CROSS_EXIT, CUSTOM_MA_EXIT, STOP_MA_EXIT, TRANSIENT_ENTRY_BLOCKS,
+};
 use crate::strategy::service::trading::py_int;
 
 // ---------------------------------------------------------------------------
@@ -1273,6 +1275,10 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             .and_then(|v| v.as_object())
             .cloned()
             .unwrap_or_default();
+        if let Some(sig) = self.custom_exit_signal(cfg, &trade, signal.as_ref()) {
+            // Close-only: the coin stays flat until its next real cross.
+            return self.reverse_live(network, cfg, state, &sig).await;
+        }
         let opposite = self.opposite_signal(cfg, &trade, signal.as_ref());
         if let Some(sig) = opposite {
             return self.reverse_live(network, cfg, state, &sig).await;
@@ -1341,14 +1347,53 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         state: &mut Map<String, Value>,
         signal: &Value,
     ) -> Result<Value, ServiceError> {
+        let exit_on = cfg
+            .get("exit_ma_enabled")
+            .map(|v| py_truthy(Some(v)))
+            .unwrap_or(false);
+        let close_only = exit_on
+            || signal
+                .get("close_only")
+                .map(|v| py_truthy(Some(v)))
+                .unwrap_or(false);
+        let custom = signal
+            .get("entry_type")
+            .and_then(|v| v.as_str())
+            .map(|s| s == "CUSTOM_EXIT")
+            .unwrap_or(false);
         let mut trade = state
             .get("trade")
             .and_then(|v| v.as_object())
             .cloned()
             .unwrap_or_default();
-        trade.insert("pending_reverse".to_string(), signal.clone());
+        if !close_only {
+            trade.insert("pending_reverse".to_string(), signal.clone());
+        }
+        if custom {
+            // close_live reloads the state from disk, so the reason detail has
+            // to be written before the close.
+            trade.insert(
+                "custom_exit_kind".to_string(),
+                signal
+                    .get("exit_kind")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String("cross".to_string())),
+            );
+            // The exit text names SMA(fast) / SMA(exit); the trade record only
+            // carries the period while the exit line is on.
+            let period = cfg.get("exit_ma_period").cloned().unwrap_or(Value::Null);
+            if !period.is_null() {
+                trade.insert("exit_ma_period".to_string(), period);
+            }
+        }
         state.insert("trade".to_string(), Value::Object(trade));
         self.save_state(network, TRADING_MODE_LIVE, state)?;
+        if close_only {
+            let reason = if custom { CUSTOM_MA_EXIT } else { CROSS_EXIT };
+            return self
+                .close_live(network, cfg, state, &reason.to_lowercase(), reason)
+                .await;
+        }
         let closed = self
             .close_live(network, cfg, state, "cross_reverse", "CROSS_REVERSE")
             .await?;
@@ -1799,7 +1844,34 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             }
         };
         let network = get_str(trade, "network");
-        let exit_reason = get_str(trade, "exit_reason");
+        let exit_reason = match get_str(trade, "exit_reason").as_str() {
+            CUSTOM_MA_EXIT => format!(
+                "{CUSTOM_MA_EXIT} — SMA{} / SMA{} {}, 재진입은 다음 크로스 마감까지 대기",
+                get_str(trade, "fast_period"),
+                {
+                    let period = get_str(trade, "exit_ma_period");
+                    if period.is_empty() {
+                        "?".to_string()
+                    } else {
+                        period
+                    }
+                },
+                {
+                    let kind = get_str(trade, "custom_exit_kind");
+                    if kind.is_empty() {
+                        "cross".to_string()
+                    } else {
+                        kind
+                    }
+                },
+            ),
+            CROSS_EXIT => format!(
+                "{CROSS_EXIT} — SMA{} / SMA{} 반대 크로스, 재진입은 다음 크로스 마감까지 대기",
+                get_str(trade, "fast_period"),
+                get_str(trade, "slow_period"),
+            ),
+            other => other.to_string(),
+        };
         let side = get_str(trade, "side");
         let entry_price = get_str(trade, "entry_price");
         let exit_price = get_str(trade, "exit_price");
