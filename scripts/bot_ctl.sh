@@ -396,8 +396,12 @@ status_bot() {
 # are the live bot. The code stays for reference, but nothing may execute it.
 # ops/BOT_DISABLED is the switch; while it exists start/restart/ensure refuse,
 # so cron, @reboot, or a manual call cannot resurrect the Python bot.
+# PYTHON_GATE_FILE exists so tests can exercise this script without depending
+# on whether the real gate happens to be present in the working tree.
+PYTHON_GATE_FILE="${PYTHON_GATE_FILE:-$APP_DIR/ops/BOT_DISABLED}"
+
 python_bot_disabled() {
-  [[ -f "$APP_DIR/ops/BOT_DISABLED" ]]
+  [[ -f "$PYTHON_GATE_FILE" ]]
 }
 
 refuse_if_python_disabled() {

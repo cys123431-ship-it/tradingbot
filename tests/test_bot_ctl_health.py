@@ -36,6 +36,10 @@ def _bot_ctl_env(tmp_path, marker, heartbeat_file, max_age="30"):
         "PID_FILE": str(tmp_path / "emas.pid"),
         "LOG_FILE": str(tmp_path / "emas.log"),
         "PYTHON_BIN": sys.executable,
+        # These tests drive the Python bot itself, so they run in a world
+        # where that bot is the enabled one. The real ops/BOT_DISABLED gate
+        # is covered separately by the tests at the end of this file.
+        "PYTHON_GATE_FILE": str(tmp_path / "python_enabled_here"),
     })
     return env
 
@@ -173,3 +177,50 @@ def test_bot_ctl_ensure_compacts_oversized_log_without_restart(tmp_path):
     assert "compacted bot log" in result.stdout
     assert log_file.stat().st_size <= 1024
     assert log_file.read_bytes().endswith(b"TAIL_MARKER")
+
+
+def _run_bot_ctl(tmp_path, marker, heartbeat_file, action, gate_file):
+    env = _bot_ctl_env(tmp_path, marker, heartbeat_file)
+    env["PYTHON_GATE_FILE"] = str(gate_file)
+    return subprocess.run(
+        ["bash", "scripts/bot_ctl.sh", action],
+        cwd=ROOT_DIR,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required by bot_ctl.sh")
+@pytest.mark.parametrize("action", ["start", "restart", "ensure"])
+def test_bot_ctl_refuses_to_start_python_bot_when_gate_present(tmp_path, action):
+    """The Python bot is retired: with the gate present nothing may start it.
+
+    This is what makes the @reboot line and the */5 ensure cron harmless.
+    """
+    marker = tmp_path / "fake_emas_entry.py"
+    marker.write_text("import time; time.sleep(60)", encoding="utf-8")
+    heartbeat_file = tmp_path / "heartbeat.json"
+    gate_file = tmp_path / "BOT_DISABLED"
+    gate_file.write_text("retired", encoding="utf-8")
+
+    result = _run_bot_ctl(tmp_path, marker, heartbeat_file, action, gate_file)
+
+    assert result.returncode != 0
+    assert "disabled" in (result.stdout + result.stderr)
+    assert not (tmp_path / "emas.pid").exists()
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required by bot_ctl.sh")
+def test_bot_ctl_stop_is_allowed_when_gate_present(tmp_path):
+    """Stopping must stay possible: the gate blocks starts, not cleanup."""
+    marker = tmp_path / "fake_emas_entry.py"
+    heartbeat_file = tmp_path / "heartbeat.json"
+    gate_file = tmp_path / "BOT_DISABLED"
+    gate_file.write_text("retired", encoding="utf-8")
+
+    result = _run_bot_ctl(tmp_path, marker, heartbeat_file, "stop", gate_file)
+
+    assert result.returncode == 0
+    assert "disabled" not in (result.stdout + result.stderr)
