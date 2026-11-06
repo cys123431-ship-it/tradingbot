@@ -39,13 +39,24 @@ async fn main() -> Result<(), String> {
 
     let api = TelegramApi::new(token);
 
+    // The menu is the only place users look for commands, so it must list
+    // exactly what handle_message() answers. Every entry here is handled there;
+    // anything else gets the "unknown command" reply.
     let mut commands = vec![
         (
             "btcmacross".to_string(),
-            "3/200 SMA 크로스 전략 메뉴".to_string(),
+            "BTC 3/200 SMA 크로스 전략 메뉴".to_string(),
         ),
-        ("macoin".to_string(), "거래할 코인 1개 지정".to_string()),
         ("macross".to_string(), "SMA3/SMA120 전략 메뉴".to_string()),
+        (
+            "macoin".to_string(),
+            "/btcmacross 거래 코인 1개 지정".to_string(),
+        ),
+        ("btcma".to_string(), "/btcmacross SMA 기간 변경".to_string()),
+        (
+            "btcmaperiod".to_string(),
+            "/btcmacross SMA 기간 도움말".to_string(),
+        ),
         ("map".to_string(), "/macross SMA 기간 변경".to_string()),
         (
             "maperiod".to_string(),
@@ -56,7 +67,10 @@ async fn main() -> Result<(), String> {
         ("stop".to_string(), "모든 선물 전략 비상 정지".to_string()),
     ];
     for name in BTC_MA_PERIOD_COMMANDS {
-        commands.push(((*name).to_string(), "SMA 기간 변경".to_string()));
+        if *name == "btcma" || *name == "btcmaperiod" {
+            continue;
+        }
+        commands.push(((*name).to_string(), "/btcmacross SMA 기간 변경".to_string()));
     }
     if let Err(e) = api.set_my_commands(commands).await {
         log_line(&format!("telegram: set_my_commands failed: {e}"));

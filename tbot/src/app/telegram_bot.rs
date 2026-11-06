@@ -862,6 +862,21 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             other if MA_CROSS_PERIOD_COMMANDS.contains(&other) => {
                 self.handle_ma_period_cmd(chat_id, &args).await
             }
+            // A command we do not serve must never be answered with silence:
+            // the user cannot tell a dead bot from an unimplemented command.
+            other if !other.is_empty() => {
+                let text = match unknown_command_note(other) {
+                    Some(note) => format!("⚠️ /{other} 명령은 이 봇(tbot)에 없습니다.\n{note}"),
+                    None => format!(
+                        "⚠️ 알 수 없는 명령입니다: /{other}\n/help 로 사용 가능한 명령을 확인하세요."
+                    ),
+                };
+                vec![Outgoing::Send {
+                    chat_id,
+                    text,
+                    markup: None,
+                }]
+            }
             _ => Vec::new(),
         }
     }
@@ -877,7 +892,8 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
              /btcma <패스트> <슬로우> — /btcmacross SMA 기간 변경 (예: /btcma 1 200)\n\
              /btcmaperiod — SMA 기간 도움말\n\
              /map <패스트> <슬로우> — /macross SMA 기간 변경 (예: /map 1 200)\n\
-             /stop — 두 전략 모두 신규 진입 OFF + 보유 포지션 청산",
+             /stop — 두 전략 모두 신규 진입 OFF + 보유 포지션 청산\n\
+             /help — 이 목록 (없는 명령은 이 봇이 모른다고 답합니다)",
             strategy_name(&cfg),
             strategy_name(&ma_cfg),
         );
@@ -2783,6 +2799,25 @@ pub(crate) fn parse_command(text: &str) -> (String, Vec<String>) {
     let command = head.split('@').next().unwrap_or("").to_lowercase();
     let args = parts.map(|s| s.to_string()).collect();
     (command, args)
+}
+
+/// Explain a command that the Python bot used to own but tbot does not serve.
+/// Rendered under the "unknown command" notice so the user knows where the
+/// feature went instead of assuming the bot died.
+pub(crate) fn unknown_command_note(command: &str) -> Option<&'static str> {
+    match command {
+        // Python-only menus: /setup was the numbered settings menu (it only
+        // opened the exchange/network switch at the end), and the rest were
+        // its entries. tbot has no settings menu; everything is a button.
+        "setup" => Some(
+            "설정 메뉴는 이 봇에 없습니다. 거래소/네트워크 전환과 전략 설정은 /btcmacross 또는 /macross 버튼으로 하세요.",
+        ),
+        "status" | "state" => Some("상태는 /btcmacross (또는 /macross) 화면에서 확인하세요."),
+        "resume" | "pause" | "unpause" => Some(
+            "정지/재개는 /stop 다음에 /btcmacross 메뉴의 버튼으로 하세요.",
+        ),
+        _ => None,
+    }
 }
 
 fn log_line(msg: &str) {

@@ -644,6 +644,45 @@ async fn close_profit_lock(ctx: &Ctx, _state: Value) {
 #[allow(dead_code)]
 fn _touch(_s: OrderState) {}
 
+/// A command tbot does not serve must get a reply, not silence: the old
+/// `_ => Vec::new()` made an unimplemented `/setup` look like a dead bot.
+#[tokio::test]
+async fn unknown_command_replies_instead_of_silence() {
+    let tmp = common::temp_dir("tg_unknown_cmd");
+    let ctx = controller(&tmp);
+    let msg = json!({"update_id": 1, "message": {"chat": {"id": 1}, "text": "/setup"}});
+    let out = ctx.bot.handle_update(&msg).await;
+    assert_eq!(out.len(), 1, "unknown command must answer");
+    let tbot::app::telegram_bot::Outgoing::Send { text, .. } = &out[0] else {
+        panic!("expected a Send reply");
+    };
+    assert!(text.contains("/setup"), "reply names the command: {text}");
+    assert!(text.contains("/btcmacross"), "reply points elsewhere: {text}");
+}
+
+#[tokio::test]
+async fn unknown_command_without_note_still_answers() {
+    let tmp = common::temp_dir("tg_unknown_cmd2");
+    let ctx = controller(&tmp);
+    let msg = json!({"update_id": 1, "message": {"chat": {"id": 1}, "text": "/nonsense@YosebiBot"}});
+    let out = ctx.bot.handle_update(&msg).await;
+    assert_eq!(out.len(), 1);
+    let tbot::app::telegram_bot::Outgoing::Send { text, .. } = &out[0] else {
+        panic!("expected a Send reply");
+    };
+    assert!(text.contains("/nonsense"), "{text}");
+    assert!(text.contains("/help"), "{text}");
+}
+
+/// Plain chat text (no slash) stays silent so the bot never echoes.
+#[tokio::test]
+async fn plain_text_is_ignored() {
+    let tmp = common::temp_dir("tg_plain_text");
+    let ctx = controller(&tmp);
+    let msg = json!({"update_id": 1, "message": {"chat": {"id": 1}, "text": "setup"}});
+    assert!(ctx.bot.handle_update(&msg).await.is_empty());
+}
+
 #[tokio::test]
 async fn updates_from_other_chats_are_ignored() {
     let tmp = common::temp_dir("tg_owner");
