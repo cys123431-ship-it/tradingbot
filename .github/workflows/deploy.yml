@@ -185,6 +185,36 @@ jobs:
             echo "=== Stop previous bot ==="
             PID_FILE="$PID_FILE" LOG_FILE="$LOG_FILE" BOT_ENTRY="$BOT_ENTRY" "$BOT_CTL" stop
 
+            verify_rust_bot() {
+              # With the Python bot disabled the live trader is tbot-engine.
+              # Report what is actually running instead of exiting green on a
+              # stopped bot: a silent no-op deploy is indistinguishable from a
+              # healthy one until someone notices the missing fills.
+              echo "=== Rust bot (tbot) status ==="
+              if ! command -v systemctl >/dev/null 2>&1; then
+                echo "systemctl not available; cannot verify the Rust bot"
+                return 0
+              fi
+              ENGINE_STATE="$(systemctl is-active tbot-engine.service 2>/dev/null || true)"
+              TELEGRAM_STATE="$(systemctl is-active tbot-telegram.service 2>/dev/null || true)"
+              echo "tbot-engine=$ENGINE_STATE tbot-telegram=$TELEGRAM_STATE"
+              if [ "$ENGINE_STATE" = "active" ] && [ "$TELEGRAM_STATE" = "active" ]; then
+                printf '%s\n' "=== Deploy complete (Python bot stopped, Rust bot running) ==="
+                return 0
+              fi
+              if [ -f ops/TBOT_ENABLED ]; then
+                echo "ops/TBOT_ENABLED is present but the Rust bot is not fully up"
+                echo "  (an inactive unit means it is stopped or failed; check journalctl -u tbot-engine)"
+                echo "tbot-engine: $ENGINE_STATE, tbot-telegram: $TELEGRAM_STATE"
+                echo "fix: run the Deploy tbot workflow (.github/workflows/deploy-tbot.yml)"
+                return 1
+              fi
+              # Both bots off is a deliberate state (neither gate present).
+              echo "=== Deploy complete (no trading bot enabled) ==="
+              echo "enable one: ops/TBOT_ENABLED (Rust) or delete ops/BOT_DISABLED (Python)"
+              return 0
+            }
+
             if [ -f ops/BOT_DISABLED ]; then
               echo "=== Bot disabled by ops/BOT_DISABLED: removing reboot/health cron, not starting ==="
               (crontab -l 2>/dev/null | grep -vF "$BOT_CTL" || true) | crontab -
@@ -193,7 +223,7 @@ jobs:
                 echo "bot still running after stop"
                 exit 1
               fi
-              echo "=== Deploy complete (bot stopped) ==="
+              verify_rust_bot || exit 1
               exit 0
             fi
 
