@@ -392,7 +392,24 @@ status_bot() {
   return 1
 }
 
+# The Python bot is retired: the Rust services (tbot-engine, tbot-telegram)
+# are the live bot. The code stays for reference, but nothing may execute it.
+# ops/BOT_DISABLED is the switch; while it exists start/restart/ensure refuse,
+# so cron, @reboot, or a manual call cannot resurrect the Python bot.
+python_bot_disabled() {
+  [[ -f "$APP_DIR/ops/BOT_DISABLED" ]]
+}
+
+refuse_if_python_disabled() {
+  if python_bot_disabled; then
+    echo "python bot disabled by $APP_DIR/ops/BOT_DISABLED; the live bot is the Rust service (tbot-engine)" >&2
+    return 1
+  fi
+  return 0
+}
+
 ensure_bot() {
+  refuse_if_python_disabled || return 1
   stop_legacy_bot_processes
   compact_log_if_needed
 
@@ -428,12 +445,14 @@ ensure_bot() {
 
 case "$ACTION" in
   start)
+    refuse_if_python_disabled || exit 1
     start_bot
     ;;
   stop)
     stop_bot
     ;;
   restart)
+    refuse_if_python_disabled || exit 1
     stop_bot
     BOT_LAUNCH_REASON="${BOT_LAUNCH_REASON:-manual_restart}" \
     BOT_PREV_PAUSED="$(heartbeat_paused_state)" \

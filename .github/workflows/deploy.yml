@@ -227,6 +227,17 @@ jobs:
               exit 0
             fi
 
+            # Reaching here means ops/BOT_DISABLED is absent, i.e. someone
+            # deliberately asked for the Python bot back. While the Rust
+            # service is the live bot that is never the intended state, so
+            # stop rather than register @reboot/*5 re-start cron.
+            if [ -f ops/TBOT_ENABLED ]; then
+              echo "ops/TBOT_ENABLED is present and ops/BOT_DISABLED is absent"
+              echo "the Python bot must wait for the Rust service to be retired: restore ops/BOT_DISABLED and deploy again"
+              verify_rust_bot || exit 1
+              exit 1
+            fi
+
             echo "=== Start bot ==="
             START_OK=0
             for ATTEMPT in 1 2 3; do
