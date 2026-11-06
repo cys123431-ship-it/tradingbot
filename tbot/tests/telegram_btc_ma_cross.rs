@@ -954,3 +954,231 @@ async fn scale_in_button_toggles() {
     assert_eq!(ctx.section()["scale_in_enabled"], json!(false));
     assert!(text.contains("물타기: 끔"), "{text}");
 }
+
+// ---------------------------------------------- custom exit MA (tests/test_btc_ma_cross_exit_ma.py)
+
+#[tokio::test]
+async fn exit_ma_buttons_and_command() {
+    let tmp = common::temp_dir("tg_exitma_buttons");
+    let ctx = controller(&tmp);
+
+    let (text, markup) = press(&ctx, "status").await;
+    let cbs = callbacks(&markup);
+    assert!(cbs.contains(&"bm:xma:on".to_string()), "{cbs:?}");
+    assert!(cbs.contains(&"bm:xmap:25".to_string()), "{cbs:?}");
+    assert!(cbs.contains(&"bm:xmap:69".to_string()), "{cbs:?}");
+    assert!(cbs.contains(&"bm:xma_help".to_string()), "{cbs:?}");
+    assert!(text.contains("청산 MA: OFF"), "{text}");
+    // A dark button never carries its own "on"/"off" text by accident.
+    assert!(labeled(&markup)
+        .iter()
+        .any(|(label, cb)| cb == "bm:xma:on" && label == "🔻 청산 MA: OFF"));
+
+    // ON via the header button keeps the default period.
+    let (text, markup) = press(&ctx, "xma:on").await;
+    let section = ctx.section();
+    assert_eq!(section["exit_ma_enabled"], json!(true));
+    assert_eq!(section["exit_ma_period"], json!(25));
+    assert!(text.contains("🔻 청산 MA: ON · SMA3가 SMA25"), "{text}");
+    assert!(text.contains("반대 진입 없이"), "{text}");
+    assert!(callbacks(&markup).contains(&"bm:xma:off".to_string()));
+    assert!(labeled(&markup)
+        .iter()
+        .any(|(label, cb)| cb == "bm:xma:off" && label == "🔻 청산 MA: SMA25"));
+    // The preset the line currently uses is marked as selected.
+    let selected: Vec<String> = labeled(&markup)
+        .into_iter()
+        .filter(|(label, _)| label.starts_with("✅ 청산 MA 25"))
+        .map(|(_, cb)| cb)
+        .collect();
+    assert_eq!(selected, vec!["bm:xmap:25".to_string()]);
+
+    // Period preset.
+    press(&ctx, "xmap:69").await;
+    let section = ctx.section();
+    assert_eq!(section["exit_ma_period"], json!(69));
+    assert_eq!(section["exit_ma_enabled"], json!(true));
+    let status = press(&ctx, "status").await.0;
+    assert!(status.contains("SMA69"), "{status}");
+
+    // OFF again: only the enabled flag changes, the period is remembered.
+    let (text, _) = press(&ctx, "xma:off").await;
+    let section = ctx.section();
+    assert_eq!(section["exit_ma_enabled"], json!(false));
+    assert_eq!(section["exit_ma_period"], json!(69));
+    assert!(text.contains("청산 MA: OFF"), "{text}");
+    assert!(press(&ctx, "status").await.0.contains("청산 MA: OFF"));
+}
+
+#[tokio::test]
+async fn bad_exit_period_is_rejected() {
+    let tmp = common::temp_dir("tg_exitma_bad_period");
+    let ctx = controller(&tmp);
+    press(&ctx, "xma:on").await;
+    let before = ctx.section()["exit_ma_period"].clone();
+
+    for action in ["xmap:1", "xmap:501", "xmap:abc", "xmap:"] {
+        let (text, _) = press(&ctx, action).await;
+        assert!(text.contains("올바르지"), "{action}: {text}");
+        assert_eq!(ctx.section()["exit_ma_period"], before, "{action}");
+        assert_eq!(ctx.section()["exit_ma_enabled"], json!(true), "{action}");
+    }
+}
+
+#[tokio::test]
+async fn exit_ma_column_in_status_and_rules() {
+    let tmp = common::temp_dir("tg_exitma_rules");
+    let ctx = controller(&tmp);
+    press(&ctx, "xma:on").await;
+
+    let status = press(&ctx, "status").await.0;
+    assert!(status.contains("청산 MA: ON · SMA3가 SMA25"), "{status}");
+    assert!(status.contains("반대 진입 없이"), "{status}");
+    // Entry and rotation descriptions change while the line is on.
+    assert!(status.contains("크로스 마감 진입만"), "{status}");
+    assert!(status.contains("청산 후 다른 코인 전환: OFF"), "{status}");
+
+    let rules = press(&ctx, "rules").await.0;
+    assert!(rules.contains("추가 청산 MA: ON"), "{rules}");
+    assert!(rules.contains("반대 진입 없음"), "{rules}");
+    assert!(rules.contains("청산 MA ON: 청산 MA 크로스와 반대 크로스"), "{rules}");
+    assert!(rules.contains("크로스 마감 진입만"), "{rules}");
+
+    press(&ctx, "xma:off").await;
+    let rules = press(&ctx, "rules").await.0;
+    assert!(rules.contains("추가 청산 MA: OFF"), "{rules}");
+    assert!(rules.contains("시장가 청산 후 즉시 반대 방향 진입"), "{rules}");
+    assert!(!rules.contains("청산 MA ON:"), "{rules}");
+}
+
+#[tokio::test]
+async fn exit_ma_help_and_entry_text_reflect_the_flag() {
+    let tmp = common::temp_dir("tg_exitma_help");
+    let ctx = controller(&tmp);
+    let off_entry = press(&ctx, "status").await.0;
+    assert!(off_entry.contains("돌파 시 진입"), "{off_entry}");
+
+    press(&ctx, "xma:on").await;
+    let on_entry = press(&ctx, "status").await.0;
+    assert!(on_entry.contains("크로스 마감 진입만"), "{on_entry}");
+
+    let (help, _) = press(&ctx, "xma_help").await;
+    assert!(help.contains("청산 MA 직접 입력"), "{help}");
+    assert!(help.contains("지금: SMA25 (ON)"), "{help}");
+    assert!(help.contains("/btcma exit 69"), "{help}");
+
+    press(&ctx, "xma:off").await;
+    let (help, _) = press(&ctx, "xma_help").await;
+    assert!(help.contains("지금: OFF"), "{help}");
+}
+
+#[test]
+fn parse_exit_ma_command_forms() {
+    use tbot::app::telegram_bot::parse_exit_ma_command;
+    let args = |list: &[&str]| -> Vec<String> { list.iter().map(|s| s.to_string()).collect() };
+    let parse = |list: &[&str]| parse_exit_ma_command(&args(list));
+
+    assert_eq!(parse(&["exit", "25"]), Ok((true, 25)));
+    assert_eq!(parse(&["off"]), Ok((false, 25)));
+    assert_eq!(parse(&["0"]), Ok((false, 25)));
+    assert_eq!(parse(&["on"]), Ok((true, 25)));
+    assert_eq!(parse(&["on", "69"]), Ok((true, 69)));
+    assert_eq!(parse(&["on", "25.9"]), Ok((true, 25)));
+    assert_eq!(parse(&["22"]), Ok((true, 22)));
+    assert_eq!(parse(&["exit", "25"]), Ok((true, 25)));
+    assert_eq!(parse(&["Exit", " OFF "]), Ok((false, 25)));
+    for bad in [
+        vec!["exit", "1"],
+        vec!["exit", "501"],
+        vec!["exit", "abc"],
+        vec![],
+        vec!["exit"],
+        vec!["exit", "25", "69"],
+        vec!["on", "25", "69"],
+        vec!["on", "abc"],
+    ] {
+        assert!(parse(&bad).is_err(), "{bad:?} should be rejected");
+    }
+    let err = parse(&["exit", "1"]).unwrap_err();
+    assert!(err.contains("2~500"), "{err}");
+    let err = parse(&["exit", "abc"]).unwrap_err();
+    assert!(err.contains("숫자가 아닙니다: abc"), "{err}");
+    let err = parse(&[]).unwrap_err();
+    assert!(err.contains("값이 없습니다"), "{err}");
+}
+
+#[tokio::test]
+async fn btcma_exit_command_sets_and_rejects() {
+    let tmp = common::temp_dir("tg_exitma_cmd");
+    let ctx = controller(&tmp);
+
+    let outs = ctx.bot.handle_update(&json!({"message": {"chat": {"id": 1}, "text": "/btcma exit 25"}})).await;
+    let tbot::app::telegram_bot::Outgoing::Send { text, markup, .. } = &outs[0] else {
+        panic!("unexpected {outs:?}");
+    };
+    assert!(markup.is_some(), "the status keyboard rides along");
+    assert!(text.contains("청산 MA: ON · SMA3가 SMA25"), "{text}");
+    assert_eq!(normalized_cfg(&ctx).await["exit_ma_enabled"], json!(true));
+
+    ctx.bot
+        .handle_update(&json!({"message": {"chat": {"id": 1}, "text": "/btcma exit on 69"}}))
+        .await;
+    assert_eq!(normalized_cfg(&ctx).await["exit_ma_period"], json!(69));
+
+    // A bad value answers with the reason and leaves the config alone.
+    let outs = ctx.bot.handle_update(&json!({"message": {"chat": {"id": 1}, "text": "/btcma exit 1"}})).await;
+    let tbot::app::telegram_bot::Outgoing::Send { text, .. } = &outs[0] else {
+        panic!("unexpected {outs:?}");
+    };
+    assert!(text.contains("청산 MA 설정 실패"), "{text}");
+    assert!(text.contains("2~500"), "{text}");
+    assert_eq!(normalized_cfg(&ctx).await["exit_ma_period"], json!(69));
+
+    ctx.bot
+        .handle_update(&json!({"message": {"chat": {"id": 1}, "text": "/btcma exit off"}}))
+        .await;
+    assert_eq!(normalized_cfg(&ctx).await["exit_ma_enabled"], json!(false));
+    // Turning it off carries the default period, same as Python's parse.
+    assert_eq!(normalized_cfg(&ctx).await["exit_ma_period"], json!(25));
+}
+
+#[tokio::test]
+async fn switching_the_line_off_releases_waiting_reentries() {
+    let tmp = common::temp_dir("tg_exitma_blocks");
+    let ctx = controller(&tmp);
+    let engine = ctx.bot.engine();
+    let network = engine
+        .call("current_network", Some("btc_ma"), json!({}))
+        .await
+        .unwrap();
+    engine
+        .call(
+            "save_state",
+            Some("btc_ma"),
+            json!({"network": network, "mode": "DRY_RUN",
+                   "state": json!({"reentry_block": {"BTCUSDT": {
+                       "side": "LONG", "exit_ms": 1, "exit_reason": "CUSTOM_MA_EXIT",
+                       "until_cross": true}}, "last_evaluated_bar": 12345})}),
+        )
+        .await
+        .unwrap();
+
+    press(&ctx, "xma:on").await;
+    let state = load_state(&ctx).await;
+    // DRY_RUN keeps the bar marker; only LIVE re-evaluates the closed candle.
+    assert_eq!(state["last_evaluated_bar"], json!(12345));
+    assert!(state["reentry_block"].get("BTCUSDT").is_some());
+
+    press(&ctx, "xma:off").await;
+    let state = load_state(&ctx).await;
+    assert_eq!(state["reentry_block"], json!({}));
+}
+
+/// The config file only holds what was written; read the normalized view.
+async fn normalized_cfg(ctx: &Ctx) -> Value {
+    ctx.bot
+        .engine()
+        .call("config_get", Some("btc_ma"), json!({}))
+        .await
+        .unwrap()
+}

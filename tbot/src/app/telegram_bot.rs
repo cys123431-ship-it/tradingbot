@@ -25,9 +25,11 @@ const PICK_LIST_SIZE: usize = 12;
 pub const TIMEFRAMES: &[&str] = &["3m", "5m", "15m", "30m", "1h", "2h", "4h"];
 pub const LEVERAGE_CHOICES: &[i64] = &[2, 3, 4, 5];
 use crate::strategy::config_btc_ma::{
-    DAILY_LOSS_LIMIT_CHOICES, LOSS_STREAK_CHOICES, MARGIN_FRACTION_CHOICES, MIN_BALANCE_CHOICES,
-    STOP_MA_PERIOD,
+    DAILY_LOSS_LIMIT_CHOICES, EXIT_MA_DEFAULT_PERIOD, EXIT_MA_MAX_PERIOD, EXIT_MA_MIN_PERIOD,
+    LOSS_STREAK_CHOICES, MARGIN_FRACTION_CHOICES, MIN_BALANCE_CHOICES, STOP_MA_PERIOD,
 };
+/// Buttons for the custom exit line (Python `EXIT_MA_PRESETS`).
+pub const EXIT_MA_PRESETS: &[i64] = &[25, 69];
 pub const EMERGENCY_STOP_CHOICES: &[i64] = &[0, 10, 20, 30, 50];
 pub const REENTRY_WAIT_CHOICES: &[i64] = &[0, 1, 2, 3, 5];
 pub const SLOW_PERIOD_CHOICES: &[i64] = &[60, 120, 200];
@@ -594,6 +596,56 @@ fn stop_ma_on(cfg: &Value) -> bool {
     cfg_int(cfg, "stop_ma_period", STOP_MA_PERIOD) > 0
 }
 
+/// `(enabled, period)` of the custom exit line from the normalized config.
+fn exit_ma_setting(cfg: &Value) -> (bool, i64) {
+    let enabled = py_truthy(cfg_get(cfg, "exit_ma_enabled"));
+    let period = cfg_int(cfg, "exit_ma_period", EXIT_MA_DEFAULT_PERIOD);
+    (enabled, period)
+}
+
+/// One-line status description (only when on does it explain the behaviour).
+fn exit_ma_text(cfg: &Value) -> String {
+    let (enabled, period) = exit_ma_setting(cfg);
+    let fast = cfg_int(cfg, "fast_period", 3);
+    let slow = cfg_int(cfg, "slow_period", 200);
+    if !enabled {
+        return "OFF (반대 크로스에서만 청산 · 반대 방향 즉시 진입)".to_string();
+    }
+    format!(
+        "ON · SMA{fast}가 SMA{period}을(를) 반대로 돌파하면 청산 \
+         · 청산 후 반대 진입 없이 다음 SMA{fast}/SMA{slow} 크로스 마감까지 현금 대기"
+    )
+}
+
+fn exit_ma_button(cfg: &Value) -> String {
+    let (enabled, period) = exit_ma_setting(cfg);
+    if enabled {
+        format!("🔻 청산 MA: SMA{period}")
+    } else {
+        "🔻 청산 MA: OFF".to_string()
+    }
+}
+
+/// Entry description that reflects the custom-exit rule when it is on.
+fn entry_mode_text_with_exit_ma(cfg: &Value) -> String {
+    let (enabled, _) = exit_ma_setting(cfg);
+    if !enabled {
+        return entry_mode_text(cfg);
+    }
+    let (fast, slow) = sma_names(cfg);
+    format!(
+        "크로스 마감 진입만 ({fast}이 {slow}을 상향 돌파한 봉 마감=롱 / \
+         하향 돌파한 봉 마감=숏) — 청산 MA ON 중에는 방향 유지 진입·즉시 반대 진입 없음"
+    )
+}
+
+fn rotation_text_with_exit_ma(cfg: &Value) -> String {
+    if py_truthy(cfg_get(cfg, "exit_ma_enabled")) {
+        return "OFF (청산 MA ON 중에는 청산 직후 다른 코인으로 바로 진입하지 않음)".to_string();
+    }
+    rotation_text(cfg)
+}
+
 fn profit_lock_on(cfg: &Value) -> bool {
     cfg_get(cfg, "profit_lock_enabled")
         .and_then(|v| v.as_bool())
@@ -890,6 +942,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
              /macross — {} 크로스 + 변동성 타겟 사이징 전략 메뉴\n\
              /macoin <코인> — /btcmacross 거래 코인 1개 지정 (예: /macoin SOL)\n\
              /btcma <패스트> <슬로우> — /btcmacross SMA 기간 변경 (예: /btcma 1 200)\n\
+             /btcma exit <기간> — /btcmacross 청산 MA 변경, 끄기는 /btcma exit off (예: /btcma exit 69)\n\
              /btcmaperiod — SMA 기간 도움말\n\
              /map <패스트> <슬로우> — /macross SMA 기간 변경 (예: /map 1 200)\n\
              /stop — 두 전략 모두 신규 진입 OFF + 보유 포지션 청산\n\
@@ -975,6 +1028,27 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
     }
 
     async fn handle_period_cmd(&self, chat_id: i64, args: &[String]) -> Vec<Outgoing> {
+        let exit_keyword = args
+            .first()
+            .map(|a| a.trim().to_lowercase())
+            .is_some_and(|a| matches!(a.as_str(), "exit" | "xma" | "exitma" | "청산"));
+        if exit_keyword {
+            let text = match parse_exit_ma_command(args) {
+                Ok((enabled, period)) => {
+                    self.set_exit_ma(enabled, period).await;
+                    let cfg = self.config().await;
+                    let (status, _) = self.status_screen().await;
+                    format!("🔻 청산 MA: {}\n\n{status}", exit_ma_text(&cfg))
+                }
+                Err(e) => format!("⚠️ 청산 MA 설정 실패: {e}\n예) /btcma exit 25 · /btcma exit off"),
+            };
+            let (_, markup) = self.status_screen().await;
+            return vec![Outgoing::Send {
+                chat_id,
+                text,
+                markup: Some(markup),
+            }];
+        }
         if args.is_empty() {
             let (help_text, _) = self.handle_btc_ma_cross_action("sma_help").await;
             let (_, markup) = self.status_screen().await;
@@ -1194,6 +1268,22 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 "bm:entry:trend",
             ),
         ]);
+        let (exit_on, exit_period) = exit_ma_setting(cfg);
+        rows.push(vec![markup_button(
+            exit_ma_button(cfg),
+            if exit_on { "bm:xma:off" } else { "bm:xma:on" },
+        )]);
+        let mut exit_row: Vec<Value> = EXIT_MA_PRESETS
+            .iter()
+            .map(|period| {
+                markup_button(
+                    mark(exit_on && exit_period == *period, &format!("청산 MA {period}")),
+                    format!("bm:xmap:{period}"),
+                )
+            })
+            .collect();
+        exit_row.push(markup_button("✏️ 청산 MA 직접 입력", "bm:xma_help"));
+        rows.push(exit_row);
         rows.push(vec![markup_button(
             format!("💰 최소 잔고: {}", min_balance_label(cfg)),
             "bm:minbal",
@@ -1455,12 +1545,13 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             ),
             "다른 전략: /macross와 동시에 켜지지 않음 (켜면 /macross 신규 진입 OFF)".to_string(),
             format!("종목: {}", scope_text(cfg)),
-            format!("진입: {}", entry_mode_text(cfg)),
+            format!("진입: {}", entry_mode_text_with_exit_ma(cfg)),
+            format!("청산 MA: {}", exit_ma_text(cfg)),
             format!(
                 "익절 자동 전환: {}",
                 profit_lock_switch_text(cfg, Some(state))
             ),
-            format!("청산 후 다른 코인 전환: {}", rotation_text(cfg)),
+            format!("청산 후 다른 코인 전환: {}", rotation_text_with_exit_ma(cfg)),
             format!(
                 "봉: {} (마감봉 기준) · SMA {fast}/{slow}",
                 timeframe_labels(cfg_str(cfg, "timeframe", ""))
@@ -1559,6 +1650,21 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 _ => format!("아직 없음 (+{}% 도달 전)", lock_start_text(cfg)),
             };
             lines.push(format!("비상손절 {stop_price} · 수익 확보 {lock_desc}"));
+            let trade_fast = py_int_of(trade.get("fast_period"));
+            let basis = if py_truthy(trade.get("exit_ma_enabled")) {
+                let exit_period = match py_int_of(trade.get("exit_ma_period")) {
+                    0 => EXIT_MA_DEFAULT_PERIOD,
+                    p => p,
+                };
+                format!("청산 기준 SMA{trade_fast}/SMA{exit_period} (청산 MA)")
+            } else {
+                let trade_slow = match py_int_of(trade.get("slow_period")) {
+                    0 => 200,
+                    p => p,
+                };
+                format!("청산 기준 SMA{trade_fast}/SMA{trade_slow} (반대 크로스)")
+            };
+            lines.push(basis);
         } else {
             lines.push(String::new());
             lines.push("보유: 없음".to_string());
@@ -1800,14 +1906,32 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         } else {
             "• 수익 확보: 끔\n".to_string()
         };
+        let exit_ma_on = py_truthy(cfg_get(cfg, "exit_ma_enabled"));
+        let cross_line = if exit_ma_on {
+            format!(
+                "• 청산: 반대 크로스(SMA{fast} ↓/↑ SMA{slow})에서 시장가 청산 (반대 진입 없음, 다음 크로스 마감까지 대기)\n"
+            )
+        } else {
+            format!(
+                "• 청산: 반대 크로스(SMA{fast} ↓/↑ SMA{slow})에서 시장가 청산 후 즉시 반대 방향 진입\n"
+            )
+        };
+        let hold_line = if exit_ma_on {
+            "• 청산 MA ON: 청산 MA 크로스와 반대 크로스 중 먼저 닿는 쪽에서 시장가(reduce-only) 청산, \
+             반대 진입은 하지 않고 다음 크로스 마감까지 현금 대기\n"
+        } else {
+            "• 보유 중 반대 크로스(또는 봉 마감 때 SMA가 반대편): 시장가(reduce-only) 청산 후 즉시 반대 방향 진입\n"
+        };
         format!(
             "📘 {fast}/{slow} SMA 크로스 규칙 (기간은 /btcma 또는 버튼으로 변경)\n\
              • 종목: {} (🎯 코인 지정 또는 /macoin SOL 로 1개 지정)\n\
              • 진입: {}\n\
+             {cross_line}\
+             • 추가 청산 MA: {}\n\
              • 익절 자동 전환: {}\n\
              • 청산 후 다른 코인 전환: {}\n\
              • 봉: {} 마감봉 기준, 진입·청산(반대 크로스) 모두 같은 봉 (3분~4시간 선택)\n\
-             • 보유 중 반대 크로스(또는 봉 마감 때 SMA{fast}이 SMA{slow} 반대편): 시장가(reduce-only) 청산 후 즉시 반대 방향 진입 (신규진입 OFF면 청산만)\n\
+             {hold_line}\
              {sma25_line}\
              • 크로스 진입 범위: {}\n\
              • 최소 잔고: {}\n\
@@ -1820,9 +1944,10 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
              • 거래소는 /setup 선택을 따르고, 켜면 /macross 전략은 신규 진입 OFF\n\
              • 수익을 보장하지 않는 전략입니다.",
             scope_text(cfg),
-            entry_mode_text(cfg),
+            entry_mode_text_with_exit_ma(cfg),
+            exit_ma_text(cfg),
             profit_lock_switch_text(cfg, None),
-            rotation_text(cfg),
+            rotation_text_with_exit_ma(cfg),
             timeframe_labels(cfg_str(cfg, "timeframe", "")),
             lookback_text(cfg),
             min_balance_text(cfg),
@@ -1955,6 +2080,66 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
     async fn reset_counters(&self, network: &str) -> Result<Value, String> {
         self.engine_call("reset_counters", json!({ "network": network }))
             .await
+    }
+
+    /// Store the custom exit line; clears stale blocks when switching off and
+    /// re-arms the newest closed candle when switching on in LIVE. Python
+    /// `_set_btc_ma_cross_exit_ma`, but the writes go out as one config change
+    /// so the engine never sees `enabled` without its period.
+    async fn set_exit_ma(&self, enabled: bool, period: i64) {
+        let mut changes = Map::new();
+        changes.insert("exit_ma_period".to_string(), json!(period));
+        changes.insert("exit_ma_enabled".to_string(), json!(enabled));
+        if let Err(e) = self
+            .engine_call("config_set", json!({ "changes": changes }))
+            .await
+        {
+            log_line(&format!("telegram: exit MA config_set failed: {e}"));
+            return;
+        }
+        let mode = match self.engine_call("mode", json!({})).await {
+            Ok(Value::String(m)) => m,
+            _ => return,
+        };
+        let mut state = match self.engine_call("load_state", json!({ "mode": mode })).await {
+            Ok(Value::Object(m)) => m,
+            _ => return,
+        };
+        let mut changed = false;
+        if !enabled && py_truthy(state.get("reentry_block")) {
+            state.insert("reentry_block".to_string(), Value::Object(Map::new()));
+            changed = true;
+        }
+        if enabled
+            && mode == "LIVE"
+            && state
+                .get("last_evaluated_bar")
+                .map(|v| py_int_of(Some(v)) != 0)
+                .unwrap_or(false)
+        {
+            // Re-evaluate the newest closed candle against the new line.
+            state.insert("last_evaluated_bar".to_string(), json!(0));
+            changed = true;
+        }
+        if changed {
+            let network = match self.engine_call("current_network", json!({})).await {
+                Ok(Value::String(n)) => n,
+                Ok(_) => return,
+                Err(e) => {
+                    log_line(&format!("telegram: exit MA network lookup failed: {e}"));
+                    return;
+                }
+            };
+            if let Err(e) = self
+                .engine_call(
+                    "save_state",
+                    json!({ "network": network, "mode": mode, "state": state }),
+                )
+                .await
+            {
+                log_line(&format!("telegram: exit MA save_state failed: {e}"));
+            }
+        }
     }
 
     fn tradfi_scope_refusal(&self, allowed: bool, network: &str) -> String {
@@ -2108,12 +2293,17 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                         String::new()
                     };
                 let (fast_name, slow_name) = sma_names(&cfg);
+                let (exit_on, exit_period) = exit_ma_setting(&cfg);
+                let exit_basis = if exit_on {
+                    format!("· {fast_name}/SMA{exit_period} 청산 MA 크로스 → 청산 (반대 진입 없음)\n")
+                } else {
+                    format!("· {fast_name}/{slow_name} 반대 크로스 → 청산 후 반대 진입\n")
+                };
                 (
                     format!(
                         "🤝 이 포지션을 봇에게 맡길까요?\n{}\n\n\
                          맡기면 봇이 연 포지션처럼 관리합니다:\n\
-                         · {fast_name}/{slow_name} 반대 크로스 → 청산 후 반대 진입\n\
-                         {sma25_line}{plock_line}{stop_line}\
+                         {exit_basis}{sma25_line}{plock_line}{stop_line}\
                          · 오늘 손익·손실 한도 계산에 포함\n\
                          직접 걸어 둔 TP/SL 주문은 그대로 남습니다.",
                         adopt_summary(&preview)
@@ -2522,6 +2712,77 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                     kb_owned!(),
                 )
             }
+            a if a.starts_with("xma:") => {
+                let enable = a.split_once(':').map(|x| x.1).unwrap_or("") == "on";
+                let (_, period) = exit_ma_setting(&cfg);
+                self.set_exit_ma(enable, period).await;
+                let cfg_now = self.config().await;
+                let note = if holding {
+                    let (enabled_now, period_now) = exit_ma_setting(&cfg_now);
+                    if enabled_now {
+                        format!(
+                            "\n보유 중 포지션에도 다음 봉 마감부터 SMA{period_now} 청산 기준을 적용합니다 \
+                             — 조건이 먼저 닿으면 청산하고, 다음 크로스 마감까지 재진입하지 않습니다."
+                        )
+                    } else {
+                        "\n보유 중 포지션은 다시 반대 크로스 청산 + 즉시 반대 진입 방식으로 관리합니다."
+                            .to_string()
+                    }
+                } else {
+                    String::new()
+                };
+                let status = self.format_status().await;
+                (
+                    format!("🔻 청산 MA: {}{note}\n\n{status}", exit_ma_text(&cfg_now)),
+                    kb_owned!(),
+                )
+            }
+            a if a.starts_with("xmap:") => {
+                let period = a
+                    .split_once(':')
+                    .map(|x| x.1)
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(-1);
+                if !(EXIT_MA_MIN_PERIOD..=EXIT_MA_MAX_PERIOD).contains(&period) {
+                    return ("⚠️ 청산 MA 값이 올바르지 않습니다.".to_string(), kb!());
+                }
+                self.set_exit_ma(true, period).await;
+                let cfg_now = self.config().await;
+                let note = if holding {
+                    "\n(보유 중 포지션은 다음 봉 마감부터 적용)"
+                } else {
+                    ""
+                };
+                let status = self.format_status().await;
+                (
+                    format!(
+                        "🔻 청산 MA {period} ON: {}{note}\n\n{status}",
+                        exit_ma_text(&cfg_now)
+                    ),
+                    kb_owned!(),
+                )
+            }
+            "xma_help" => {
+                let (enabled_now, period_now) = exit_ma_setting(&cfg);
+                let now = if enabled_now {
+                    format!("SMA{period_now} (ON)")
+                } else {
+                    "OFF".to_string()
+                };
+                (
+                    format!(
+                        "✏️ 청산 MA 직접 입력\n지금: {now}\n\n\
+                         명령: /btcma exit <기간>\n\
+                         예) /btcma exit 25 → SMA3 / SMA25 크로스에서 청산\n\
+                         예) /btcma exit 69 → SMA3 / SMA69 크로스에서 청산\n\
+                         끄기: /btcma exit off (기본값)\n\n\
+                         • {EXIT_MA_MIN_PERIOD}~{EXIT_MA_MAX_PERIOD} 사이, 기본 {EXIT_MA_DEFAULT_PERIOD}\n\
+                         • 켜면 청산은 그대로 하되(수익확보·비상손절도 그대로), 반대 크로스에서도 \
+                         반대 진입을 하지 않고 다음 크로스 마감까지 대기합니다."
+                    ),
+                    kb_owned!(),
+                )
+            }
             "pls:on" => {
                 if let Err(e) = self
                     .set_coin_value(
@@ -2818,6 +3079,53 @@ pub(crate) fn unknown_command_note(command: &str) -> Option<&'static str> {
         ),
         _ => None,
     }
+}
+
+/// Parse `/btcma exit 25` / `off` / `on 69` into `(enabled, period)`.
+/// Ported from `parse_exit_ma_command`; the error is a Telegram-ready reason.
+pub fn parse_exit_ma_command(args: &[String]) -> Result<(bool, i64), String> {
+    let mut tokens: Vec<String> = args
+        .iter()
+        .map(|a| a.trim().to_lowercase())
+        .filter(|a| !a.is_empty())
+        .collect();
+    // "/btcma exit 25" passes the leading keyword through; it is not a value.
+    while matches!(tokens.first().map(|s| s.as_str()), Some("exit" | "xma" | "exitma" | "청산"))
+    {
+        tokens.remove(0);
+    }
+    let Some(head) = tokens.first().cloned() else {
+        return Err("값이 없습니다. 예) /btcma exit 25 · /btcma exit off".to_string());
+    };
+    if head.starts_with(|c: char| c.is_numeric()) && tokens.len() > 1 {
+        return Err("값이 너무 많습니다. 예) /btcma exit 25".to_string());
+    }
+    if head == "off" || head == "0" {
+        return Ok((false, EXIT_MA_DEFAULT_PERIOD));
+    }
+    let value = if head == "on" {
+        if tokens.len() > 2 {
+            return Err("값이 너무 많습니다. 예) /btcma exit on 25".to_string());
+        }
+        match tokens.get(1) {
+            Some(v) => v.clone(),
+            None => return Ok((true, EXIT_MA_DEFAULT_PERIOD)),
+        }
+    } else {
+        head
+    };
+    let period = match value.parse::<f64>() {
+        Ok(f) if f.is_finite() => f as i64,
+        _ => {
+            return Err(format!("숫자가 아닙니다: {value} — 예) /btcma exit 25"));
+        }
+    };
+    if !(EXIT_MA_MIN_PERIOD..=EXIT_MA_MAX_PERIOD).contains(&period) {
+        return Err(format!(
+            "청산 MA는 {EXIT_MA_MIN_PERIOD}~{EXIT_MA_MAX_PERIOD} 사이여야 합니다 (입력: {period})."
+        ));
+    }
+    Ok((true, period))
 }
 
 fn log_line(msg: &str) {
