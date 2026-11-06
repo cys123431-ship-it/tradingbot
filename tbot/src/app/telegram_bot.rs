@@ -2142,6 +2142,33 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         }
     }
 
+    /// Drop any waiting re-entry before a manual close, mirroring Python's
+    /// `confirm_close` branch.
+    async fn clear_reentry_if_blocked(&self) -> Result<(), String> {
+        let mode = match self.engine_call("mode", json!({})).await? {
+            Value::String(m) => m,
+            _ => return Ok(()),
+        };
+        let mut state = match self.engine_call("load_state", json!({ "mode": mode })).await? {
+            Value::Object(m) => m,
+            _ => return Ok(()),
+        };
+        if !py_truthy(state.get("reentry_block")) {
+            return Ok(());
+        }
+        state.insert("reentry_block".to_string(), Value::Object(Map::new()));
+        let network = match self.engine_call("current_network", json!({})).await? {
+            Value::String(n) => n,
+            _ => return Ok(()),
+        };
+        self.engine_call(
+            "save_state",
+            json!({ "network": network, "mode": mode, "state": state }),
+        )
+        .await
+        .map(|_| ())
+    }
+
     fn tradfi_scope_refusal(&self, allowed: bool, network: &str) -> String {
         if allowed {
             return String::new();
@@ -2777,7 +2804,6 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                          예) /btcma exit 69 → SMA3 / SMA69 크로스에서 청산\n\
                          끄기: /btcma exit off (기본값)\n\n\
                          • {EXIT_MA_MIN_PERIOD}~{EXIT_MA_MAX_PERIOD} 사이, 기본 {EXIT_MA_DEFAULT_PERIOD}\n\
-                         • 켜면 청산은 그대로 하되(수익확보·비상손절도 그대로), 반대 크로스에서도 \
                          반대 진입을 하지 않고 다음 크로스 마감까지 대기합니다."
                     ),
                     kb_owned!(),
@@ -3010,6 +3036,10 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 )
             }
             "confirm_close" => {
+                // Python clears a waiting re-entry before asking for the close.
+                if let Err(e) = self.clear_reentry_if_blocked().await {
+                    log_line(&format!("telegram: confirm_close reentry clear failed: {e}"));
+                }
                 let result = match self
                     .engine_call("close_position", json!({ "reason": "manual" }))
                     .await

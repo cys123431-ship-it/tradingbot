@@ -1174,6 +1174,51 @@ async fn switching_the_line_off_releases_waiting_reentries() {
     assert_eq!(state["reentry_block"], json!({}));
 }
 
+/// Python's exit-MA help ends with the no-reverse-entry reminder; a mismatch
+/// here means the port drifted from the controller text.
+#[tokio::test]
+async fn exit_ma_help_ends_with_the_no_reverse_entry_reminder() {
+    let tmp = common::temp_dir("tg_exitma_help_tail");
+    let ctx = controller(&tmp);
+    let (text, _) = press(&ctx, "xma_help").await;
+    assert!(
+        text.ends_with("반대 진입을 하지 않고 다음 크로스 마감까지 대기합니다."),
+        "{text}"
+    );
+    assert!(!text.contains("수익확보"), "{text}");
+}
+
+/// Python's `confirm_close` drops a waiting re-entry before the close request,
+/// so the next entry is not blocked by the old exit.
+#[tokio::test]
+async fn confirming_a_close_releases_waiting_reentries() {
+    let tmp = common::temp_dir("tg_close_blocks");
+    let ctx = controller(&tmp);
+    let engine = ctx.bot.engine();
+    let network = engine
+        .call("current_network", Some("btc_ma"), json!({}))
+        .await
+        .unwrap();
+    engine
+        .call(
+            "save_state",
+            Some("btc_ma"),
+            json!({"network": network, "mode": "DRY_RUN",
+                   "state": {"reentry_block": {"BTCUSDT": {
+                       "side": "LONG", "exit_ms": 1, "exit_reason": "CUSTOM_MA_EXIT",
+                       "until_cross": true}}}}),
+        )
+        .await
+        .unwrap();
+    assert!(load_state(&ctx).await["reentry_block"]
+        .get("BTCUSDT")
+        .is_some());
+
+    let (text, _) = press(&ctx, "confirm_close").await;
+    assert!(text.contains("청산 요청"), "{text}");
+    assert_eq!(load_state(&ctx).await["reentry_block"], json!({}));
+}
+
 /// The config file only holds what was written; read the normalized view.
 async fn normalized_cfg(ctx: &Ctx) -> Value {
     ctx.bot
