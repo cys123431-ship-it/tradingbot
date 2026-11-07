@@ -20,6 +20,7 @@ const STRATEGY: &str = "btc_ma";
 const DEFAULT_PROFIT_LOCK_SWITCH_COUNT: i64 = 3;
 
 use crate::core::sma_cross::{scale_in_loss_roi, SCALE_IN_STEPS};
+use crate::strategy::service::base::{BINANCE_MAINNET, BINANCE_TESTNET, UPBIT_MODE};
 const PICK_LIST_SIZE: usize = 12;
 
 pub const TIMEFRAMES: &[&str] = &["3m", "5m", "15m", "30m", "1h", "2h", "4h"];
@@ -37,6 +38,35 @@ const TRADFI_SCOPE: &str = "tradfi";
 
 pub const NETWORK_LABELS: &[(&str, &str)] =
     &[("testnet", "테스트넷(데모)"), ("mainnet", "메인넷(실계좌)")];
+
+/// `/exchange` menu: which exchange/network the futures strategies trade on
+/// (Python `/setup` -> "22. 거래소/네트워크 전환"). Upbit is spot-only, so it is
+/// offered as a button that explains why the futures bot cannot use it.
+pub const EXCHANGE_COMMANDS: &[&str] = &["exchange", "setup", "network"];
+/// Python `get_network_status_label`.
+pub const EXCHANGE_MODE_LABELS: &[(&str, &str)] = &[
+    ("binance_testnet", "테스트넷(데모) 🧪"),
+    ("binance_mainnet", "메인넷 💰"),
+    ("upbit", "업비트 KRW 현물"),
+];
+
+pub fn exchange_mode_label(mode: &str) -> String {
+    EXCHANGE_MODE_LABELS
+        .iter()
+        .find(|(k, _)| *k == mode)
+        .map(|(_, v)| v.to_string())
+        .unwrap_or_else(|| mode.to_string())
+}
+
+/// Engine network id (`testnet`/`mainnet`) or exchange mode id
+/// (`binance_testnet`/`binance_mainnet`/`upbit`) as the short net name.
+pub fn net_name_of(mode: &str) -> &'static str {
+    match mode {
+        BINANCE_MAINNET => "mainnet",
+        BINANCE_TESTNET => "testnet",
+        _ => "",
+    }
+}
 
 pub fn network_label(network: &str) -> String {
     NETWORK_LABELS
@@ -906,6 +936,14 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                     markup: Some(markup),
                 }]
             }
+            other if EXCHANGE_COMMANDS.contains(&other) => {
+                let (text, markup) = self.exchange_menu().await;
+                vec![Outgoing::Send {
+                    chat_id,
+                    text,
+                    markup: Some(markup),
+                }]
+            }
             "start" | "help" => self.handle_help(chat_id).await,
             "stop" => self.handle_stop(chat_id).await,
             other if BTC_MA_PERIOD_COMMANDS.contains(&other) => {
@@ -943,7 +981,8 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
              /macoin <코인> — /btcmacross 거래 코인 1개 지정 (예: /macoin SOL)\n\
              /btcma <패스트> <슬로우> — /btcmacross SMA 기간 변경 (예: /btcma 1 200)\n\
              /btcma exit <기간> — /btcmacross 청산 MA 변경, 끄기는 /btcma exit off (예: /btcma exit 69)\n\
-             /btcmaperiod — SMA 기간 도움말\n\
+             /btcmaperiod — SMA 기간 도움말\
+             /exchange — 거래소/네트워크 전환 (바이낸스 테스트넷 · 메인넷, 구 /setup)\n\
              /map <패스트> <슬로우> — /macross SMA 기간 변경 (예: /map 1 200)\n\
              /stop — 두 전략 모두 신규 진입 OFF + 보유 포지션 청산\n\
              /help — 이 목록 (없는 명령은 이 봇이 모른다고 답합니다)",
@@ -1118,6 +1157,278 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         self.set_value(key, arg).await
     }
 
+    // ------------------------------------------------------ exchange switch
+
+    /// Current `api.exchange_mode` from the config file ("" if unreadable).
+    async fn exchange_mode_now(&self) -> String {
+        self.engine_call("exchange_mode", json!({}))
+            .await
+            .ok()
+            .and_then(|v| v.get("mode").and_then(|m| m.as_str()).map(|s| s.to_string()))
+            .unwrap_or_default()
+    }
+
+    /// One line for the switch screen: positions that stop the switch.
+    fn held_positions_lines(preview: &Value) -> (Vec<String>, bool) {
+        let mut positions: Vec<&Value> = preview
+            .get("positions")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().collect())
+            .unwrap_or_default();
+        let tradfi: Vec<&Value> = preview
+            .get("tradfi_positions")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().collect())
+            .unwrap_or_default();
+        for p in &tradfi {
+            if !positions.iter().any(|q| std::ptr::eq(*q, *p)) {
+                positions.push(p);
+            }
+        }
+        if positions.is_empty() {
+            return (vec!["· 보유 포지션: 없음".to_string()], false);
+        }
+        let mut lines = vec!["· ⚠️ 보유 포지션이 있어 전환할 수 없습니다. 먼저 청산하세요:".to_string()];
+        for p in &positions {
+            lines.push(format!(
+                "  - {} {} {} {}개 ({})",
+                p.get("strategy").and_then(|v| v.as_str()).unwrap_or(""),
+                p.get("symbol").and_then(|v| v.as_str()).unwrap_or(""),
+                p.get("side").and_then(|v| v.as_str()).unwrap_or(""),
+                p.get("contracts").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                p.get("network").and_then(|v| v.as_str()).unwrap_or(""),
+            ));
+        }
+        (lines, true)
+    }
+
+    /// What the switch keeps/changes (single coin + watchlist) for one mode.
+    fn exchange_plan_lines(plan: Option<&Value>) -> Vec<String> {
+        let mut lines = Vec::new();
+        for changes in plan.and_then(|p| p.as_array()).into_iter().flatten() {
+            for change in changes.as_array().into_iter().flatten() {
+                lines.push(format!(
+                    "· ⚠️ {}: {} — {} → {}",
+                    change.get("strategy").and_then(|v| v.as_str()).unwrap_or(""),
+                    change.get("field").and_then(|v| v.as_str()).unwrap_or(""),
+                    change.get("from").and_then(|v| v.as_str()).unwrap_or(""),
+                    change.get("to").and_then(|v| v.as_str()).unwrap_or(""),
+                ));
+            }
+        }
+        lines
+    }
+
+    fn exchange_menu_keyboard(network: &str) -> Value {
+        markup(vec![
+            vec![
+                markup_button(mark(network == "testnet", "🧪 바이낸스 테스트넷"), "bm:exch:testnet"),
+                markup_button(mark(network == "mainnet", "💰 바이낸스 메인넷"), "bm:exch:mainnet"),
+            ],
+            vec![markup_button("🏦 업비트 KRW 현물", "bm:exch:upbit")],
+            vec![markup_button("📊 상태로", "bm:status")],
+        ])
+    }
+
+    /// `/exchange` (alias `/setup`): which exchange/network the bot trades on.
+    pub async fn exchange_menu(&self) -> (String, Value) {
+        let mode = self.exchange_mode_now().await;
+        let network = match mode.as_str() {
+            BINANCE_TESTNET => "testnet",
+            BINANCE_MAINNET => "mainnet",
+            _ => "",
+        };
+        let cfg = self.config().await;
+        let label = if mode.is_empty() {
+            "읽을 수 없음".to_string()
+        } else {
+            exchange_mode_label(&mode)
+        };
+        let text = format!(
+            "🔄 거래소/네트워크 전환 (구 /setup)\n\
+             지금: {label}\n\
+             \n\
+             · 🧪 테스트넷(데모): 바이낸스 선물 테스트넷. 실제 주문 없음, /btcmacross에서 LIVE를 켜도 모의 체결만.\n\
+             · 💰 메인넷: 바이낸스 선물 실계좌. LIVE면 실제 주문이 나갑니다.\n\
+             · 🏦 업비트: 현물만 지원 — 선물 전략(SMA 크로스)은 사용할 수 없습니다.\n\
+             \n\
+             바꾸면 두 전략(/btcmacross·/macross) 모두 다음 판단부터 새 거래소를 씁니다.\n\
+             모드는 {} 그대로입니다.\n\
+             보유 포지션이 있으면 전환을 막습니다 (SL/TP 관리가 끊기지 않도록).",
+            cfg_str(&cfg, "trading_mode", "")
+        );
+        (text, Self::exchange_menu_keyboard(network))
+    }
+
+    /// `bm:exch:*`: the switch screen, a step before anything is written.
+    async fn exchange_action(&self, action: &str) -> (String, Value) {
+        let heard = action.trim().to_lowercase();
+        // Buttons speak network names (`testnet`); the engine speaks modes.
+        let plan = match heard.as_str() {
+            "testnet" => BINANCE_TESTNET,
+            "mainnet" => BINANCE_MAINNET,
+            other => other,
+        };
+        if plan == UPBIT_MODE {
+            let mode = self.exchange_mode_now().await;
+            let network = match mode.as_str() {
+                BINANCE_TESTNET => "testnet",
+                BINANCE_MAINNET => "mainnet",
+                _ => "",
+            };
+            return (
+                "🏦 업비트 KRW 현물\n\n\
+                 이 봇의 전략(/btcmacross·/macross)은 바이낸스 선물 전용입니다.\n\
+                 업비트는 현물 거래소라 레버리지·숏·선물 주문이 없어 사용할 수 없습니다.\n\
+                 (파이썬 봇도 같은 이유로 선물 전략에서 업비트를 막았습니다.)\n\n\
+                 거래소: 바이낸스 테스트넷(데모) 또는 메인넷을 선택하세요."
+                    .to_string(),
+                Self::exchange_menu_keyboard(network),
+            );
+        }
+        if plan != BINANCE_TESTNET && plan != BINANCE_MAINNET {
+            return self.exchange_menu().await;
+        }
+        let preview = match self
+            .engine_call("set_exchange_mode", json!({"mode": plan, "dry_run": true}))
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                let mode = self.exchange_mode_now().await;
+                let network = if mode == BINANCE_MAINNET { "mainnet" } else { "testnet" };
+                return (
+                    format!("⚠️ 거래소 전환 확인 실패: {e}"),
+                    Self::exchange_menu_keyboard(network),
+                );
+            }
+        };
+        if preview.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            let message = preview
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("거래소를 전환할 수 없습니다.");
+            return (message.to_string(), Self::exchange_menu_keyboard(""));
+        }
+        let mode = preview.get("current").and_then(|v| v.as_str()).unwrap_or("");
+        let (mut lines, _) = Self::held_positions_lines(&preview);
+        if preview.get("same").and_then(|v| v.as_bool()) == Some(true) {
+            lines.insert(0, "ℹ️ 이미 이 거래소를 사용 중입니다.".to_string());
+        }
+        let cooldown = preview
+            .get("cooldown_text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !cooldown.is_empty() {
+            lines.push(format!("· {cooldown}"));
+        }
+        let cfg = self.config().await;
+        let mode_now = cfg_str(&cfg, "trading_mode", "");
+        let mut body = format!(
+            "🔄 {}로 전환할까요?\n\
+             지금: {} · 모드 {} ({})\n\
+             {}\n\
+             · 바꾸면 이 봇의 모든 전략이 다음 판단부터 새 거래소를 씁니다.\n\
+             · LIVE에서 메인넷이면 실제 주문이 나갑니다.",
+            network_label(net_name_of(plan)),
+            exchange_mode_label(mode),
+            mode_now,
+            if mode_now == "LIVE" { "실주문" } else { "가상" },
+            lines.join("\n")
+        );
+        let network = net_name_of(plan);
+        let network = if network.is_empty() {
+            net_name_of(&self.exchange_mode_now().await)
+        } else {
+            network
+        };
+        let plan_lines = Self::exchange_plan_lines(preview.get("plan"));
+        if !plan_lines.is_empty() {
+            body.push_str(&format!("\n\n전환 시 조정:\n{}", plan_lines.join("\n")));
+        }
+        let held = lines.iter().any(|l| l.contains("보유 포지션이 있어"));
+        let keyboard = if held || preview.get("same").and_then(|v| v.as_bool()) == Some(true) {
+            Self::exchange_menu_keyboard(network)
+        } else {
+            markup(vec![
+                vec![
+                    markup_button(
+                        format!("✅ {}로 전환", network_label(network)),
+                        format!("bm:exch:confirm:{plan}"),
+                    ),
+                    markup_button("취소", "bm:exchange"),
+                ],
+            ])
+        };
+        (body, keyboard)
+    }
+
+    /// `bm:exch:confirm:<net>`: write `api.exchange_mode`, verify, else roll back.
+    async fn exchange_switch(&self, target: &str) -> (String, Value) {
+        let target = match target.trim().to_lowercase().as_str() {
+            "testnet" => BINANCE_TESTNET,
+            "mainnet" => BINANCE_MAINNET,
+            other => other,
+        }
+        .to_string();
+        let result = self
+            .engine_call("set_exchange_mode", json!({"mode": target}))
+            .await;
+        let (cfg_now, network, text) = match result {
+            Ok(v) => {
+                let mode = v.get("mode").and_then(|m| m.as_str()).unwrap_or(target.as_str());
+                let network = v.get("network").and_then(|n| n.as_str()).unwrap_or("");
+                let mut lines = vec![
+                    format!("✅ 거래소/네트워크 전환 완료: {}", exchange_mode_label(mode)),
+                    String::new(),
+                ];
+                let plan_lines = Self::exchange_plan_lines(v.get("plan"));
+                if plan_lines.is_empty() {
+                    lines.push("· 감시목록·단일 코인은 그대로입니다.".to_string());
+                } else {
+                    lines.push("감시목록·단일 코인을 현재 거래소 기준으로 정리했습니다.".to_string());
+                    lines.extend(plan_lines);
+                }
+                lines.push(String::new());
+                lines.push(format!(
+                    "모드: {} (그대로) · API 키: {}",
+                    cfg_str(&self.config().await, "trading_mode", ""),
+                    self.exchange_badge().await
+                ));
+                (self.config().await, network.to_string(), lines.join("\n"))
+            }
+            Err(e) => {
+                let mode = self.exchange_mode_now().await;
+                let network = if mode == BINANCE_MAINNET { "mainnet" } else { "testnet" };
+                (
+                    self.config().await,
+                    network.to_string(),
+                    format!("❌ 거래소 전환 실패: {e}"),
+                )
+            }
+        };
+        let state = self.load_state_or_empty().await;
+        let markup = if network.is_empty() {
+            Self::exchange_menu_keyboard("")
+        } else {
+            self.build_keyboard(&cfg_now, None, Some(&state))
+        };
+        (text, markup)
+    }
+
+    async fn exchange_badge(&self) -> String {
+        match self.engine_call("status", json!({})).await {
+            Ok(v) => {
+                if py_truthy(v.get("has_credentials")) {
+                    "있음".to_string()
+                } else {
+                    "없음".to_string()
+                }
+            }
+            Err(_) => "확인 실패".to_string(),
+        }
+    }
+
     /// Full stop: disable new entries, close this strategy's position in the
     /// current mode, then read config and both modes' state back to prove it.
     async fn full_off(&self) -> String {
@@ -1198,6 +1509,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
     ) -> Value {
         let enabled = py_truthy(cfg_get(cfg, "enabled"));
         let trading_mode = cfg_str(cfg, "trading_mode", "");
+        let network = cfg_str(cfg, "network", "");
         let scan_scope = cfg_str(cfg, "scan_scope", "");
         let entry_mode = cfg_str(cfg, "entry_mode", "");
         let timeframe = cfg_str(cfg, "timeframe", "");
@@ -1231,6 +1543,23 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             markup_button(mark(trading_mode == "DRY_RUN", "🧪 DRY_RUN"), "bm:mode:dry"),
             markup_button(mark(trading_mode == "LIVE", "💥 LIVE"), "bm:mode:live"),
         ]);
+        // Exchange/network line (network == "" means an unreadable mode).
+        if !network.is_empty() {
+            let after = if network == "mainnet" { "testnet" } else { "mainnet" };
+            rows.push(vec![
+                markup_button(
+                    mark(network == "testnet", "🧪 바이낸스 테스트넷"),
+                    "bm:exch:testnet",
+                ),
+                markup_button(
+                    mark(network == "mainnet", "💰 바이낸스 메인넷"),
+                    "bm:exch:mainnet",
+                ),
+                markup_button(format!("🔄 {after}로 전환"), format!("bm:exch:confirm:{after}")),
+            ]);
+        } else {
+            rows.push(vec![markup_button("🔄 거래소/네트워크 전환", "bm:exchange")]);
+        }
         let pick_label = if scan_scope == "single" {
             mark(true, &format!("🎯 {single}"))
         } else {
@@ -1539,7 +1868,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 }
             ),
             format!(
-                "거래소: {} (/setup 선택을 따름) · API 키: {}",
+                "거래소: {} (/exchange 변경) · API 키: {}",
                 network_label(network),
                 if has_credentials { "있음" } else { "없음" }
             ),
@@ -2185,6 +2514,15 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
     // ------------------------------------------------------ action handler (ported verbatim)
 
     pub async fn handle_btc_ma_cross_action(&self, action: &str) -> (String, Value) {
+        if let Some(rest) = action.strip_prefix("exch:") {
+            return match rest.strip_prefix("confirm:") {
+                Some(target) => self.exchange_switch(target).await,
+                None => self.exchange_action(rest).await,
+            };
+        }
+        if action == "exchange" {
+            return self.exchange_menu().await;
+        }
         let cfg = self.config().await;
         let network = match self.engine_call("current_network", json!({})).await {
             Ok(Value::String(n)) => n,
@@ -3100,9 +3438,6 @@ pub(crate) fn unknown_command_note(command: &str) -> Option<&'static str> {
         // Python-only menus: /setup was the numbered settings menu (it only
         // opened the exchange/network switch at the end), and the rest were
         // its entries. tbot has no settings menu; everything is a button.
-        "setup" => Some(
-            "설정 메뉴는 이 봇에 없습니다. 거래소/네트워크 전환과 전략 설정은 /btcmacross 또는 /macross 버튼으로 하세요.",
-        ),
         "status" | "state" => Some("상태는 /btcmacross (또는 /macross) 화면에서 확인하세요."),
         "resume" | "pause" | "unpause" => Some(
             "정지/재개는 /stop 다음에 /btcmacross 메뉴의 버튼으로 하세요.",

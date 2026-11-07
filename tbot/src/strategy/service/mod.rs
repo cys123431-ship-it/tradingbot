@@ -298,6 +298,11 @@ pub struct ServiceDeps<E> {
     pub environ: HashMap<String, String>,
     /// Implemented as the `set_entry_mode` method.
     pub config_writer: Option<Arc<dyn Fn(String) -> BoxFut<bool> + Send + Sync>>,
+    /// Writes a whole config section (`api.exchange_mode` / `api.use_testnet`):
+    /// `(section, changes) -> saved section`. `None` = no config file to write.
+    pub config_file_writer: Option<
+        Arc<dyn Fn(&str, Map<String, Value>) -> BoxFut<Result<Value, String>> + Send + Sync>,
+    >,
     /// Timestamps used by the ledger/order store.
     pub store_clock: Arc<dyn Clock>,
 }

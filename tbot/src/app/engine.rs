@@ -16,13 +16,18 @@ use crate::exchange::binance::{BinanceClient, Credentials, Network};
 use crate::exchange::binance_futures::BinanceFutures;
 use crate::exchange::FuturesExchange;
 use crate::store::clock::{Clock, SystemClock};
+use crate::strategy::service::base::{BINANCE_MAINNET, BINANCE_TESTNET, UPBIT_MODE};
 use crate::strategy::service::{ServiceDeps, SmaCrossService, Variant};
+use crate::strategy::tradfi::market_in_tradfi_scope;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HEARTBEAT_FILE: &str = "tbot_engine_heartbeat.json";
 
 /// Coin list size requested by the Telegram "pick a coin" keyboard.
 const PICK_LIST_SIZE: usize = 12;
+
+/// Python `exchange_switch_cooldown_seconds`.
+const EXCHANGE_SWITCH_COOLDOWN_SECS: f64 = 30.0;
 
 pub struct Engine<E: FuturesExchange + 'static> {
     cfg: Arc<ConfigFile>,
@@ -32,6 +37,8 @@ pub struct Engine<E: FuturesExchange + 'static> {
     telegram: Option<TelegramApi>,
     started_at: i64,
     runtime_dir: PathBuf,
+    /// Python `exchange_switch_lock` + `last_exchange_switch_ts`.
+    exchange_switch: tokio::sync::Mutex<Option<f64>>,
 }
 
 impl Engine<BinanceFutures> {
@@ -79,6 +86,7 @@ impl Engine<BinanceFutures> {
             telegram,
             started_at,
             runtime_dir,
+            exchange_switch: tokio::sync::Mutex::new(None),
         })
     }
 }
@@ -98,6 +106,7 @@ impl<E: FuturesExchange + 'static> Engine<E> {
             telegram: None,
             started_at: now_secs(),
             runtime_dir,
+            exchange_switch: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -302,6 +311,35 @@ impl<E: FuturesExchange + 'static> Engine<E> {
                     .map_err(|e| e.to_string())?;
                 Ok(Value::Object(state))
             }
+            "exchange_mode" => {
+                let api = self.cfg.section("api");
+                let mode = crate::app::config_file::exchange_mode(&self.cfg.load());
+                let use_testnet = api
+                    .get("use_testnet")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(mode == BINANCE_TESTNET);
+                Ok(json!({
+                    "mode": mode,
+                    "use_testnet": use_testnet,
+                    "network": crate::app::config_file::main_network(&self.cfg.load()),
+                    "cooldown_seconds": EXCHANGE_SWITCH_COOLDOWN_SECS as i64,
+                }))
+            }
+            "set_exchange_mode" => {
+                let target = req
+                    .arg_str("mode")
+                    .ok_or_else(|| "ValueError: missing mode".to_string())?
+                    .trim()
+                    .to_lowercase();
+                let force = req.arg("force").and_then(|v| v.as_bool()).unwrap_or(false);
+                let dry_run = req.arg("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+                if dry_run {
+                    self.exchange_switch_preview(&target).await
+                } else {
+                    self.set_exchange_mode(&target, force).await
+                }
+            }
+            "positions_overview" => self.positions_overview(&req).await,
             "current_network" => {
                 let service = self.service_for(&req)?;
                 Ok(service
@@ -625,6 +663,307 @@ impl<E: FuturesExchange + 'static> Engine<E> {
         )
     }
 
+    /// Every open position on both Binance Futures networks for the two SMA
+    /// strategies, in live mode (the mode that sends real orders).
+    async fn open_positions(&self) -> Result<Vec<Value>, String> {
+        let mut items = Vec::new();
+        for (suffix, service, section) in [
+            ("", &self.btc_ma, "btc_ma_cross"),
+            (" C", &self.ma_plus, "ma_cross"),
+        ] {
+            let label = self.sma_label(section, suffix);
+            for network in ["testnet", "mainnet"] {
+                let rows = service
+                    .fetch_account_positions(network)
+                    .await
+                    .map_err(|e| format!("{label} {network}: {e}"))?;
+                for row in rows {
+                    let contracts = row.get("contracts").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    if contracts.abs() <= 0.0 {
+                        continue;
+                    }
+                    let symbol = row
+                        .get("symbol")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let market = row.get("info").cloned();
+                    items.push(json!({
+                        "strategy": label,
+                        "network": network,
+                        "symbol": symbol,
+                        "side": row.get("side").cloned().unwrap_or(Value::Null),
+                        "contracts": contracts,
+                        "tradfi": market_in_tradfi_scope(&symbol, market.as_ref()),
+                    }));
+                }
+            }
+        }
+        Ok(items)
+    }
+
+    /// What a switch would do to the kept coins: the per-strategy single coin
+    /// and the explicit watchlist, checked against the mode's rules.
+    async fn exchange_switch_plan(&self, mode: &str) -> Value {
+        let mut changes = Vec::new();
+        for (suffix, section) in [("", "btc_ma_cross"), (" C", "ma_cross")] {
+            let label = self.sma_label(section, suffix);
+            let cfg = self.cfg.section(section);
+            let single = cfg
+                .get("single_symbol")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_uppercase();
+            if !single.is_empty() && market_in_tradfi_scope(&single, None) && mode != "mainnet" {
+                changes.push(json!({
+                    "strategy": label,
+                    "field": "단일 코인",
+                    "from": single,
+                    "to": "BTCUSDT",
+                }));
+            }
+            let watchlist: Vec<String> = cfg
+                .get("watchlist")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|s| s.to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if watchlist.is_empty() {
+                continue;
+            }
+            let kept: Vec<&String> = watchlist
+                .iter()
+                .filter(|s| mode == "mainnet" || !market_in_tradfi_scope(s, None))
+                .collect();
+            if kept.len() != watchlist.len() {
+                let to = if kept.is_empty() {
+                    "BTCUSDT".to_string()
+                } else {
+                    kept.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")
+                };
+                changes.push(json!({
+                    "strategy": label,
+                    "field": "감시목록",
+                    "from": watchlist.join(","),
+                    "to": to,
+                }));
+            }
+        }
+        Value::Array(changes)
+    }
+
+    /// `set_exchange_mode` mode: what changing the exchange would do right now.
+    async fn exchange_switch_preview(&self, mode: &str) -> Result<Value, String> {
+        let current = crate::app::config_file::exchange_mode(&self.cfg.load());
+        if mode == UPBIT_MODE {
+            return Ok(json!({
+                "ok": false,
+                "blocked": "upbit_unsupported",
+                "current": current,
+                "target": mode,
+                "message": "업비트는 현물 전용이라 선물 전략(SMA 크로스)을 돌릴 수 없습니다.\
+                    바이낸스 테스트넷(데모) 또는 메인넷을 선택하세요.",
+            }));
+        }
+        if mode != BINANCE_TESTNET && mode != BINANCE_MAINNET {
+            return Err(format!("지원하지 않는 거래모드: {mode}"));
+        }
+        let after_cooldown = {
+            let last = *(self.exchange_switch.lock().await);
+            match last {
+                Some(ts) => {
+                    let remain = EXCHANGE_SWITCH_COOLDOWN_SECS - (now_secs_f64() - ts);
+                    if remain > 0.0 {
+                        format!("⚠️ 거래소 전환은 너무 자주 실행할 수 없습니다. {}초 후 다시 시도하세요.", remain.ceil() as i64)
+                    } else {
+                        String::new()
+                    }
+                }
+                None => String::new(),
+            }
+        };
+        let positions = self.open_positions().await?;
+        let tradfi = positions
+            .iter()
+            .filter(|p| {
+                p.get("tradfi").and_then(|v| v.as_bool()) == Some(true)
+                    && p.get("network").and_then(|v| v.as_str()) != Some("mainnet")
+            })
+            .collect::<Vec<_>>();
+        let mut plans = Vec::new();
+        if mode != BINANCE_TESTNET {
+            plans.push(self.exchange_switch_plan("mainnet").await);
+        }
+        plans.push(self.exchange_switch_plan("testnet").await);
+        Ok(json!({
+            "ok": true,
+            "current": current,
+            "target": mode,
+            "same": current == mode,
+            "cooldown_text": after_cooldown,
+            "positions": positions,
+            "tradfi_positions": tradfi,
+            "plan": plans,
+        }))
+    }
+
+    /// Python `reinit_exchange`: exclusive, 30s cooldown, refuse while a
+    /// position is open, verify the new network resolves, roll back on failure.
+    async fn set_exchange_mode(&self, mode: &str, force: bool) -> Result<Value, String> {
+        let Ok(mut guard) = self.exchange_switch.try_lock() else {
+            return Err(
+                "이미 거래소/네트워크 전환 중입니다. 완료될 때까지 기다려주세요.".to_string(),
+            );
+        };
+        if mode != BINANCE_TESTNET && mode != BINANCE_MAINNET && mode != UPBIT_MODE {
+            return Err(format!("지원하지 않는 거래모드: {mode}"));
+        }
+        {
+            let last = *guard;
+            if let Some(ts) = last {
+                let elapsed = now_secs_f64() - ts;
+                if elapsed < EXCHANGE_SWITCH_COOLDOWN_SECS {
+                    let remain =
+                        (EXCHANGE_SWITCH_COOLDOWN_SECS - elapsed).ceil().max(1.0) as i64;
+                    return Err(format!(
+                        "거래소 전환은 너무 자주 실행할 수 없습니다. {remain}초 후 다시 시도하세요."
+                    ));
+                }
+            }
+        }
+        let current = crate::app::config_file::exchange_mode(&self.cfg.load());
+        // A position only exists on the exchange the strategy trades now.
+        // Switching under it would orphan its protective SL/TP orders.
+        if !force {
+            let held = self.open_positions().await?;
+            if !held.is_empty() {
+                let mut lines = vec![
+                    "보유 포지션이 있어 거래소를 바꾸지 않았습니다.\n\
+                     · 거래소를 바꾸면 보유 포지션과 SL/TP 주문의 관리가 끊깁니다."
+                        .to_string(),
+                ];
+                for p in held {
+                    lines.push(format!(
+                        "· {} {} {} {}개 ({})",
+                        p.get("strategy").and_then(|v| v.as_str()).unwrap_or(""),
+                        p.get("symbol").and_then(|v| v.as_str()).unwrap_or(""),
+                        p.get("side").and_then(|v| v.as_str()).unwrap_or(""),
+                        p.get("contracts").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                        p.get("network").and_then(|v| v.as_str()).unwrap_or(""),
+                    ));
+                }
+                lines.push("· 먼저 포지션을 청산한 뒤 전환하세요.".to_string());
+                return Err(lines.join("\n"));
+            }
+        }
+        if mode == current {
+            return Ok(json!({
+                "ok": true, "same": true, "mode": mode, "network": crate::app::config_file::main_network(&self.cfg.load()),
+            }));
+        }
+        let target = if mode == BINANCE_TESTNET {
+            "testnet"
+        } else {
+            "mainnet"
+        };
+        let plan = self.exchange_switch_plan(target).await;
+        let apply_plan = |cfg: &mut Map<String, Value>, plan: &Value| {
+            for change in plan.as_array().into_iter().flatten() {
+                let field = change.get("field").and_then(|v| v.as_str()).unwrap_or("");
+                let key = if field == "단일 코인" {
+                    "single_symbol"
+                } else {
+                    "watchlist"
+                };
+                let to = change.get("to").and_then(|v| v.as_str()).unwrap_or("");
+                let value = if key == "watchlist" {
+                    Value::Array(
+                        to.split(',')
+                            .map(|s| Value::String(s.trim().to_string()))
+                            .collect(),
+                    )
+                } else {
+                    Value::String(to.to_string())
+                };
+                cfg.insert(key.to_string(), value);
+            }
+        };
+        let old = self.cfg.load();
+        let mut rollback: Vec<(String, Map<String, Value>)> = vec![(
+            "api".to_string(),
+            old.get("api")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default(),
+        )];
+        for section in ["btc_ma_cross", "ma_cross"] {
+            rollback.push((
+                section.to_string(),
+                old.get(section)
+                    .and_then(|v| v.as_object())
+                    .cloned()
+                    .unwrap_or_default(),
+            ));
+        }
+        let restore = |text: String| -> BoxFut<Result<Value, String>> {
+            let cfg = Arc::clone(&self.cfg);
+            Box::pin(async move {
+                for (section, values) in rollback {
+                    match cfg.update_values(&section, values).await {
+                        Ok(_) => {}
+                        Err(e) => log_line(&format!("engine: exchange rollback {section} failed: {e}")),
+                    }
+                }
+                Err(format!("{text} (이전 거래소 설정으로 롤백했습니다)"))
+            })
+        };
+        for section in ["btc_ma_cross", "ma_cross"] {
+            let mut values = self.cfg.section(section).as_object().cloned().unwrap_or_default();
+            apply_plan(&mut values, &plan);
+            let mut changes = values
+                .into_iter()
+                .filter(|(k, _)| matches!(k.as_str(), "single_symbol" | "watchlist"))
+                .collect::<Map<String, Value>>();
+            if changes.is_empty() {
+                continue;
+            }
+            if let Err(e) = self.cfg.update_values(section, std::mem::take(&mut changes)).await {
+                return restore(e).await;
+            }
+        }
+        let mut errors = Vec::new();
+        for (_suffix, service) in [("", &self.btc_ma), (" C", &self.ma_plus)] {
+            if let Err(e) = service.set_exchange_mode(mode).await {
+                errors.push(e);
+            }
+        }
+        if !errors.is_empty() {
+            return restore(errors.join(" / ")).await;
+        }
+        *guard = Some(now_secs_f64());
+        Ok(json!({
+            "ok": true,
+            "mode": mode,
+            "network": target,
+            "previous": current,
+            "plan": plan,
+        }))
+    }
+
+    /// Open positions per network, or a read error (for the switch screen).
+    async fn positions_overview(&self, _req: &Request) -> Result<Value, String> {
+        match self.open_positions().await {
+            Ok(items) => Ok(json!({"ok": true, "positions": items})),
+            Err(e) => Ok(json!({"ok": false, "error": e})),
+        }
+    }
+
     async fn emergency_stop(&self) -> Result<Value, String> {
         let mut lines: Vec<String> = Vec::new();
         for (suffix, service, section) in [
@@ -798,6 +1137,19 @@ fn build_service(
         }))
     };
 
+    let config_file_writer: Option<
+        Arc<dyn Fn(&str, Map<String, Value>) -> BoxFut<Result<Value, String>> + Send + Sync>,
+    > = {
+        let cfg = Arc::clone(cfg);
+        Some(Arc::new(
+            move |section: &str, changes: Map<String, Value>| -> BoxFut<Result<Value, String>> {
+                let cfg = Arc::clone(&cfg);
+                let section = section.to_string();
+                Box::pin(async move { cfg.update_values(&section, changes).await })
+            },
+        ))
+    };
+
     let clock: Arc<dyn Fn() -> f64 + Send + Sync> = Arc::new(now_secs_f64);
     let sleep: Arc<dyn Fn(f64) -> BoxFut<()> + Send + Sync> = Arc::new(|secs: f64| -> BoxFut<()> {
         Box::pin(async move {
@@ -818,6 +1170,7 @@ fn build_service(
         sleep,
         environ: env_map(),
         config_writer,
+        config_file_writer,
         store_clock: Arc::new(SystemClock) as Arc<dyn Clock>,
     };
 

@@ -336,6 +336,7 @@ async fn testnet_universe_is_ranked_by_mainnet_volume() {
         sleep,
         environ: HashMap::new(),
         config_writer: None,
+        config_file_writer: None,
         store_clock: Arc::new(SystemClock),
     };
     let service = SmaCrossService::new(Variant::BtcMa, deps);

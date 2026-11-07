@@ -76,6 +76,7 @@ fn service_over<X: tbot::exchange::FuturesExchange + 'static>(
         sleep: Arc::new(|_s: f64| Box::pin(async {}) as BoxFut<()>),
         environ: HashMap::new(),
         config_writer: None,
+        config_file_writer: None,
         store_clock: Arc::new(SystemClock),
     };
     SmaCrossService::new(variant, deps)

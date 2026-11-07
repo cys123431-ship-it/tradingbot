@@ -16,11 +16,19 @@ use crate::store::ledger::{
     compute_stats, daily_entry_block_reason, trading_day_bounds, StrategyLedger,
 };
 use crate::store::order_state::{OrderState, SQLiteTradingStateStore};
-use crate::strategy::config_base::{effective_trading_mode, NETWORK_TESTNET, TRADING_MODE_LIVE};
+use crate::strategy::config_base::{
+    effective_trading_mode, NETWORK_MAINNET, NETWORK_TESTNET, TRADING_MODE_LIVE,
+};
 use crate::strategy::service::{
     iso_ms, market_key, position_entry, position_qty, position_side, py_f, symbol_pair, BoxFut,
     ServiceError, SmaCrossService, IDLE, MARKET_ID, POSITION_RECONCILIATION,
 };
+
+/// Exchange modes `api.exchange_mode` accepts (Python `SUPPORTED_EXCHANGE_MODES`).
+pub const BINANCE_TESTNET: &str = "binance_testnet";
+pub const BINANCE_MAINNET: &str = "binance_mainnet";
+pub const UPBIT_MODE: &str = "upbit";
+
 
 impl<E: FuturesExchange + 'static> SmaCrossService<E> {
     // ------------------------------------------------------------------ basics
@@ -641,6 +649,43 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             Value::Object(compute_stats(&all_trades)),
         );
         Ok(Value::Object(map))
+    }
+
+    /// Switch `api.exchange_mode` (+ `api.use_testnet`) the way the Python
+    /// `reinit_exchange` did, then prove the service now resolves to the
+    /// requested network. The caller rolls the config back when this fails.
+    pub async fn set_exchange_mode(&self, exchange_mode: &str) -> Result<String, String> {
+        let use_testnet = exchange_mode == BINANCE_TESTNET;
+        let mut changes = Map::new();
+        changes.insert(
+            "exchange_mode".to_string(),
+            Value::String(exchange_mode.to_string()),
+        );
+        changes.insert("use_testnet".to_string(), Value::Bool(use_testnet));
+        let writer = self
+            .deps
+            .config_file_writer
+            .as_ref()
+            .ok_or_else(|| "ValueError: exchange switch needs the config file".to_string())?;
+        writer("api", changes).await?;
+        let wanted = if use_testnet {
+            NETWORK_TESTNET
+        } else {
+            NETWORK_MAINNET
+        };
+        match self.main_network() {
+            Some(net) if net == wanted => {
+                // Drop the cached handles of the old network: the next cycle
+                // rebuilds the exchange from the new credentials.
+                self.exchanges.lock().unwrap().clear();
+                Ok(net)
+            }
+            other => Err(format!(
+                "거래소 설정이 [{}]로 반영되지 않았습니다 (지금: {}). 엔진 환경변수가 거래소를 고정하고 있는지 확인하세요.",
+                exchange_mode,
+                other.unwrap_or_else(|| "없음".to_string())
+            )),
+        }
     }
 
     /// `_main_network()`.

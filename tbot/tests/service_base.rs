@@ -66,6 +66,7 @@ fn build_service(
         sleep,
         environ,
         config_writer: None,
+        config_file_writer: None,
         store_clock: fixed_clock(),
     };
     SmaCrossService::new(Variant::BtcMa, deps)

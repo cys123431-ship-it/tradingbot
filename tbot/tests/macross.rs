@@ -428,6 +428,7 @@ fn build_scope_service(network: &str) -> SmaCrossService<Fake> {
         },
         environ: HashMap::new(),
         config_writer: None,
+        config_file_writer: None,
         store_clock: Arc::new(SystemClock),
     };
     let _ = &network;

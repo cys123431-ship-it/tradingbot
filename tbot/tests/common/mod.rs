@@ -447,6 +447,7 @@ impl Harness {
                     sleep: Arc::new(|_s: f64| Box::pin(async {})),
                     environ: HashMap::new(),
                     config_writer: None,
+                    config_file_writer: None,
                     store_clock: Arc::new(SystemClock),
                 },
             ),
@@ -500,6 +501,7 @@ impl Harness {
             sleep,
             environ: HashMap::new(),
             config_writer: None,
+            config_file_writer: None,
             store_clock: Arc::new(SystemClock),
         };
         SmaCrossService::new(Variant::BtcMa, deps)

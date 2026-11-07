@@ -149,6 +149,7 @@ fn build_with_network(h: &ScopeHarness, network: &str) -> SmaCrossService<MultiF
         sleep,
         environ: HashMap::new(),
         config_writer: None,
+        config_file_writer: None,
         store_clock: Arc::new(tbot::store::clock::SystemClock),
     };
     SmaCrossService::new(Variant::BtcMa, deps)
@@ -357,6 +358,7 @@ async fn tradfi_universe_keeps_only_us_equities_and_gold() {
         sleep,
         environ: HashMap::new(),
         config_writer: None,
+        config_file_writer: None,
         store_clock: Arc::new(tbot::store::clock::SystemClock),
     };
     let service = SmaCrossService::new(Variant::BtcMa, deps);

@@ -75,6 +75,7 @@ fn service_over<X: tbot::exchange::FuturesExchange + 'static>(
         sleep: Arc::new(|_s: f64| Box::pin(async {}) as BoxFut<()>),
         environ: HashMap::new(),
         config_writer: None,
+        config_file_writer: None,
         store_clock: Arc::new(SystemClock),
     };
     SmaCrossService::new(variant, deps)
@@ -210,6 +211,7 @@ fn build_btc(
         sleep,
         environ: HashMap::new(),
         config_writer: None,
+        config_file_writer: None,
         store_clock: Arc::new(SystemClock),
     };
     SmaCrossService::new(Variant::BtcMa, deps)
@@ -258,6 +260,7 @@ fn build_ma(
         sleep,
         environ: HashMap::new(),
         config_writer: None,
+        config_file_writer: None,
         store_clock: Arc::new(SystemClock),
     };
     SmaCrossService::new(Variant::MaPlus, deps)
@@ -308,7 +311,7 @@ async fn telegram_menu_timeframe_emergency_stop_and_exclusivity() {
     let tmp = common::temp_dir("tg_menu");
     let ctx = controller(&tmp);
     let (text, markup) = press(&ctx, "status").await;
-    assert!(text.contains("3/200 SMA") && text.contains("/setup"));
+    assert!(text.contains("3/200 SMA") && text.contains("/exchange"));
     let cbs = callbacks(&markup);
     for tf in ["15m", "30m", "1h", "2h", "4h"] {
         assert!(cbs.contains(&format!("bm:tf:{tf}")));
@@ -645,19 +648,19 @@ async fn close_profit_lock(ctx: &Ctx, _state: Value) {
 fn _touch(_s: OrderState) {}
 
 /// A command tbot does not serve must get a reply, not silence: the old
-/// `_ => Vec::new()` made an unimplemented `/setup` look like a dead bot.
+/// `_ => Vec::new()` made an unimplemented command look like a dead bot.
 #[tokio::test]
 async fn unknown_command_replies_instead_of_silence() {
     let tmp = common::temp_dir("tg_unknown_cmd");
     let ctx = controller(&tmp);
-    let msg = json!({"update_id": 1, "message": {"chat": {"id": 1}, "text": "/setup"}});
+    let msg = json!({"update_id": 1, "message": {"chat": {"id": 1}, "text": "/nosuchcmd"}});
     let out = ctx.bot.handle_update(&msg).await;
     assert_eq!(out.len(), 1, "unknown command must answer");
     let tbot::app::telegram_bot::Outgoing::Send { text, .. } = &out[0] else {
         panic!("expected a Send reply");
     };
-    assert!(text.contains("/setup"), "reply names the command: {text}");
-    assert!(text.contains("/btcmacross"), "reply points elsewhere: {text}");
+    assert!(text.contains("/nosuchcmd"), "reply names the command: {text}");
+    assert!(text.contains("/help"), "reply points elsewhere: {text}");
 }
 
 #[tokio::test]
