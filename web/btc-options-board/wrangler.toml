@@ -1,0 +1,8 @@
+name = "btc-options-board"
+main = "worker.js"
+compatibility_date = "2026-11-01"
+
+[[rules]]
+type = "Text"
+globs = ["**/*.html", "**/*.css"]
+fallthrough = true

@@ -1,0 +1,38 @@
+:root {
+  /* 색 */
+  --bg: #ffffff;
+  --surface: #f4f4f4;
+  --ink: #111111;
+  --muted: #6b6b6b;
+  --line: #e2e2e2;
+  --accent: #1a4be0;
+  --accent-ink: #ffffff;
+  --accent-2: #1a4be0;
+  /* 글꼴 */
+  --font-display: "Switzer", "Archivo", "Pretendard", "Noto Sans KR", "Malgun Gothic", sans-serif;
+  --font-body: "Switzer", "Archivo", "Pretendard", "Noto Sans KR", "Malgun Gothic", sans-serif;
+  --font-mono: "IBM Plex Mono", "Pretendard", "Noto Sans KR", "Malgun Gothic", monospace;
+  /* 크기 */
+  --size-display: 88px;
+  --size-h1: 40px;
+  --size-h2: 28px;
+  --size-body: 16px;
+  --size-small: 13px;
+  --leading: 1.45;
+  --measure: 34ch;
+  /* 간격·모양 */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 16px;
+  --space-4: 24px;
+  --space-5: 40px;
+  --space-6: 64px;
+  --radius: 8px;
+  --border-width: 1px;
+  --shadow: none;
+  /* 추가 */
+  --x-gap: 8px;
+  --x-margin: 12px;
+  --x-tile-pad: 22px;
+  --x-row: 92px;
+}

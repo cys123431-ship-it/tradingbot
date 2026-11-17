@@ -1,0 +1,1034 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BTC 옵션 보드</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600&family=Noto+Sans+KR:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="tokens.css">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: var(--bg); color: var(--ink); }
+  body {
+    font-family: var(--font-body);
+    font-size: var(--size-body);
+    line-height: var(--leading);
+    padding: var(--x-margin);
+    -webkit-font-smoothing: antialiased;
+  }
+  .board {
+    display: grid;
+    grid-template-columns: repeat(12, minmax(0, 1fr));
+    gap: var(--x-gap);
+    grid-auto-rows: var(--x-row);
+  }
+  .tile {
+    background: var(--surface);
+    border-radius: var(--radius);
+    padding: var(--x-tile-pad);
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-start;
+    overflow: auto;
+    position: relative;
+    min-width: 0;
+  }
+  .tile::-webkit-scrollbar { width: 6px; height: 6px; }
+  .tile::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
+
+  /* sizes */
+  .c6 { grid-column: span 6; }
+  .c3 { grid-column: span 3; }
+  .c12 { grid-column: span 12; }
+  .r4 { grid-row: span 4; }
+  .r2 { grid-row: span 2; }
+  .r1 { grid-row: span 1; }
+
+  /* name tile */
+  .tile.name { background: var(--ink); color: var(--bg); justify-content: space-between; }
+  .tile.name .wordmark {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: var(--size-display);
+    letter-spacing: -0.04em;
+    line-height: 0.95;
+    color: var(--bg);
+  }
+  .tile.name .tag {
+    font-size: var(--size-small);
+    color: color-mix(in srgb, var(--bg) 62%, transparent);
+    line-height: 1.5;
+  }
+
+  /* metric */
+  .metric .num {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 56px;
+    line-height: 1;
+    letter-spacing: -0.03em;
+    color: var(--ink);
+    white-space: nowrap;
+  }
+  .metric .num.sm { font-size: 44px; }
+  .metric .lbl { font-size: var(--size-small); color: var(--muted); margin-top: var(--space-2); }
+  .metric .sub { font-size: var(--size-small); color: var(--muted); margin-top: auto; }
+
+  /* statement */
+  .tile.statement p {
+    font-family: var(--font-display);
+    font-weight: 500;
+    font-size: 32px;
+    line-height: 1.2;
+    letter-spacing: -0.02em;
+    color: var(--ink);
+    max-width: 30ch;
+  }
+  .selector { display: flex; flex-wrap: wrap; gap: var(--space-3); margin-top: auto; padding-top: var(--space-3); }
+  .selector button {
+    background: none;
+    border: none;
+    font-family: var(--font-body);
+    font-size: var(--size-small);
+    font-weight: 400;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 2px 0;
+    text-align: left;
+    line-height: 1.4;
+    border-bottom: 1px solid transparent;
+    transition: none;
+  }
+  .selector button .ed { display: block; font-size: 11px; color: var(--muted); }
+  .selector button[aria-pressed="true"] {
+    font-weight: 600;
+    color: var(--ink);
+    border-bottom: 1px solid var(--ink);
+  }
+  .selector button[aria-pressed="true"] .ed { color: var(--ink); }
+
+  /* tables */
+  .tables { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-3); margin-top: var(--space-2); }
+  .tables h3 {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 14px;
+    color: var(--ink);
+    margin-bottom: var(--space-2);
+  }
+  .tables .side { min-width: 0; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: right; padding: 4px 6px; font-weight: 400; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  thead th { color: var(--muted); font-weight: 400; border-bottom: 1px solid var(--line); padding-bottom: 6px; }
+  tbody td { color: var(--ink); }
+  tbody td.sec { color: var(--muted); }
+  .tile h2 {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 16px;
+    letter-spacing: -0.01em;
+    color: var(--ink);
+    margin-bottom: var(--space-2);
+  }
+  .tile h2 .hint { font-weight: 400; font-size: var(--size-small); color: var(--muted); margin-left: var(--space-2); }
+
+  /* summary table */
+  .summary table { width: 100%; }
+  .summary th, .summary td { text-align: right; padding: 6px 6px; }
+  .summary th:first-child, .summary td:first-child { text-align: left; }
+
+  /* guide */
+  .guide ul { list-style: none; margin-top: var(--space-2); }
+  .guide li {
+    font-size: var(--size-small);
+    color: var(--muted);
+    line-height: 1.5;
+    padding: 4px 0;
+  }
+  .guide li b { color: var(--ink); font-weight: 600; }
+
+  /* action */
+  .tile.action {
+    background: var(--accent);
+    color: var(--accent-ink);
+    justify-content: space-between;
+  }
+  .tile.action .big {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: var(--size-h2);
+    line-height: 1.15;
+    letter-spacing: -0.02em;
+  }
+  .tile.action .count {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 40px;
+    line-height: 1;
+    letter-spacing: -0.02em;
+    margin-top: var(--space-2);
+  }
+  .tile.action .stat { font-size: var(--size-small); line-height: 1.6; color: color-mix(in srgb, var(--accent-ink) 80%, transparent); }
+  .tile.action .stat b { color: var(--accent-ink); font-weight: 600; }
+  .tile.action .refresh {
+    background: none; border: none;
+    font-family: var(--font-body);
+    font-weight: 500;
+    font-size: var(--size-small);
+    color: var(--accent-ink);
+    cursor: pointer;
+    text-align: left;
+    padding: 0;
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+
+  /* footer */
+  .tile.foot {
+    background: var(--ink);
+    color: var(--bg);
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+    gap: var(--space-3);
+    overflow: hidden;
+  }
+  .tile.foot strong { font-weight: 600; font-size: 15px; color: var(--bg); flex: none; }
+  .tile.foot span { font-size: var(--size-small); color: color-mix(in srgb, var(--bg) 70%, transparent); text-align: right; }
+
+  .neg { font-variant-numeric: tabular-nums; }
+
+  @media (max-width: 759px) {
+    .board { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-auto-rows: auto; }
+    .tile { min-height: calc(var(--x-row) * 2 + var(--x-gap)); }
+    .tile.foot { min-height: 0; }
+    .selector { flex-wrap: wrap; row-gap: var(--space-2); }
+    .c6, .c12 { grid-column: span 2; }
+    .c3 { grid-column: span 1; }
+    .metric .num { font-size: 26px; overflow-wrap: anywhere; }
+    .metric .num.sm { font-size: 22px; }
+    .tile.statement p { font-size: 24px; }
+    .tile.name .wordmark { font-size: clamp(48px, 15vw, var(--size-display)); }
+    .tables { grid-template-columns: 1fr; }
+    .tile.statement { grid-row: span 4; }
+    .tile.name { grid-row: span 2; }
+    .tile.metric { grid-row: auto; min-height: 128px; }
+    .tile.foot { flex-direction: column; align-items: flex-start; justify-content: center; }
+    .tile.foot span { text-align: left; }
+  }
+</style>
+</head>
+<body>
+<div class="board">
+
+  <!-- 1. name tile 6x2 + index 3x2 + perp 3x2 -->
+  <div class="tile name c6 r2">
+    <div class="wordmark">BTC 옵션 보드</div>
+    <div class="tag">Deribit 옵션 · 바이낸스 BTCUSDT 무기한 · 읽기 전용</div>
+  </div>
+
+  <div class="tile metric c3 r2">
+    <div class="num" id="idxNum">불러오는 중…</div>
+    <div class="lbl">지수 (Deribit BTC-USD)</div>
+  </div>
+
+  <div class="tile metric c3 r2">
+    <div class="num" id="perpNum">불러오는 중…</div>
+    <div class="lbl">무기한 (바이낸스 BTCUSDT)</div>
+    <div class="sub" id="perpSub">불러오는 중…</div>
+  </div>
+
+  <!-- 2. statement 6x4 + 4 metric tiles -->
+  <div class="tile statement c6 r4">
+    <p id="statement">불러오는 중…</p>
+    <div class="selector" id="selector" role="group" aria-label="만기 구간 선택"></div>
+  </div>
+
+  <div class="tile metric c3 r2">
+    <div class="num sm" id="maxPainNum">불러오는 중…</div>
+    <div class="lbl">맥스페인</div>
+  </div>
+  <div class="tile metric c3 r2">
+    <div class="num sm" id="flipNum">불러오는 중…</div>
+    <div class="lbl">감마 플립 (제로 감마)</div>
+  </div>
+  <div class="tile metric c3 r2">
+    <div class="num sm" id="gexNum">불러오는 중…</div>
+    <div class="lbl">딜러 감마 · 1% 움직임당 딜러 헤지</div>
+  </div>
+  <div class="tile metric c3 r2">
+    <div class="num sm" id="pcrNum">불러오는 중…</div>
+    <div class="lbl">풋/콜 OI</div>
+  </div>
+
+  <!-- 3. four metric tiles 3x2 -->
+  <div class="tile metric c3 r2">
+    <div class="num sm" id="dvolNum">불러오는 중…</div>
+    <div class="sub" id="dvolSub">불러오는 중…</div>
+  </div>
+  <div class="tile metric c3 r2">
+    <div class="num sm" id="skewNum">불러오는 중…</div>
+    <div class="lbl">25Δ 스큐 (풋 − 콜, %p)</div>
+  </div>
+  <div class="tile metric c3 r2">
+    <div class="num sm" id="callOiNum">불러오는 중…</div>
+    <div class="lbl">콜 OI 합</div>
+  </div>
+  <div class="tile metric c3 r2">
+    <div class="num sm" id="putOiNum">불러오는 중…</div>
+    <div class="lbl">풋 OI 합</div>
+  </div>
+
+  <!-- 4. tables -->
+  <div class="tile c6 r4">
+    <h2>미결제약정 벽 TOP 10 <span class="hint">행사가 · OI · 거래량</span></h2>
+    <div class="tables">
+      <div class="side">
+        <h3>콜 벽 (저항)</h3>
+        <table id="callWall"><thead><tr><th>행사가</th><th>OI</th><th>거래량</th></tr></thead><tbody></tbody></table>
+      </div>
+      <div class="side">
+        <h3>풋 벽 (지지)</h3>
+        <table id="putWall"><thead><tr><th>행사가</th><th>OI</th><th>거래량</th></tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+  </div>
+
+  <div class="tile c6 r4">
+    <h2>24시간 거래 상위 10 <span class="hint">행사가 · 거래량 · OI · 회전율</span></h2>
+    <div class="tables">
+      <div class="side">
+        <h3>콜</h3>
+        <table id="callVol"><thead><tr><th>행사가</th><th>거래량</th><th>OI</th><th>회전율</th></tr></thead><tbody></tbody></table>
+      </div>
+      <div class="side">
+        <h3>풋</h3>
+        <table id="putVol"><thead><tr><th>행사가</th><th>거래량</th><th>OI</th><th>회전율</th></tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+  </div>
+
+  <!-- 5. summary + guide + action -->
+  <div class="tile summary c6 r4">
+    <h2>만기별 요약</h2>
+    <div style="overflow-x:auto;">
+      <table id="summaryTable">
+        <thead><tr><th>만기</th><th>남은 일</th><th>맥스페인</th><th>감마 플립</th><th>딜러 감마</th><th>PCR</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="tile guide c3 r4">
+    <h2>읽는 법</h2>
+    <ul>
+      <li><b>맥스페인</b> — 만기 때 옵션 매수자가 가장 많이 잃는 행사가. 가격이 끌리는 자리.</li>
+      <li><b>감마 플립</b> — 딜러 감마 합계의 부호가 바뀌는 지수. 위/아래에 따라 헤지 방향이 달라집니다.</li>
+      <li><b>딜러 감마 부호 가정</b> — 콜 +, 풋 −. 딜러가 콜을 매도, 풋을 매도한 표준 모델.</li>
+      <li><b>OI 벽</b> — 미결제약정이 몰린 행사가. 콜은 저항, 풋은 지지로 읽습니다.</li>
+      <li><b>회전율 100% 초과</b> — 새 포지션 유입 신호.</li>
+    </ul>
+  </div>
+
+  <div class="tile action c3 r4">
+    <div>
+      <div class="big">60초마다<br>갱신</div>
+      <div class="count" id="countdown">—</div>
+    </div>
+    <div class="stat">
+      <div>마지막 갱신 <b id="lastUpdate">—</b> (KST)</div>
+      <div>Deribit <b id="statusDeribit">불러오는 중…</b></div>
+      <div>Binance <b id="statusBinance">불러오는 중…</b></div>
+    </div>
+    <button class="refresh" id="refreshBtn" type="button">지금 새로고침</button>
+  </div>
+
+  <!-- 6. footer -->
+  <div class="tile foot c12 r1">
+    <strong>BTC 옵션 보드</strong>
+    <span>데이터: Deribit 공개 API · Binance 공개 시세 · 참고용 정보이며 매매 신호가 아닙니다</span>
+  </div>
+
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var DERIBIT = 'https://www.deribit.com/api/v2';
+  var BINANCE_WS = 'wss://fstream.binance.com/stream?streams=btcusdt@aggTrade/btcusdt@markPrice@1s';
+  var BINANCE_REST = 'https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT';
+  var REFRESH_MS = 60000;
+  var YEAR_MS = 365 * 24 * 3600 * 1000;
+  var MIN_T = 1 / 8760;
+
+  var state = {
+    index: null,
+    perp: null,
+    funding: null,
+    dvol: null,
+    dvolChange: null,
+    options: [],
+    lastUpdate: null,
+    deribitOk: null,
+    binanceOk: null,
+    tier: 'all',
+    nextRefresh: 0
+  };
+
+  /* ---------- formatting ---------- */
+  function fmtInt(n) {
+    if (n === null || n === undefined || !isFinite(n)) return '—';
+    return Math.round(n).toLocaleString('en-US');
+  }
+  function fmtUsd(n, digits) {
+    if (n === null || n === undefined || !isFinite(n)) return '—';
+    var neg = n < 0;
+    var v = Math.abs(n);
+    var s;
+    if (digits !== undefined) {
+      s = v.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
+    } else {
+      s = fmtInt(v);
+    }
+    return (neg ? '−$' : '$') + s;
+  }
+  function fmtSignedUsd(n) {
+    if (n === null || n === undefined || !isFinite(n)) return '—';
+    var sign = n < 0 ? '−' : '+';
+    var v = Math.abs(n);
+    return sign + '$' + v.toLocaleString('en-US', { maximumFractionDigits: 0 });
+  }
+  function fmtMillions(n) {
+    if (n === null || n === undefined || !isFinite(n)) return '—';
+    var sign = n < 0 ? '−' : '+';
+    var v = Math.abs(n) / 1e6;
+    return sign + '$' + v.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + 'M';
+  }
+  function fmtBtc(n) {
+    if (n === null || n === undefined || !isFinite(n)) return '—';
+    return fmtInt(n) + ' BTC';
+  }
+  function fmtPct2(n) {
+    if (n === null || n === undefined || !isFinite(n)) return '—';
+    var sign = n < 0 ? '−' : '';
+    return sign + Math.abs(n).toFixed(2) + '%';
+  }
+  function fmtSignedNum(n, digits) {
+    if (n === null || n === undefined || !isFinite(n)) return '—';
+    var sign = n < 0 ? '−' : '+';
+    return sign + Math.abs(n).toFixed(digits);
+  }
+  function kstTime(d) {
+    if (!d) return '—';
+    try {
+      var parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+      }).formatToParts(d);
+      var o = {};
+      parts.forEach(function (p) { o[p.type] = p.value; });
+      return (o.hour || '00') + ':' + (o.minute || '00') + ':' + (o.second || '00');
+    } catch (e) {
+      return d.toTimeString().slice(0, 8);
+    }
+  }
+
+  /* ---------- math ---------- */
+  function erf(x) {
+    var sign = x < 0 ? -1 : 1;
+    var ax = Math.abs(x);
+    var a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741,
+        a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
+    var t = 1 / (1 + p * ax);
+    var y = 1 - (((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t) * Math.exp(-ax * ax);
+    return sign * y;
+  }
+  function normCdf(x) { return 0.5 * (1 + erf(x / Math.SQRT2)); }
+  function normPdf(x) { return Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI); }
+
+  function bsm(S, K, T, sigma) {
+    var sqt = sigma * Math.sqrt(T);
+    var d1 = (Math.log(S / K) + 0.5 * sigma * sigma * T) / sqt;
+    var gamma = normPdf(d1) / (S * sqt);
+    var callDelta = normCdf(d1);
+    var putDelta = normCdf(d1) - 1;
+    return { d1: d1, gamma: gamma, callDelta: callDelta, putDelta: putDelta };
+  }
+
+  /* ---------- parsing ---------- */
+  var MON = { JAN: 0, FEB: 1, MAR: 2, APR: 3, MAY: 4, JUN: 5, JUL: 6, AUG: 7, SEP: 8, OCT: 9, NOV: 10, DEC: 11 };
+  var INST_RE = /^BTC-(\d{1,2})([A-Z]{3})(\d{2})-(\d+)-([CP])$/;
+
+  function parseInstrument(name) {
+    var m = INST_RE.exec(name);
+    if (!m) return null;
+    var day = parseInt(m[1], 10);
+    var mon = MON[m[2]];
+    if (mon === undefined) return null;
+    var yy = parseInt(m[3], 10);
+    var year = 2000 + yy;
+    var strike = parseInt(m[4], 10);
+    var type = m[5];
+    var expiry = Date.UTC(year, mon, day, 8, 0, 0);
+    if (!isFinite(expiry)) return null;
+    return { expiry: expiry, strike: strike, type: type, name: name };
+  }
+
+  function isLastFridayOfMonth(ts) {
+    var d = new Date(ts);
+    var y = d.getUTCFullYear(), mo = d.getUTCMonth(), day = d.getUTCDate();
+    var last = new Date(Date.UTC(y, mo + 1, 0));
+    var lastDay = last.getUTCDate();
+    // must be within last 7 days and Friday(5)
+    if (d.getUTCDay() !== 5) return false;
+    if (day !== lastDay && day < lastDay - 6) return false;
+    // confirm it's the last friday
+    var dd = lastDay;
+    while (new Date(Date.UTC(y, mo, dd)).getUTCDay() !== 5) dd--;
+    return day === dd;
+  }
+
+  /* ---------- option processing ---------- */
+  function buildOptions(raw, now) {
+    var out = [];
+    for (var i = 0; i < raw.length; i++) {
+      var r = raw[i];
+      var parsed = parseInstrument(r.instrument_name);
+      if (!parsed) continue;
+      var oi = r.open_interest;
+      var iv = r.mark_iv;
+      if (!(oi > 0)) continue;
+      if (!(iv > 0)) continue;
+      out.push({
+        expiry: parsed.expiry,
+        strike: parsed.strike,
+        type: parsed.type,
+        oi: oi,
+        volume: r.volume > 0 ? r.volume : 0,
+        iv: iv / 100,
+        underlying: r.underlying_price
+      });
+    }
+    return out;
+  }
+
+  /* ---------- metrics for a set of options ---------- */
+  function computeMetrics(opts, S) {
+    if (!opts.length || !(S > 0)) {
+      return { maxPain: null, flip: null, gex: null, pcr: null, callOi: 0, putOi: 0, skew: null };
+    }
+    var now = Date.now();
+    var i, o, T, g, gammaVal, sign, gexSum = 0;
+    var callOi = 0, putOi = 0;
+    var byStrike = {};
+    var sk = [];
+
+    // prepare derived
+    var menu = opts.map(function (o) {
+      T = (o.expiry - now) / YEAR_MS;
+      if (T < MIN_T) T = MIN_T;
+      var b = bsm(S, o.strike, T, o.iv);
+      var sig = o.type === 'C' ? 1 : -1;
+      return { o: o, T: T, gamma: b.gamma, delta: o.type === 'C' ? b.callDelta : b.putDelta, sig: sig };
+    });
+
+    // gex cumulative & strikes
+    for (i = 0; i < menu.length; i++) {
+      o = menu[i].o;
+      gammaVal = menu[i].gamma;
+      sign = menu[i].sig;
+      gexSum += sign * gammaVal * o.oi * S * S * 0.01;
+      if (o.type === 'C') callOi += o.oi; else putOi += o.oi;
+      var kobj = byStrike[o.strike] || (byStrike[o.strike] = { call: 0, put: 0 });
+      if (o.type === 'C') kobj.call += o.oi; else kobj.put += o.oi;
+    }
+    sk = Object.keys(byStrike).map(function (k) { return parseFloat(k); });
+
+    // max pain
+    var bestK = null, bestPain = Infinity;
+    for (i = 0; i < sk.length; i++) {
+      var Ks = sk[i];
+      var pain = 0;
+      for (var ks in byStrike) {
+        var K = parseFloat(ks);
+        var ko = byStrike[ks];
+        // settling at Ks: calls below Ks and puts above Ks finish in the money
+        if (K < Ks) pain += ko.call * (Ks - K);
+        else if (K > Ks) pain += ko.put * (K - Ks);
+      }
+      if (pain < bestPain) { bestPain = pain; bestK = Ks; }
+    }
+
+    // gamma flip scan
+    var flip = null;
+    var prevS = null, prevG = null;
+    var bestDist = Infinity;
+    for (var k = 0; k <= 120; k++) {
+      var s = S * (0.70 + 0.005 * k);
+      var gsum = 0;
+      for (i = 0; i < menu.length; i++) {
+        var mm = menu[i];
+        T = (mm.o.expiry - now) / YEAR_MS;
+        if (T < MIN_T) T = MIN_T;
+        var b2 = bsm(s, mm.o.strike, T, mm.o.iv);
+        gsum += mm.sig * b2.gamma * mm.o.oi * s * s * 0.01;
+      }
+      if (prevG !== null) {
+        if ((prevG < 0 && gsum >= 0) || (prevG >= 0 && gsum < 0)) {
+          var t = prevG === gsum ? 0 : prevG / (prevG - gsum);
+          var cross = prevS + t * (s - prevS);
+          var dist = Math.abs(cross - S);
+          if (dist < bestDist) { bestDist = dist; flip = cross; }
+        }
+      }
+      prevS = s; prevG = gsum;
+    }
+
+    // 25 delta skew (single expiry)
+    var skew = null;
+    var singleExp = opts.length > 0;
+    for (i = 1; i < menu.length; i++) if (menu[i].o.expiry !== menu[0].o.expiry) { singleExp = false; break; }
+    if (singleExp) {
+      var putBest = null, putDist = Infinity, callBest = null, callDist = Infinity;
+      for (i = 0; i < menu.length; i++) {
+        var m = menu[i];
+        if (m.o.type === 'P') {
+          var pd = Math.abs(m.delta - (-0.25));
+          if (pd < putDist) { putDist = pd; putBest = m.o; }
+        } else {
+          var cd = Math.abs(m.delta - 0.25);
+          if (cd < callDist) { callDist = cd; callBest = m.o; }
+        }
+      }
+      if (putBest && callBest) skew = (putBest.iv - callBest.iv) * 100;
+    }
+
+    return {
+      maxPain: bestK,
+      flip: flip,
+      gex: gexSum,
+      pcr: callOi > 0 ? putOi / callOi : null,
+      callOi: callOi,
+      putOi: putOi,
+      skew: skew
+    };
+  }
+
+  /* ---------- tier selection ---------- */
+  function getExpiryList(now) {
+    var set = {};
+    for (var i = 0; i < state.options.length; i++) set[state.options[i].expiry] = true;
+    return Object.keys(set).map(Number).filter(function (t) { return t > now; }).sort(function (a, b) { return a - b; });
+  }
+
+  function tiersInfo() {
+    var now = Date.now();
+    var exps = getExpiryList(now);
+    var monthly = exps.filter(isLastFridayOfMonth);
+    var tiers = {
+      all: { expiries: null, label: '전체' },
+      near: { expiries: exps[0] !== undefined ? [exps[0]] : null, label: '최근접' },
+      next: { expiries: exps[1] !== undefined ? [exps[1]] : null, label: '차근접' },
+      month: { expiries: monthly[0] !== undefined ? [monthly[0]] : null, label: '당월물' },
+      nextMonth: { expiries: monthly[1] !== undefined ? [monthly[1]] : null, label: '차월물' }
+    };
+    return tiers;
+  }
+
+  function formatExpiryShort(ts) {
+    var d = new Date(ts);
+    var dd = String(d.getUTCDate()).padStart(2, '0');
+    var mon = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getUTCMonth()];
+    var yy = String(d.getUTCFullYear() % 100).padStart(2, '0');
+    return dd + mon + yy;
+  }
+  function daysUntil(ts) {
+    var d = (ts - Date.now()) / (24 * 3600 * 1000);
+    return d;
+  }
+  function formatDays(ts) {
+    var d = daysUntil(ts);
+    if (d < 0) d = 0;
+    return d.toFixed(1) + '일';
+  }
+
+  function optionsForTier(tierKey) {
+    var tiers = tiersInfo();
+    var t = tiers[tierKey];
+    if (t && tierKey === 'all') {
+      var nowAll = Date.now();
+      return { opts: state.options.filter(function (o) { return o.expiry > nowAll; }), label: t.label, expiry: null, empty: false };
+    }
+    if (!t || !t.expiries) return { opts: [], label: t ? t.label : '', expiry: null, empty: true };
+    var set = {};
+    t.expiries.forEach(function (e) { set[e] = true; });
+    var opts = state.options.filter(function (o) { return set[o.expiry]; });
+    return { opts: opts, label: t.label, expiry: t.expiries[0], empty: false };
+  }
+
+  /* ---------- render ---------- */
+  function setText(id, txt) {
+    var el = document.getElementById(id);
+    if (el) el.textContent = txt;
+  }
+
+  function renderTop() {
+    setText('idxNum', state.index === null ? '불러오는 중…' : fmtUsd(state.index));
+    setText('perpNum', state.perp === null ? '불러오는 중…' : fmtUsd(state.perp));
+    var sub = '불러오는 중…';
+    if (state.perp !== null) {
+      var fund = state.funding === null ? '—' : (state.funding >= 0 ? '+' : '') + (state.funding * 100).toFixed(4) + '%';
+      var basis = (state.index !== null) ? fmtSignedUsd(Math.round(state.perp - state.index)) : '—';
+      sub = '펀딩 ' + fund + ' · 베이시스 ' + basis;
+    }
+    setText('perpSub', sub);
+  }
+
+  function renderSelector() {
+    var wrap = document.getElementById('selector');
+    var tiers = tiersInfo();
+    var order = ['all', 'near', 'next', 'month', 'nextMonth'];
+    wrap.textContent = '';
+    order.forEach(function (key) {
+      var t = tiers[key];
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.setAttribute('aria-pressed', state.tier === key ? 'true' : 'false');
+      var labelSpan = document.createElement('span');
+      labelSpan.textContent = t.label;
+      btn.appendChild(labelSpan);
+      if (t.expiries && t.expiries.length) {
+        var ed = document.createElement('span');
+        ed.className = 'ed';
+        ed.textContent = formatExpiryShort(t.expiries[0]) + ' · ' + formatDays(t.expiries[0]);
+        btn.appendChild(ed);
+      } else if (key !== 'all') {
+        var ed2 = document.createElement('span');
+        ed2.className = 'ed';
+        ed2.textContent = '해당 없음';
+        btn.appendChild(ed2);
+      }
+      btn.addEventListener('click', function () {
+        state.tier = key;
+        try { localStorage.setItem('btcopt.tier', key); } catch (e) {}
+        renderAll();
+      });
+      wrap.appendChild(btn);
+    });
+  }
+
+  function renderStatement(metrics) {
+    var el = document.getElementById('statement');
+    if (state.index === null) { el.textContent = '불러오는 중…'; return; }
+    var idx = fmtUsd(state.index);
+    if (metrics.flip === null || metrics.flip === undefined) {
+      el.textContent = idx + ' 기준, 범위 안에 감마 플립이 없습니다. 딜러 포지션이 한 방향으로 치우쳐 있습니다.';
+      return;
+    }
+    var flip = fmtUsd(metrics.flip);
+    if (state.index >= metrics.flip) {
+      el.textContent = idx + '은 감마 플립 ' + flip + ' 위에 있습니다. 딜러 헤지가 움직임을 누그러뜨리는 구간입니다.';
+    } else {
+      el.textContent = idx + '은 감마 플립 ' + flip + ' 아래에 있습니다. 딜러 헤지가 움직임을 키우는 구간입니다.';
+    }
+  }
+
+  function renderMetrics(m) {
+    setText('maxPainNum', m.maxPain === null ? '—' : fmtUsd(m.maxPain));
+    setText('flipNum', m.flip === null || m.flip === undefined ? '범위 밖' : fmtUsd(m.flip));
+    setText('gexNum', m.gex === null ? '—' : fmtMillions(m.gex));
+    setText('pcrNum', m.pcr === null ? '—' : m.pcr.toFixed(2));
+    setText('callOiNum', m.callOi ? fmtBtc(m.callOi) : '0 BTC');
+    setText('putOiNum', m.putOi ? fmtBtc(m.putOi) : '0 BTC');
+    setText('skewNum', m.skew === null || m.skew === undefined ? '-' : fmtSignedNum(m.skew, 2) + '%p');
+
+    // dvol
+    if (state.dvol === null) {
+      setText('dvolNum', '불러오는 중…');
+      setText('dvolSub', '불러오는 중…');
+    } else {
+      setText('dvolNum', state.dvol.toFixed(1));
+      var ch = state.dvolChange;
+      setText('dvolSub', 'DVOL 지수 · 24시간 ' + (ch === null ? '—' : fmtSignedNum(ch, 1)));
+    }
+  }
+
+  function renderWalls(opts) {
+    var calls = opts.filter(function (o) { return o.type === 'C'; });
+    var puts = opts.filter(function (o) { return o.type === 'P'; });
+    var callStrikes = aggregateByStrike(calls);
+    var putStrikes = aggregateByStrike(puts);
+    var topCall = callStrikes.slice().sort(function (a, b) { return b.oi - a.oi; }).slice(0, 10);
+    var topPut = putStrikes.slice().sort(function (a, b) { return b.oi - a.oi; }).slice(0, 10);
+    fillWallTable('callWall', topCall, 'oi');
+    fillWallTable('putWall', topPut, 'oi');
+  }
+
+  function fillWallTable(id, rows, sortKey) {
+    var tb = document.querySelector('#' + id + ' tbody');
+    tb.textContent = '';
+    if (!rows.length) {
+      var tr0 = document.createElement('tr');
+      var td0 = document.createElement('td');
+      td0.colSpan = 3;
+      td0.className = 'sec';
+      td0.textContent = '데이터 없음';
+      tr0.appendChild(td0); tb.appendChild(tr0); return;
+    }
+    rows.forEach(function (r) {
+      var tr = document.createElement('tr');
+      td(tr, fmtUsd(r.strike), false);
+      td(tr, fmtInt(r.oi), true);
+      td(tr, fmtInt(r.volume), true);
+      tb.appendChild(tr);
+    });
+  }
+
+  function renderVol(opts) {
+    var calls = opts.filter(function (o) { return o.type === 'C'; });
+    var puts = opts.filter(function (o) { return o.type === 'P'; });
+    var cs = aggregateByStrike(calls).sort(function (a, b) { return b.volume - a.volume; }).slice(0, 10);
+    var ps = aggregateByStrike(puts).sort(function (a, b) { return b.volume - a.volume; }).slice(0, 10);
+    fillVolTable('callVol', cs);
+    fillVolTable('putVol', ps);
+  }
+
+  function fillVolTable(id, rows) {
+    var tb = document.querySelector('#' + id + ' tbody');
+    tb.textContent = '';
+    if (!rows.length) {
+      var tr0 = document.createElement('tr');
+      var td0 = document.createElement('td');
+      td0.colSpan = 4;
+      td0.className = 'sec';
+      td0.textContent = '데이터 없음';
+      tr0.appendChild(td0); tb.appendChild(tr0); return;
+    }
+    rows.forEach(function (r) {
+      var tr = document.createElement('tr');
+      td(tr, fmtUsd(r.strike), false);
+      td(tr, fmtInt(r.volume), true);
+      td(tr, fmtInt(r.oi), true);
+      var turn = r.oi > 0 ? (r.volume / r.oi * 100) : null;
+      td(tr, turn === null ? '—' : turn.toFixed(0) + '%', true, true);
+      tb.appendChild(tr);
+    });
+  }
+
+  function td(tr, text, right, sec) {
+    var cell = document.createElement('td');
+    cell.textContent = text;
+    if (right) cell.className = sec ? 'sec' : '';
+    tr.appendChild(cell);
+  }
+
+  function aggregateByStrike(arr) {
+    var map = {};
+    arr.forEach(function (o) {
+      var e = map[o.strike] || (map[o.strike] = { strike: o.strike, oi: 0, volume: 0 });
+      e.oi += o.oi; e.volume += o.volume;
+    });
+    return Object.keys(map).map(function (k) { return map[k]; });
+  }
+
+  function renderSummary() {
+    var tb = document.querySelector('#summaryTable tbody');
+    tb.textContent = '';
+    var tiers = tiersInfo();
+    var order = ['near', 'next', 'month', 'nextMonth'];
+    order.forEach(function (key) {
+      var info = tiers[key];
+      var tr = document.createElement('tr');
+      var labelCell = document.createElement('td');
+      if (info.expiries && info.expiries.length) {
+        labelCell.textContent = info.label;
+        tr.appendChild(labelCell);
+        var e = info.expiries[0];
+        var dCell = document.createElement('td');
+        dCell.className = 'sec';
+        dCell.textContent = formatExpiryShort(e) + ' · ' + formatDays(e);
+        tr.appendChild(dCell);
+
+        var opts = state.options.filter(function (o) { return o.expiry === e; });
+        var m = (state.index !== null && opts.length) ? computeMetrics(opts, state.index) : null;
+        var mp = document.createElement('td'); mp.textContent = m && m.maxPain !== null ? fmtUsd(m.maxPain) : '—'; tr.appendChild(mp);
+        var fl = document.createElement('td'); fl.textContent = m ? (m.flip === null || m.flip === undefined ? '범위 밖' : fmtUsd(m.flip)) : '—'; tr.appendChild(fl);
+        var gx = document.createElement('td'); gx.textContent = m ? fmtMillions(m.gex) : '—'; tr.appendChild(gx);
+        var pc = document.createElement('td'); pc.className = 'sec'; pc.textContent = m && m.pcr !== null ? m.pcr.toFixed(2) : '—'; tr.appendChild(pc);
+      } else {
+        labelCell.textContent = info.label;
+        tr.appendChild(labelCell);
+        var none = document.createElement('td');
+        none.colSpan = 5;
+        none.className = 'sec';
+        none.textContent = '해당 없음 · 추후 만기 없음';
+        tr.appendChild(none);
+      }
+      tb.appendChild(tr);
+    });
+  }
+
+  function renderStatus() {
+    setText('lastUpdate', state.lastUpdate ? kstTime(state.lastUpdate) : '—');
+    setText('statusDeribit', state.deribitOk === null ? '불러오는 중…' : (state.deribitOk ? '정상' : '연결 실패 · 다시 시도 중'));
+    setText('statusBinance', state.binanceOk === null ? '불러오는 중…' : (state.binanceOk ? '정상' : '연결 실패 · 다시 시도 중'));
+  }
+
+  function renderAll() {
+    renderTop();
+    renderSelector();
+    var t = optionsForTier(state.tier);
+    var m = (state.index !== null && t.opts.length) ? computeMetrics(t.opts, state.index) : computeMetrics([], state.index || 0);
+    renderStatement(m);
+    renderMetrics(m);
+    renderWalls(t.opts);
+    renderVol(t.opts);
+    renderSummary();
+    renderStatus();
+  }
+
+  /* ---------- data fetching ---------- */
+  function fetchJson(url) {
+    return fetch(url, { cache: 'no-store' }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    });
+  }
+
+  function loadDeribit() {
+    var now = Date.now();
+    var start = now - 26 * 3600 * 1000;
+    var p1 = fetchJson(DERIBIT + '/public/get_book_summary_by_currency?currency=BTC&kind=option');
+    var p2 = fetchJson(DERIBIT + '/public/get_index_price?index_name=btc_usd');
+    var dvolUrl = DERIBIT + '/public/get_volatility_index_data?currency=BTC&start_timestamp=' + start +
+      '&end_timestamp=' + now + '&resolution=3600';
+
+    Promise.all([p1, p2]).then(function (res) {
+      var bookRes = res[0], idxRes = res[1];
+      if (bookRes && bookRes.result && Array.isArray(bookRes.result)) {
+        state.options = buildOptions(bookRes.result, Date.now());
+      }
+      if (idxRes && idxRes.result && isFinite(idxRes.result.index_price)) {
+        state.index = idxRes.result.index_price;
+      }
+      state.deribitOk = true;
+      state.lastUpdate = new Date();
+      renderAll();
+      return fetchJson(dvolUrl).then(function (dv) {
+        var data = dv && dv.result && dv.result.data;
+        if (Array.isArray(data) && data.length) {
+          var last = data[data.length - 1];
+          state.dvol = last[4];
+          var target = Date.now() - 24 * 3600 * 1000;
+          var nearest = data[0];
+          var bestDiff = Infinity;
+          for (var i = 0; i < data.length; i++) {
+            var diff = Math.abs(data[i][0] - target);
+            if (diff < bestDiff) { bestDiff = diff; nearest = data[i]; }
+          }
+          if (nearest && nearest[4] !== undefined) state.dvolChange = state.dvol - nearest[4];
+          renderAll();
+        }
+      }).catch(function () { /* dvol optional */ });
+    }).catch(function () {
+      state.deribitOk = false;
+      renderStatus();
+    });
+  }
+
+  function loadBinanceRest() {
+    fetchJson(BINANCE_REST).then(function (j) {
+      if (j && isFinite(j.markPrice)) { state.perp = parseFloat(j.markPrice); state.binanceOk = true; }
+      if (j && j.lastFundingRate !== undefined) { state.funding = parseFloat(j.lastFundingRate); }
+      if (!state.lastUpdate) state.lastUpdate = new Date();
+      renderTop(); renderStatus();
+    }).catch(function () {
+      state.binanceOk = false;
+      renderStatus();
+    });
+  }
+
+  var ws = null;
+  var wsTimer = null;
+  var wsRetry = null;
+
+  function connectBinanceWs() {
+    try {
+      ws = new WebSocket(BINANCE_WS);
+    } catch (e) {
+      scheduleWsReconnect();
+      return;
+    }
+    ws.onopen = function () { state.binanceOk = true; renderStatus(); };
+    ws.onmessage = function (ev) {
+      var msg;
+      try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      var stream = msg.stream || '';
+      var data = msg.data;
+      if (!data) return;
+      if (stream.indexOf('aggTrade') !== -1) {
+        if (isFinite(data.p)) { state.perp = parseFloat(data.p); state.binanceOk = true; renderTop(); }
+      } else if (stream.indexOf('markPrice') !== -1) {
+        if (isFinite(data.p)) { state.perp = state.perp === null ? parseFloat(data.p) : state.perp; }
+        if (data.r !== undefined) { state.funding = parseFloat(data.r); }
+        state.binanceOk = true;
+        if (state.perp === null && isFinite(data.p)) state.perp = parseFloat(data.p);
+        renderTop(); renderStatus();
+      }
+    };
+    ws.onerror = function () { /* handled by onclose */ };
+    ws.onclose = function () { state.binanceOk = false; renderStatus(); scheduleWsReconnect(); };
+  }
+
+  function scheduleWsReconnect() {
+    if (wsRetry) clearTimeout(wsRetry);
+    wsRetry = setTimeout(function () { connectBinanceWs(); }, 5000);
+  }
+
+  /* ---------- timers ---------- */
+  function refreshCycle() {
+    loadDeribit();
+    loadBinanceRest();
+  }
+
+  function tickCountdown() {
+    var remain = Math.max(0, Math.round((state.nextRefresh - Date.now()) / 1000));
+    setText('countdown', remain + '초');
+    if (Date.now() >= state.nextRefresh) {
+      state.nextRefresh = Date.now() + REFRESH_MS;
+      refreshCycle();
+    }
+  }
+
+  function init() {
+    try {
+      var saved = localStorage.getItem('btcopt.tier');
+      if (saved && ['all', 'near', 'next', 'month', 'nextMonth'].indexOf(saved) !== -1) state.tier = saved;
+    } catch (e) {}
+
+    renderSelector();
+    renderStatement({ flip: null });
+    renderStatus();
+
+    document.getElementById('refreshBtn').addEventListener('click', function () {
+      state.nextRefresh = Date.now() + REFRESH_MS;
+      refreshCycle();
+      tickCountdown();
+    });
+
+    refreshCycle();
+    state.nextRefresh = Date.now() + REFRESH_MS;
+    setInterval(tickCountdown, 1000);
+    setInterval(loadBinanceRest, 10000);
+    connectBinanceWs();
+    tickCountdown();
+  }
+
+  init();
+})();
+</script>
+</body>
+</html>
