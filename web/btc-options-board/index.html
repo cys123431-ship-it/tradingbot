@@ -75,6 +75,10 @@
   .metric .num.sm { font-size: 44px; }
   .metric .lbl { font-size: var(--size-small); color: var(--muted); margin-top: var(--space-2); }
   .metric .sub { font-size: var(--size-small); color: var(--muted); margin-top: auto; }
+  .metric .note { font-size: var(--size-small); color: var(--ink); margin-top: auto; line-height: 1.4; }
+  .tile.statement .reading { margin-top: var(--space-3); font-size: 14px; line-height: 1.55; color: var(--muted); max-width: 52ch; }
+  .tile.statement .reading div + div { margin-top: var(--space-1); }
+  .tile.statement .reading strong { color: var(--ink); font-weight: 600; }
 
   /* statement */
   .tile.statement p {
@@ -244,40 +248,48 @@
   <div class="tile metric c3 r2">
     <div class="num" id="perpNum">불러오는 중…</div>
     <div class="lbl">무기한 (바이낸스 BTCUSDT)</div>
-    <div class="sub" id="perpSub">불러오는 중…</div>
+    <div class="lbl" id="perpSub">불러오는 중…</div>
+    <div class="note" id="noteFunding"></div>
   </div>
 
   <!-- 2. statement 6x4 + 4 metric tiles -->
   <div class="tile statement c6 r4">
     <p id="statement">불러오는 중…</p>
+    <div class="reading" id="reading"></div>
     <div class="selector" id="selector" role="group" aria-label="만기 구간 선택"></div>
   </div>
 
   <div class="tile metric c3 r2">
     <div class="num sm" id="maxPainNum">불러오는 중…</div>
     <div class="lbl">맥스페인</div>
+    <div class="note" id="noteMaxPain"></div>
   </div>
   <div class="tile metric c3 r2">
     <div class="num sm" id="flipNum">불러오는 중…</div>
     <div class="lbl">감마 플립 (제로 감마)</div>
+    <div class="note" id="noteFlip"></div>
   </div>
   <div class="tile metric c3 r2">
     <div class="num sm" id="gexNum">불러오는 중…</div>
     <div class="lbl">딜러 감마 · 1% 움직임당 딜러 헤지</div>
+    <div class="note" id="noteGex"></div>
   </div>
   <div class="tile metric c3 r2">
     <div class="num sm" id="pcrNum">불러오는 중…</div>
     <div class="lbl">풋/콜 OI</div>
+    <div class="note" id="notePcr"></div>
   </div>
 
   <!-- 3. four metric tiles 3x2 -->
   <div class="tile metric c3 r2">
     <div class="num sm" id="dvolNum">불러오는 중…</div>
-    <div class="sub" id="dvolSub">불러오는 중…</div>
+    <div class="lbl" id="dvolSub">불러오는 중…</div>
+    <div class="note" id="noteDvol"></div>
   </div>
   <div class="tile metric c3 r2">
     <div class="num sm" id="skewNum">불러오는 중…</div>
     <div class="lbl">25Δ 스큐 (풋 − 콜, %p)</div>
+    <div class="note" id="noteSkew"></div>
   </div>
   <div class="tile metric c3 r2">
     <div class="num sm" id="callOiNum">불러오는 중…</div>
@@ -722,20 +734,324 @@
     });
   }
 
-  function renderStatement(metrics) {
+  function interpretBoard(ctx) {
+    var c = ctx || {};
+
+    function num(v) {
+      return typeof v === 'number' && isFinite(v) ? v : null;
+    }
+
+    var S = num(c.S);
+    var mp = num(c.mp);
+    var flip = num(c.flip);
+    var gex = num(c.gex);
+    var pcr = num(c.pcr);
+    var dvol = num(c.dvol);
+    var dvolChg = num(c.dvolChg);
+    var skew = num(c.skew);
+    var funding = num(c.funding);
+    var days = num(c.days);
+    var callWall = num(c.callWall);
+    var putWall = num(c.putWall);
+
+    var CAVEAT = '규칙 기반 해석이며 매매 신호가 아닙니다.';
+
+    function pct(v) {
+      return Math.abs(v).toFixed(1);
+    }
+
+    function btcFmt(v) {
+      return Math.round(v).toLocaleString('en-US');
+    }
+
+    function strikeFmt(v) {
+      return Math.round(v).toLocaleString('en-US');
+    }
+
+    var notes = {
+      maxPain: null,
+      flip: null,
+      gex: null,
+      pcr: null,
+      dvol: null,
+      skew: null,
+      funding: null
+    };
+
+    var bias = 0;
+    var vol = 0;
+    var reasons = [];
+
+    // 맥스페인 note + d
+    var mpD = null;
+    if (mp !== null && S !== null && S !== 0) {
+      mpD = (mp - S) / S;
+      var absD = Math.abs(mpD) * 100;
+      if (Math.abs(mpD) < 0.01) {
+        notes.maxPain = '지수와 거의 같음 · 만기까지 이 근처에 머물려는 힘';
+      } else {
+        var dir = mpD > 0 ? '위' : '아래';
+        notes.maxPain = '지수보다 ' + absD.toFixed(1) + '% ' + dir + ' · ' +
+          ((days !== null && days <= 7) ? '만기가 가까워 그쪽으로 끌릴 수 있음' : '만기가 멀어 끌림은 약함');
+      }
+    }
+
+    // 감마 플립 note
+    if (flip !== null) {
+      if (S !== null && flip !== 0) {
+        var flipDist = Math.abs(S - flip) / flip * 100;
+        if (S >= flip) {
+          notes.flip = '지수가 ' + flipDist.toFixed(1) + '% 위 · 딜러가 반대로 헤지해 움직임이 줄어드는 구간';
+        } else {
+          notes.flip = '지수가 ' + flipDist.toFixed(1) + '% 아래 · 딜러가 같은 방향으로 헤지해 움직임이 커지는 구간';
+        }
+      }
+    } else if (S !== null) {
+      notes.flip = '범위 안에 없음 · 딜러 감마가 한쪽으로 치우침';
+    }
+
+    // 딜러 감마 note
+    if (gex !== null && S !== null && S !== 0) {
+      var gexBtc = Math.abs(gex) / S;
+      if (gex < 0) {
+        notes.gex = '1% 움직이면 딜러가 약 ' + btcFmt(gexBtc) + ' BTC를 같은 방향으로 거래 (변동성 증폭)';
+      } else {
+        notes.gex = '1% 움직이면 딜러가 약 ' + btcFmt(gexBtc) + ' BTC를 반대 방향으로 거래 (변동성 완충)';
+      }
+    }
+
+    // 풋/콜 OI note
+    if (pcr !== null) {
+      if (pcr < 0.7) {
+        notes.pcr = '콜이 훨씬 많음 · 상승 기대 쏠림';
+      } else if (pcr < 1) {
+        notes.pcr = '균형에 가까움 (콜 약간 우세)';
+      } else if (pcr <= 1.3) {
+        notes.pcr = '풋이 많음 · 하락 헤지 수요';
+      } else {
+        notes.pcr = '풋 쏠림이 큼 · 과도한 비관 (반대 신호가 되기도 함)';
+      }
+    }
+
+    // DVOL note
+    if (dvol !== null) {
+      var levelStr = dvol < 40 ? '낮음' : (dvol > 60 ? '높음' : '보통');
+      var chgStr = ' · 24시간 변화 작음';
+      if (dvolChg !== null) {
+        if (dvolChg >= 3) {
+          chgStr = ' · 24시간 급등, 불안 확대';
+        } else if (dvolChg <= -3) {
+          chgStr = ' · 24시간 하락, 안정';
+        }
+      }
+      notes.dvol = '변동성 ' + levelStr + chgStr;
+    }
+
+    // 25Δ 스큐 note
+    if (skew !== null) {
+      if (skew > 5) {
+        notes.skew = '풋이 비쌈 · 하락 대비 수요 강함';
+      } else if (skew >= 0) {
+        notes.skew = '풋이 약간 비쌈 · 평소 수준';
+      } else {
+        notes.skew = '콜이 비쌈 · 상승 베팅 우세';
+      }
+    }
+
+    // 펀딩 note
+    if (funding !== null) {
+      if (funding > 0.0005) {
+        notes.funding = '롱 과열';
+      } else if (funding < 0) {
+        notes.funding = '숏 우세';
+      } else {
+        notes.funding = '보통';
+      }
+    }
+
+    // 1. Gamma regime
+    if (flip !== null && S !== null) {
+      if (S < flip) {
+        vol += 1;
+        reasons.push('숏감마 구간');
+      } else {
+        vol -= 1;
+        reasons.push('롱감마 구간');
+      }
+    } else if (flip === null && gex !== null) {
+      if (gex < 0) {
+        vol += 1;
+        reasons.push('딜러 숏감마');
+      } else {
+        vol -= 1;
+        reasons.push('딜러 롱감마');
+      }
+    }
+
+    // 2. DVOL
+    if (dvolChg !== null) {
+      if (dvolChg >= 3) {
+        vol += 1;
+        reasons.push('DVOL 급등');
+      } else if (dvolChg <= -3) {
+        vol -= 1;
+        reasons.push('DVOL 하락');
+      }
+    }
+    if (dvol !== null && dvol > 60) {
+      vol += 1;
+      reasons.push('DVOL 높음');
+    }
+
+    // 3. Max pain pull
+    if (mpD !== null && days !== null && days <= 7 && Math.abs(mpD) >= 0.01) {
+      if (mpD > 0) {
+        bias += 1;
+        reasons.push('맥스페인 위 끌림');
+      } else {
+        bias -= 1;
+        reasons.push('맥스페인 아래 끌림');
+      }
+    }
+
+    // 4. PCR
+    if (pcr !== null) {
+      if (pcr < 0.7) {
+        bias += 1;
+        reasons.push('콜 쏠림');
+      } else if (pcr > 1.3) {
+        bias += 1;
+        reasons.push('풋 과열 · 역발상');
+      } else if (pcr > 1.0 && pcr <= 1.3) {
+        bias -= 1;
+        reasons.push('풋 헤지 많음');
+      }
+    }
+
+    // 5. Skew
+    if (skew !== null) {
+      if (skew > 5) {
+        bias -= 1;
+        reasons.push('하락 대비 수요');
+      } else if (skew < 0) {
+        bias += 1;
+        reasons.push('상승 베팅 우세');
+      }
+    }
+
+    // 6. Funding
+    if (funding !== null) {
+      if (funding > 0.0005) {
+        bias -= 1;
+        reasons.push('롱 과열');
+      } else if (funding < 0) {
+        bias -= 1;
+        reasons.push('숏 우세');
+      }
+    }
+
+    // 7. Walls
+    var wallsExist = callWall !== null && putWall !== null && S !== null && S !== 0;
+    if (wallsExist) {
+      var up = (callWall - S) / S;
+      var down = (S - putWall) / S;
+      if (down < up / 2) {
+        bias += 1;
+        reasons.push('지지선 근처');
+      } else if (up < down / 2) {
+        bias -= 1;
+        reasons.push('저항선 근처');
+      }
+    }
+
+    var verdictBias = bias >= 2 ? '상방 우위' : (bias <= -2 ? '하방 우위' : '중립');
+    var verdictVol = vol >= 1 ? '변동성 확대 쪽' : (vol <= -1 ? '변동성 축소 쪽' : '변동성 보통');
+
+    var range = null;
+    if (wallsExist) {
+      range = '지지 $' + strikeFmt(putWall) + ' · 저항 $' + strikeFmt(callWall) + ' (지수 $' + strikeFmt(S) + ')';
+    }
+
+    var summary = '종합: ' + verdictBias + ' · ' + verdictVol + '.';
+    if (reasons.length > 0) {
+      summary += ' 근거: ' + reasons.join(', ') + '.';
+    }
+    summary += ' ' + CAVEAT;
+
+    return {
+      notes: notes,
+      bias: bias,
+      vol: vol,
+      reasons: reasons,
+      verdictBias: verdictBias,
+      verdictVol: verdictVol,
+      range: range,
+      summary: summary
+    };
+  }
+
+  /* largest call OI above S and largest put OI below S */
+  function wallsAround(opts, S) {
+    var calls = {}, puts = {};
+    opts.forEach(function (o) {
+      var bucket = o.type === 'C' ? calls : puts;
+      bucket[o.strike] = (bucket[o.strike] || 0) + o.oi;
+    });
+    function best(map, above) {
+      var k = null, v = -1;
+      Object.keys(map).forEach(function (key) {
+        var strike = parseFloat(key);
+        if ((above ? strike > S : strike < S) && map[key] > v) { v = map[key]; k = strike; }
+      });
+      return k;
+    }
+    return { callWall: best(calls, true), putWall: best(puts, false) };
+  }
+
+  function renderStatement(metrics, tier) {
     var el = document.getElementById('statement');
-    if (state.index === null) { el.textContent = '불러오는 중…'; return; }
-    var idx = fmtUsd(state.index);
-    if (metrics.flip === null || metrics.flip === undefined) {
-      el.textContent = idx + ' 기준, 범위 안에 감마 플립이 없습니다. 딜러 포지션이 한 방향으로 치우쳐 있습니다.';
+    var box = document.getElementById('reading');
+    if (state.index === null || !tier || !tier.opts.length) {
+      el.textContent = '불러오는 중…';
+      box.textContent = '';
       return;
     }
-    var flip = fmtUsd(metrics.flip);
-    if (state.index >= metrics.flip) {
-      el.textContent = idx + '은 감마 플립 ' + flip + ' 위에 있습니다. 딜러 헤지가 움직임을 누그러뜨리는 구간입니다.';
+    var walls = wallsAround(tier.opts, state.index);
+    var days = tier.expiry ? (tier.expiry - Date.now()) / 86400000 : null;
+    var r = interpretBoard({
+      S: state.index, mp: metrics.maxPain, flip: metrics.flip, gex: metrics.gex, pcr: metrics.pcr,
+      dvol: state.dvol, dvolChg: state.dvolChange, skew: metrics.skew, funding: state.funding,
+      days: days, callWall: walls.callWall, putWall: walls.putWall
+    });
+    el.textContent = r.verdictBias + ' · ' + r.verdictVol;
+    var idx = fmtUsd(state.index);
+    var regime;
+    if (metrics.flip === null || metrics.flip === undefined) {
+      regime = idx + ' 기준, 범위 안에 감마 플립이 없습니다.';
+    } else if (state.index >= metrics.flip) {
+      regime = idx + '은 감마 플립 ' + fmtUsd(metrics.flip) + ' 위입니다. 딜러 헤지가 움직임을 누그러뜨리는 구간입니다.';
     } else {
-      el.textContent = idx + '은 감마 플립 ' + flip + ' 아래에 있습니다. 딜러 헤지가 움직임을 키우는 구간입니다.';
+      regime = idx + '은 감마 플립 ' + fmtUsd(metrics.flip) + ' 아래입니다. 딜러 헤지가 움직임을 키우는 구간입니다.';
     }
+    var lines = [regime];
+    if (r.range) lines.push(r.range);
+    lines.push('근거 (방향 ' + (r.bias > 0 ? '+' : '') + r.bias + ', 변동성 ' + (r.vol > 0 ? '+' : '') + r.vol + '): ' +
+               (r.reasons.length ? r.reasons.join(', ') : '뚜렷한 신호 없음'));
+    lines.push('규칙 기반 해석이며 매매 신호가 아닙니다.');
+    box.textContent = '';
+    lines.forEach(function (line) {
+      var d = document.createElement('div');
+      d.textContent = line;
+      box.appendChild(d);
+    });
+    var n = r.notes;
+    setText('noteMaxPain', n.maxPain || '');
+    setText('noteFlip', n.flip || '');
+    setText('noteGex', n.gex || '');
+    setText('notePcr', n.pcr || '');
+    setText('noteDvol', n.dvol || '');
+    setText('noteSkew', n.skew || (tier.expiry ? '' : '만기 하나를 고르면 계산합니다'));
+    setText('noteFunding', n.funding ? '펀딩 ' + n.funding : '');
   }
 
   function renderMetrics(m) {
@@ -884,7 +1200,7 @@
     renderSelector();
     var t = optionsForTier(state.tier);
     var m = (state.index !== null && t.opts.length) ? computeMetrics(t.opts, state.index) : computeMetrics([], state.index || 0);
-    renderStatement(m);
+    renderStatement(m, t);
     renderMetrics(m);
     renderWalls(t.opts);
     renderVol(t.opts);
