@@ -81,15 +81,27 @@
   .tile.statement .reading strong { color: var(--ink); font-weight: 600; }
 
   /* statement */
-  .tile.statement p {
-    font-family: var(--font-display);
-    font-weight: 500;
-    font-size: 32px;
-    line-height: 1.2;
-    letter-spacing: -0.02em;
-    color: var(--ink);
-    max-width: 30ch;
-  }
+  .gauges { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-3); }
+  .gauge { display: flex; flex-direction: column; align-items: center; text-align: center; min-width: 0; }
+  .gauge svg { width: 100%; max-width: 190px; height: auto; display: block; }
+  .g-title { font-size: var(--size-small); color: var(--muted); }
+  .g-label { font-family: var(--font-display); font-weight: 600; font-size: 26px; letter-spacing: -0.02em; line-height: 1.15; color: var(--ink); }
+  .g-label[data-tone="down"] { color: var(--x-down); }
+  .g-label[data-tone="up"] { color: var(--x-up); }
+  #gaugeVol .g-label[data-tone="down"] { color: var(--x-calm); }
+  #gaugeVol .g-label[data-tone="up"] { color: var(--x-hot); }
+  .g-counts { display: flex; gap: var(--space-3); background: var(--bg); border-radius: var(--radius); padding: 6px 14px; margin-top: var(--space-2); }
+  .g-counts span { display: flex; flex-direction: column; align-items: center; }
+  .g-counts em { font-style: normal; font-size: 12px; color: var(--muted); }
+  .g-counts b { font-size: 18px; font-weight: 600; color: var(--ink); line-height: 1.2; }
+  .sig { position: absolute; top: 14px; right: 14px; display: flex; flex-direction: column; align-items: center; font-size: 14px; font-weight: 600; line-height: 1.2; }
+  .sig[hidden] { display: none; }
+  .sig svg { width: 60px; height: auto; display: block; }
+  .sig span { color: var(--muted); }
+  .sig span[data-tone="down"] { color: var(--x-down); }
+  .sig span[data-tone="up"] { color: var(--x-up); }
+  #sigFlip span[data-tone="down"], #sigGex span[data-tone="down"], #sigDvol span[data-tone="down"] { color: var(--x-calm); }
+  #sigFlip span[data-tone="up"], #sigGex span[data-tone="up"], #sigDvol span[data-tone="up"] { color: var(--x-hot); }
   .selector { display: flex; flex-wrap: wrap; gap: var(--space-3); margin-top: auto; padding-top: var(--space-3); }
   .selector button {
     background: none;
@@ -209,7 +221,9 @@
     .tile.name .wordmark { font-size: clamp(48px, 6.4vw, var(--size-display)); }
     .metric .num { font-size: clamp(30px, 4.2vw, 56px); }
     .metric .num.sm { font-size: clamp(26px, 3.4vw, 44px); }
-    .tile.statement p { font-size: clamp(24px, 2.8vw, 34px); }
+    .g-label { font-size: 22px; }
+    .sig { position: static; flex-direction: row; gap: 6px; align-self: flex-start; margin-bottom: 4px; font-size: 13px; }
+    .sig svg { width: 36px; }
   }
   @media (max-width: 759px) {
     .board { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-auto-rows: auto; }
@@ -220,7 +234,11 @@
     .c3 { grid-column: span 1; }
     .metric .num { font-size: 26px; overflow-wrap: anywhere; }
     .metric .num.sm { font-size: 22px; }
-    .tile.statement p { font-size: 24px; }
+    .sig { position: static; flex-direction: row; gap: 6px; align-self: flex-start; margin-bottom: 6px; font-size: 13px; }
+    .sig svg { width: 44px; }
+    .gauges { gap: var(--space-2); }
+    .g-label { font-size: 20px; }
+    .g-counts { gap: var(--space-2); padding: 4px 8px; }
     .tile.name .wordmark { font-size: clamp(48px, 15vw, var(--size-display)); }
     .tables { grid-template-columns: 1fr; }
     .tile.statement { grid-row: span 4; }
@@ -246,6 +264,7 @@
   </div>
 
   <div class="tile metric c3 r2">
+    <div class="sig" id="sigFunding" hidden></div>
     <div class="num" id="perpNum">불러오는 중…</div>
     <div class="lbl">무기한 (바이낸스 BTCUSDT)</div>
     <div class="lbl" id="perpSub">불러오는 중…</div>
@@ -254,27 +273,34 @@
 
   <!-- 2. statement 6x4 + 4 metric tiles -->
   <div class="tile statement c6 r4">
-    <p id="statement">불러오는 중…</p>
+    <div class="gauges">
+      <div class="gauge" id="gaugeDir"><div class="g-title">방향</div><div class="g-label">불러오는 중…</div></div>
+      <div class="gauge" id="gaugeVol"><div class="g-title">변동성</div><div class="g-label">불러오는 중…</div></div>
+    </div>
     <div class="reading" id="reading"></div>
     <div class="selector" id="selector" role="group" aria-label="만기 구간 선택"></div>
   </div>
 
   <div class="tile metric c3 r2">
+    <div class="sig" id="sigMaxPain" hidden></div>
     <div class="num sm" id="maxPainNum">불러오는 중…</div>
     <div class="lbl">맥스페인</div>
     <div class="note" id="noteMaxPain"></div>
   </div>
   <div class="tile metric c3 r2">
+    <div class="sig" id="sigFlip" hidden></div>
     <div class="num sm" id="flipNum">불러오는 중…</div>
     <div class="lbl">감마 플립 (제로 감마)</div>
     <div class="note" id="noteFlip"></div>
   </div>
   <div class="tile metric c3 r2">
+    <div class="sig" id="sigGex" hidden></div>
     <div class="num sm" id="gexNum">불러오는 중…</div>
     <div class="lbl">딜러 감마 · 1% 움직임당 딜러 헤지</div>
     <div class="note" id="noteGex"></div>
   </div>
   <div class="tile metric c3 r2">
+    <div class="sig" id="sigPcr" hidden></div>
     <div class="num sm" id="pcrNum">불러오는 중…</div>
     <div class="lbl">풋/콜 OI</div>
     <div class="note" id="notePcr"></div>
@@ -282,11 +308,13 @@
 
   <!-- 3. four metric tiles 3x2 -->
   <div class="tile metric c3 r2">
+    <div class="sig" id="sigDvol" hidden></div>
     <div class="num sm" id="dvolNum">불러오는 중…</div>
     <div class="lbl" id="dvolSub">불러오는 중…</div>
     <div class="note" id="noteDvol"></div>
   </div>
   <div class="tile metric c3 r2">
+    <div class="sig" id="sigSkew" hidden></div>
     <div class="num sm" id="skewNum">불러오는 중…</div>
     <div class="lbl">25Δ 스큐 (풋 − 콜, %p)</div>
     <div class="note" id="noteSkew"></div>
@@ -302,6 +330,7 @@
 
   <!-- 4. tables -->
   <div class="tile c6 r4">
+    <div class="sig" id="sigWalls" hidden></div>
     <h2>미결제약정 벽 TOP 10 <span class="hint">행사가 · OI · 거래량</span></h2>
     <div class="tables">
       <div class="side">
@@ -869,110 +898,106 @@
       }
     }
 
-    // 1. Gamma regime
-    if (flip !== null && S !== null) {
-      if (S < flip) {
-        vol += 1;
-        reasons.push('숏감마 구간');
+    var signals = [];
+
+    // 방향: 맥스페인
+    var sigMaxPain = null;
+    if (mp !== null && mp !== undefined && S !== null && S !== 0) {
+      if (mpD !== null && days !== null && days <= 7 && Math.abs(mpD) >= 0.01) {
+        if (mpD > 0) sigMaxPain = { score: 1, reason: '맥스페인 위 끌림' };
+        else sigMaxPain = { score: -1, reason: '맥스페인 아래 끌림' };
       } else {
-        vol -= 1;
-        reasons.push('롱감마 구간');
+        sigMaxPain = { score: 0, reason: null };
       }
-    } else if (flip === null && gex !== null) {
-      if (gex < 0) {
-        vol += 1;
-        reasons.push('딜러 숏감마');
-      } else {
-        vol -= 1;
-        reasons.push('딜러 롱감마');
-      }
+      signals.push({ key: 'max_pain', label: '맥스페인', axis: 'dir', score: sigMaxPain.score, reason: sigMaxPain.reason, note: notes.maxPain || null });
     }
 
-    // 2. DVOL
-    if (dvolChg !== null) {
-      if (dvolChg >= 3) {
-        vol += 1;
-        reasons.push('DVOL 급등');
-      } else if (dvolChg <= -3) {
-        vol -= 1;
-        reasons.push('DVOL 하락');
-      }
-    }
-    if (dvol !== null && dvol > 60) {
-      vol += 1;
-      reasons.push('DVOL 높음');
-    }
-
-    // 3. Max pain pull
-    if (mpD !== null && days !== null && days <= 7 && Math.abs(mpD) >= 0.01) {
-      if (mpD > 0) {
-        bias += 1;
-        reasons.push('맥스페인 위 끌림');
-      } else {
-        bias -= 1;
-        reasons.push('맥스페인 아래 끌림');
-      }
-    }
-
-    // 4. PCR
+    // 방향: 풋/콜
     if (pcr !== null) {
-      if (pcr < 0.7) {
-        bias += 1;
-        reasons.push('콜 쏠림');
-      } else if (pcr > 1.3) {
-        bias += 1;
-        reasons.push('풋 과열 · 역발상');
-      } else if (pcr > 1.0 && pcr <= 1.3) {
-        bias -= 1;
-        reasons.push('풋 헤지 많음');
-      }
+      var pScore = 0, pReason = null;
+      if (pcr < 0.7) { pScore = 1; pReason = '콜 쏠림'; }
+      else if (pcr > 1.3) { pScore = 1; pReason = '풋 과열 · 역발상'; }
+      else if (pcr > 1.0) { pScore = -1; pReason = '풋 헤지 많음'; }
+      signals.push({ key: 'pcr', label: '풋/콜', axis: 'dir', score: pScore, reason: pReason, note: notes.pcr || null });
     }
 
-    // 5. Skew
+    // 방향: 25Δ 스큐
     if (skew !== null) {
-      if (skew > 5) {
-        bias -= 1;
-        reasons.push('하락 대비 수요');
-      } else if (skew < 0) {
-        bias += 1;
-        reasons.push('상승 베팅 우세');
-      }
+      var sScore = 0, sReason = null;
+      if (skew > 5) { sScore = -1; sReason = '하락 대비 수요'; }
+      else if (skew < 0) { sScore = 1; sReason = '상승 베팅 우세'; }
+      signals.push({ key: 'skew', label: '25Δ 스큐', axis: 'dir', score: sScore, reason: sReason, note: notes.skew || null });
     }
 
-    // 6. Funding
+    // 방향: 펀딩
     if (funding !== null) {
-      if (funding > 0.0005) {
-        bias -= 1;
-        reasons.push('롱 과열');
-      } else if (funding < 0) {
-        bias -= 1;
-        reasons.push('숏 우세');
-      }
+      var fScore = 0, fReason = null;
+      if (funding > 0.0005) { fScore = -1; fReason = '롱 과열'; }
+      else if (funding < 0) { fScore = -1; fReason = '숏 우세'; }
+      signals.push({ key: 'funding', label: '펀딩', axis: 'dir', score: fScore, reason: fReason, note: notes.funding ? '펀딩 ' + notes.funding : null });
     }
 
-    // 7. Walls
+    // 방향: 지지·저항
     var wallsExist = callWall !== null && putWall !== null && S !== null && S !== 0;
     if (wallsExist) {
-      var up = (callWall - S) / S;
-      var down = (S - putWall) / S;
-      if (down < up / 2) {
-        bias += 1;
-        reasons.push('지지선 근처');
-      } else if (up < down / 2) {
-        bias -= 1;
-        reasons.push('저항선 근처');
-      }
+      var wUp = (callWall - S) / S;
+      var wDown = (S - putWall) / S;
+      var wScore = 0, wReason = null, wNote = '지지와 저항 사이 가운데쯤';
+      if (wDown < wUp / 2) { wScore = 1; wReason = '지지선 근처'; wNote = '지지선(풋 벽)이 더 가까움 · 아래가 받쳐짐'; }
+      else if (wUp < wDown / 2) { wScore = -1; wReason = '저항선 근처'; wNote = '저항선(콜 벽)이 더 가까움 · 위가 막힘'; }
+      signals.push({ key: 'walls', label: '지지·저항', axis: 'dir', score: wScore, reason: wReason, note: wNote });
     }
 
-    var verdictBias = bias >= 2 ? '상방 우위' : (bias <= -2 ? '하방 우위' : '중립');
-    var verdictVol = vol >= 1 ? '변동성 확대 쪽' : (vol <= -1 ? '변동성 축소 쪽' : '변동성 보통');
+    // 변동성: 감마 플립
+    if (S !== null) {
+      var flScore = 0, flReason = null;
+      if (flip !== null && S < flip) { flScore = 1; flReason = '숏감마 구간'; }
+      else if (flip !== null && S >= flip) { flScore = -1; flReason = '롱감마 구간'; }
+      signals.push({ key: 'flip', label: '감마 플립', axis: 'vol', score: flScore, reason: flReason, note: notes.flip || null });
+    }
+
+    // 변동성: 딜러 감마
+    if (gex !== null) {
+      var gxScore = 0, gxReason = null;
+      if (gex < 0) { gxScore = 1; gxReason = '딜러 숏감마'; }
+      else if (gex > 0) { gxScore = -1; gxReason = '딜러 롱감마'; }
+      signals.push({ key: 'gex', label: '딜러 감마', axis: 'vol', score: gxScore, reason: gxReason, note: notes.gex || null });
+    }
+
+    // 변동성: DVOL
+    if (dvol !== null) {
+      var dScore = 0, dReason = null;
+      if (dvolChg !== null && dvolChg >= 3) { dScore = 1; dReason = 'DVOL 급등'; }
+      else if (dvolChg !== null && dvolChg <= -3) { dScore = -1; dReason = 'DVOL 하락'; }
+      else if (dvol > 60) { dScore = 1; dReason = 'DVOL 높음'; }
+      else if (dvol < 40) { dScore = -1; dReason = 'DVOL 낮음'; }
+      signals.push({ key: 'dvol', label: 'DVOL', axis: 'vol', score: dScore, reason: dReason, note: notes.dvol || null });
+    }
+
+    function tally(axis, labels5) {
+      var pool = signals.filter(function (s) { return s.axis === axis; });
+      var n = pool.length, net = 0, down = 0, neutral = 0, up = 0;
+      pool.forEach(function (s) {
+        net += s.score;
+        if (s.score < 0) down++;
+        else if (s.score > 0) up++;
+        else neutral++;
+      });
+      var avg = n ? net / n : 0;
+      return { score: avg, net: net, label: ratingLabel(avg, labels5), down: down, neutral: neutral, up: up };
+    }
+
+    var direction = tally('dir', ['강한 하방', '하방', '중립', '상방', '강한 상방']);
+    var volatility = tally('vol', ['크게 축소', '축소', '보통', '확대', '크게 확대']);
+
+    var reasons = signals.filter(function (s) { return s.reason; }).map(function (s) { return s.reason; });
 
     var range = null;
     if (wallsExist) {
       range = '지지 $' + strikeFmt(putWall) + ' · 저항 $' + strikeFmt(callWall) + ' (지수 $' + strikeFmt(S) + ')';
     }
 
-    var summary = '종합: ' + verdictBias + ' · ' + verdictVol + '.';
+    var summary = '종합: ' + direction.label + ' · 변동성 ' + volatility.label + '.';
     if (reasons.length > 0) {
       summary += ' 근거: ' + reasons.join(', ') + '.';
     }
@@ -980,14 +1005,110 @@
 
     return {
       notes: notes,
-      bias: bias,
-      vol: vol,
+      signals: signals,
+      direction: direction,
+      volatility: volatility,
+      bias: direction.net,
+      vol: volatility.net,
       reasons: reasons,
-      verdictBias: verdictBias,
-      verdictVol: verdictVol,
+      verdictBias: direction.label,
+      verdictVol: '변동성 ' + volatility.label,
       range: range,
       summary: summary
     };
+  }
+
+  function ratingLabel(avg, labels) {
+    if (avg >= 0.6) return labels[4];
+    if (avg >= 0.3) return labels[3];
+    if (avg > -0.3) return labels[2];
+    if (avg > -0.6) return labels[1];
+    return labels[0];
+  }
+
+  function gaugeSvg(score, kind, small) {
+    score = Math.max(-1, Math.min(1, score));
+    var big = !small;
+    var cx = big ? 100 : 28;
+    var cy = big ? 100 : 28;
+    var r = big ? 82 : 22;
+    var sw = big ? 10 : 5;
+    var vb = big ? '0 0 200 112' : '0 0 56 32';
+    var n = big ? 5 : 3;
+    var gap = 3;
+    var calm = kind === 'vol';
+    var negColor = calm ? 'var(--x-calm)' : 'var(--x-down)';
+    var posColor = calm ? 'var(--x-hot)' : 'var(--x-up)';
+    var negSoft = 'color-mix(in srgb, ' + (calm ? 'var(--x-calm)' : 'var(--x-down)') + ' 55%, transparent)';
+    var posSoft = 'color-mix(in srgb, ' + (calm ? 'var(--x-hot)' : 'var(--x-up)') + ' 55%, transparent)';
+    var colors;
+    if (n === 5) colors = [negColor, negSoft, 'var(--line)', posSoft, posColor];
+    else colors = [negColor, 'var(--line)', posColor];
+    function pt(deg, rad) {
+      var th = deg * Math.PI / 180;
+      return [cx + rad * Math.sin(th), cy - rad * Math.cos(th)];
+    }
+    function arc(a0, a1, color) {
+      var p0 = pt(a0, r), p1 = pt(a1, r);
+      var large = (a1 - a0) > 180 ? 1 : 0;
+      return '<path d="M ' + p0[0].toFixed(2) + ' ' + p0[1].toFixed(2) + ' A ' + r + ' ' + r + ' 0 ' + large + ' 1 ' + p1[0].toFixed(2) + ' ' + p1[1].toFixed(2) + '" fill="none" stroke-width="' + sw + '" stroke-linecap="round" style="stroke:' + color + '"/>';
+    }
+    var span = 180 / n;
+    var out = '<svg viewBox="' + vb + '" aria-hidden="true">';
+    for (var i = 0; i < n; i++) {
+      var a0 = -90 + i * span + gap / 2;
+      var a1 = -90 + (i + 1) * span - gap / 2;
+      if (a1 > a0) out += arc(a0, a1, colors[i]);
+    }
+    var theta = score * 90;
+    var L = r * 0.78;
+    var tip = pt(theta, L);
+    var bw = big ? 8 : 4;
+    var left = pt(theta - 90, bw / 2);
+    var right = pt(theta + 90, bw / 2);
+    out += '<path d="M ' + tip[0].toFixed(2) + ' ' + tip[1].toFixed(2) + ' L ' + left[0].toFixed(2) + ' ' + left[1].toFixed(2) + ' L ' + right[0].toFixed(2) + ' ' + right[1].toFixed(2) + ' Z" style="fill:var(--muted)"/>';
+    out += '<circle cx="' + cx + '" cy="' + cy + '" r="' + (big ? 6 : 3) + '" style="fill:var(--muted)"/>';
+    out += '</svg>';
+    return out;
+  }
+
+  function renderGauge(id, t, kind) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    var tone = t.score <= -0.3 ? 'down' : (t.score >= 0.3 ? 'up' : 'neutral');
+    var title = kind === 'vol' ? '변동성' : '방향';
+    var l1 = kind === 'vol' ? '축소' : '하방';
+    var l2 = kind === 'vol' ? '보통' : '중립';
+    var l3 = kind === 'vol' ? '확대' : '상방';
+    el.innerHTML =
+      '<div class="g-title">' + title + '</div>' +
+      gaugeSvg(t.score, kind, false) +
+      '<div class="g-label" data-tone="' + tone + '">' + t.label + '</div>' +
+      '<div class="g-counts">' +
+        '<span><em>' + l1 + '</em><b>' + t.down + '</b></span>' +
+        '<span><em>' + l2 + '</em><b>' + t.neutral + '</b></span>' +
+        '<span><em>' + l3 + '</em><b>' + t.up + '</b></span>' +
+      '</div>';
+  }
+
+  function renderSig(id, signal) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    if (!signal) {
+      el.innerHTML = '';
+      el.hidden = true;
+      return;
+    }
+    el.hidden = false;
+    var vol = signal.axis === 'vol';
+    var word;
+    if (signal.score < 0) word = vol ? '축소' : '하방';
+    else if (signal.score > 0) word = vol ? '확대' : '상방';
+    else word = vol ? '보통' : '중립';
+    var tone = signal.score < 0 ? 'down' : (signal.score > 0 ? 'up' : 'neutral');
+    el.innerHTML = gaugeSvg(signal.score * 0.67, signal.axis, true) +
+      '<span data-tone="' + tone + '">' + word + '</span>';
+    el.title = signal.label + ' · ' + (signal.reason || '뚜렷한 신호 없음');
   }
 
   /* largest call OI above S and largest put OI below S */
@@ -1009,11 +1130,16 @@
   }
 
   function renderStatement(metrics, tier) {
-    var el = document.getElementById('statement');
     var box = document.getElementById('reading');
     if (state.index === null || !tier || !tier.opts.length) {
-      el.textContent = '불러오는 중…';
+      var gd = document.getElementById('gaugeDir');
+      var gv = document.getElementById('gaugeVol');
+      if (gd) gd.innerHTML = '<div class="g-title">방향</div><div class="g-label">불러오는 중…</div>';
+      if (gv) gv.innerHTML = '<div class="g-title">변동성</div><div class="g-label">불러오는 중…</div>';
       box.textContent = '';
+      ['sigMaxPain', 'sigFlip', 'sigGex', 'sigPcr', 'sigDvol', 'sigSkew', 'sigFunding', 'sigWalls'].forEach(function (id) {
+        renderSig(id, null);
+      });
       return;
     }
     var walls = wallsAround(tier.opts, state.index);
@@ -1023,26 +1149,23 @@
       dvol: state.dvol, dvolChg: state.dvolChange, skew: metrics.skew, funding: state.funding,
       days: days, callWall: walls.callWall, putWall: walls.putWall
     });
-    el.textContent = r.verdictBias + ' · ' + r.verdictVol;
-    var idx = fmtUsd(state.index);
-    var regime;
-    if (metrics.flip === null || metrics.flip === undefined) {
-      regime = idx + ' 기준, 범위 안에 감마 플립이 없습니다.';
-    } else if (state.index >= metrics.flip) {
-      regime = idx + '은 감마 플립 ' + fmtUsd(metrics.flip) + ' 위입니다. 딜러 헤지가 움직임을 누그러뜨리는 구간입니다.';
-    } else {
-      regime = idx + '은 감마 플립 ' + fmtUsd(metrics.flip) + ' 아래입니다. 딜러 헤지가 움직임을 키우는 구간입니다.';
-    }
-    var lines = [regime];
+    renderGauge('gaugeDir', r.direction, 'dir');
+    renderGauge('gaugeVol', r.volatility, 'vol');
+    var lines = [];
     if (r.range) lines.push(r.range);
-    lines.push('근거 (방향 ' + (r.bias > 0 ? '+' : '') + r.bias + ', 변동성 ' + (r.vol > 0 ? '+' : '') + r.vol + '): ' +
-               (r.reasons.length ? r.reasons.join(', ') : '뚜렷한 신호 없음'));
+    lines.push('근거: ' + (r.reasons.length ? r.reasons.join(', ') : '뚜렷한 신호 없음'));
     lines.push('규칙 기반 해석이며 매매 신호가 아닙니다.');
     box.textContent = '';
     lines.forEach(function (line) {
       var d = document.createElement('div');
       d.textContent = line;
       box.appendChild(d);
+    });
+    var map = { max_pain: 'sigMaxPain', flip: 'sigFlip', gex: 'sigGex', pcr: 'sigPcr', dvol: 'sigDvol', skew: 'sigSkew', funding: 'sigFunding', walls: 'sigWalls' };
+    var byKey = {};
+    r.signals.forEach(function (s) { byKey[s.key] = s; });
+    Object.keys(map).forEach(function (key) {
+      renderSig(map[key], byKey[key] || null);
     });
     var n = r.notes;
     setText('noteMaxPain', n.maxPain || '');

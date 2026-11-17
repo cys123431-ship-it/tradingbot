@@ -35,4 +35,9 @@
   --x-margin: 12px;
   --x-tile-pad: 22px;
   --x-row: 92px;
+  /* 판정 색 (하방·상방·변동성 축소·확대) */
+  --x-down: #d63c3c;
+  --x-up: #1a4be0;
+  --x-calm: #1f9a5c;
+  --x-hot: #e07b16;
 }
