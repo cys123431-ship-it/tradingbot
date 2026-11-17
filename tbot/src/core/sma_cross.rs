@@ -60,19 +60,17 @@ pub struct CrossResult {
     pub sma_slow_prev: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sma_stop: Option<f64>,
-    /// Exit line state (`exit_ma_enabled`); always present like Python.
+    /// Exit line state; this, `exit_ma_period`, `exit_side` and `exit_trend_side`
+    /// are always present (null when unused), like Python.
     pub exit_ma_enabled: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_ma_period: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sma_exit: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sma_exit_prev: Option<f64>,
     /// SMA(fast) crossed the exit line against the held side on this close.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_side: Option<String>,
     /// Which side SMA(fast) currently sits on relative to the exit line.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_trend_side: Option<String>,
     /// Cross on the bar before the last one that still holds on the last bar.
     #[serde(skip_serializing_if = "Option::is_none")]
