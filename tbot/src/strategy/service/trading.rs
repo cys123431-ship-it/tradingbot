@@ -30,6 +30,9 @@ use crate::strategy::service::{
     PROTECTION_FAILED, PROTECTION_ORDERS_SUBMITTED, TRADE_RECORDED,
 };
 
+/// How far back `exit_fills` asks Binance for fills (its userTrades window is 7 days).
+const FILLS_WINDOW_MS: i64 = 6 * 24 * 3600 * 1000;
+
 // ---------------------------------------------------------------------------
 // Local helpers
 // ---------------------------------------------------------------------------
@@ -1206,13 +1209,21 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         let (_, market) = symbol_pair(Some(&Value::Object(trade.clone())));
         let start = get(trade, "entry_ms").map(py_int).unwrap_or(0) - 5_000;
         let now = self.now_ms();
+        // Binance userTrades only covers a 7-day window: with an older startTime
+        // the closing fills of a long-held position are not returned. Ask for the
+        // last 6 days instead; the entry fill then falls outside the window and
+        // its commission is estimated below.
+        let fills_start = start.max(now - FILLS_WINDOW_MS);
+        let entry_outside_window = fills_start > start;
         let long = get_str(trade, "side") == "LONG";
         let close_side = if long { "SELL" } else { "BUY" };
         let exit_price;
         let exit_ms;
         let commission;
         let source: &str;
-        let user_trades = exchange.user_trades_raw(&market, Some(start), 1000).await;
+        let user_trades = exchange
+            .user_trades_raw(&market, Some(fills_start), 1000)
+            .await;
         let computed = user_trades.and_then(|payload| {
             let fills: Vec<Value> = payload.as_array().cloned().unwrap_or_default();
             let commission: f64 = fills
@@ -1255,11 +1266,17 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             Ok((ep, em, cm)) => {
                 exit_price = ep.to_string();
                 exit_ms = em;
-                commission = cm;
+                commission = if entry_outside_window {
+                    cm + get_num(trade, "entry_price")
+                        * get_num(trade, "quantity")
+                        * py_f(get(trade, "fee_rate"), 0.0005)
+                } else {
+                    cm
+                };
                 source = "exchange";
             }
             Err(exc) => {
-                eprintln!("BTC pullback exit fills unavailable: {}", exc);
+                eprintln!("sma service: exit fills unavailable: {}", exc);
                 let fallback = match self.premium_index(network, &market).await {
                     Ok(m) => py_f(m.get("mark_price"), 0.0),
                     // Python: ignored on purpose (premium index failure).
@@ -1291,7 +1308,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
                 funding = rows.iter().map(|r| py_f(r.get("income"), 0.0)).sum();
             }
             Err(exc) => {
-                eprintln!("BTC pullback funding income unavailable: {}", exc);
+                eprintln!("sma service: funding income unavailable: {}", exc);
             }
         }
         let mut m = Map::new();
@@ -1328,7 +1345,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             };
             if let Some(record) = exists {
                 if let Err(exc) = order_gateway.recover(&record, false).await {
-                    eprintln!("BTC pullback recover failed: {}", exc);
+                    eprintln!("sma service: recover failed: {}", exc);
                 }
             }
         }

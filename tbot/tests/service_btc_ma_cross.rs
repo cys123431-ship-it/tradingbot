@@ -1699,3 +1699,22 @@ fn exit_line_is_off_by_default_and_ignores_bad_periods() {
     assert_eq!(cfg.exit_ma_period, None);
     assert_eq!(tbot::core::sma_cross::exit_period(&cfg), None);
 }
+
+#[tokio::test]
+async fn exit_of_a_long_held_trade_asks_only_for_recent_fills() {
+    // Binance userTrades covers 7 days: a 10-day-old startTime would miss the
+    // closing fills, so the exit asks for the last 6 days only.
+    let root = temp_dir("long_hold_fills");
+    let mut h = Harness::new(&root, true, "testnet", 86_000.0, HashMap::new());
+    assert_eq!(h.run().await["action"], json!("entered"));
+    let mut state = h.service.load_state("testnet", "LIVE").unwrap();
+    let entry_ms = state["trade"]["entry_ms"].as_i64().unwrap();
+    state["trade"]["entry_ms"] = json!(entry_ms - 10 * 24 * 3600 * 1000);
+    h.service.save_state("testnet", "LIVE", &mut state).unwrap();
+    h.next_bar(83_000.0);
+    let result = h.run().await;
+    assert_eq!(result["action"], json!("reversed"), "{result}");
+    let starts = h.fake.with_state(|s| s.user_trades_starts.clone());
+    let first = starts.first().cloned().flatten().unwrap();
+    assert_eq!(first, h.now_ms - 6 * 24 * 3600 * 1000, "{starts:?}");
+}

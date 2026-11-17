@@ -227,6 +227,8 @@ pub struct FakeState {
     pub leverage: u32,
     pub margin_type: String,
     pub user_trades: Vec<Value>,
+    /// `start_time` of every `user_trades_raw` call, oldest first.
+    pub user_trades_starts: Vec<Option<i64>>,
     pub income: Vec<Value>,
 }
 
@@ -259,6 +261,7 @@ impl FakeBinance {
                 leverage: 3,
                 margin_type: "isolated".to_string(),
                 user_trades: Vec::new(),
+                user_trades_starts: Vec::new(),
                 income: Vec::new(),
             }),
         }
@@ -661,10 +664,11 @@ impl FuturesExchange for FakeBinance {
     async fn user_trades_raw(
         &self,
         _market_id: &str,
-        _start_time: Option<i64>,
+        start_time: Option<i64>,
         _limit: u32,
     ) -> Result<Value, ExchangeError> {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        state.user_trades_starts.push(start_time);
         Ok(Value::Array(state.user_trades.clone()))
     }
 

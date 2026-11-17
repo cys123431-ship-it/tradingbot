@@ -110,7 +110,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         // Spawned so a panicking notifier cannot take the trading cycle down.
         let res = tokio::spawn(fut).await;
         if res.is_err() {
-            eprintln!("BTC pullback notification failed");
+            eprintln!("sma service: notification failed");
         }
     }
 
@@ -469,7 +469,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             match attempt {
                 Ok(rate) if rate >= 0.0 => return Ok((rate.to_string(), "exchange")),
                 Ok(_) => {}
-                Err(exc) => eprintln!("BTC pullback commission rate unavailable: {}", exc.message),
+                Err(exc) => eprintln!("sma service: commission rate unavailable: {}", exc.message),
             }
         }
         let default = cfg
@@ -849,12 +849,12 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         if let Err(exc) = exchange.set_margin_mode("isolated", symbol).await {
             let text = exc.message.to_lowercase();
             if !text.contains("no need to change") && !exc.message.contains("-4046") {
-                eprintln!("BTC pullback set_margin_mode: {}", exc.message);
+                eprintln!("sma service: set_margin_mode: {}", exc.message);
             }
         }
         let lev = py_int_of(&cfg["leverage"]);
         if let Err(exc) = exchange.set_leverage(lev as u32, symbol).await {
-            eprintln!("BTC pullback set_leverage: {}", exc.message);
+            eprintln!("sma service: set_leverage: {}", exc.message);
         }
         let rows = match exchange.position_risk_v2_raw(&market).await {
             Ok(r) => {
