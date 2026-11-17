@@ -1297,3 +1297,34 @@ async fn options_report_live_smoke() {
     println!("{text}");
     assert!(text.contains("맥스페인"));
 }
+
+#[test]
+fn options_report_shows_rating_gauges_per_indicator() {
+    let report = serde_json::json!({
+        "spot": 64000.0,
+        "dvol": 55.0,
+        "dvol_change_24h": 0.5,
+        "all": {
+            "max_pain": 70000.0,
+            "zero_gamma": 66000.0,
+            "net_gex": -1000000.0,
+            "pcr": 1.2,
+            "skew_25d": 6.0,
+            "skew_label": "20NOV26",
+            "support": 63000.0,
+            "resistance": 80000.0,
+        },
+        "expiries": [],
+    });
+    let text = tbot::app::telegram_bot::options_report_text_for_tests(&report);
+    assert!(text.contains("🧭 방향: 중립"), "{text}");
+    assert!(text.contains("🔴 하방 2 · ⚪ 중립 1 · 🔵 상방 1"), "{text}");
+    assert!(text.contains("🌊 변동성: 크게 확대"), "{text}");
+    assert!(
+        text.contains("🔴 하방 · 25Δ 스큐(20NOV26): 풋이 비쌈"),
+        "{text}"
+    );
+    assert!(text.contains("🟠 확대 · 감마 플립:"), "{text}");
+    assert!(text.contains("🔵 상방 · 지지·저항:"), "{text}");
+    assert!(text.contains("하방 ────●────── 상방"), "{text}");
+}

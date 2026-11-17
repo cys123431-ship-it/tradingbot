@@ -439,43 +439,69 @@ pub(crate) fn options_report_text(report: &Value) -> String {
     let reading = crate::core::options_micro::interpret(report);
     let text_of = |v: &Value| v.as_str().map(str::to_string);
     lines.push(String::new());
-    lines.push(format!(
-        "▪ 해석: {} · {}",
-        reading["verdict_bias"].as_str().unwrap_or("-"),
-        reading["verdict_vol"].as_str().unwrap_or("-")
+    lines.push("▪ 종합 해석".to_string());
+    let gauge = |t: &Value, title: &str, ends: [&str; 2], names: [&str; 3], icons: [&str; 3]| {
+        let count = |k: &str| t[k].as_u64().unwrap_or(0);
+        vec![
+            format!("{title}: {}", t["label"].as_str().unwrap_or("-")),
+            format!(
+                "{} {} {}",
+                ends[0],
+                text_gauge(t["score"].as_f64().unwrap_or(0.0)),
+                ends[1]
+            ),
+            format!(
+                "{} {} {} · {} {} {} · {} {} {}",
+                icons[0],
+                names[0],
+                count("down"),
+                icons[1],
+                names[1],
+                count("neutral"),
+                icons[2],
+                names[2],
+                count("up")
+            ),
+        ]
+    };
+    lines.extend(gauge(
+        &reading["direction"],
+        "🧭 방향",
+        ["하방", "상방"],
+        ["하방", "중립", "상방"],
+        ["🔴", "⚪", "🔵"],
+    ));
+    lines.extend(gauge(
+        &reading["volatility"],
+        "🌊 변동성",
+        ["축소", "확대"],
+        ["축소", "보통", "확대"],
+        ["🟢", "⚪", "🟠"],
     ));
     if let Some(range) = text_of(&reading["range"]) {
         lines.push(range);
     }
-    let reasons: Vec<String> = reading["reasons"]
-        .as_array()
-        .map(|a| a.iter().filter_map(text_of).collect())
-        .unwrap_or_default();
-    lines.push(format!(
-        "근거 (방향 {:+}, 변동성 {:+}): {}",
-        reading["bias"].as_i64().unwrap_or(0),
-        reading["vol"].as_i64().unwrap_or(0),
-        if reasons.is_empty() {
-            "뚜렷한 신호 없음".to_string()
-        } else {
-            reasons.join(", ")
-        }
-    ));
-    let notes = &reading["notes"];
-    for (label, key) in [
-        ("맥스페인", "max_pain"),
-        ("감마 플립", "flip"),
-        ("딜러 감마", "gex"),
-        ("풋/콜", "pcr"),
-        ("DVOL", "dvol"),
-        ("25Δ 스큐", "skew"),
-    ] {
-        if let Some(note) = text_of(&notes[key]) {
-            let tag = match (key, all.get("skew_label").and_then(|v| v.as_str())) {
-                ("skew", Some(l)) => format!("{label}({l})"),
-                _ => label.to_string(),
-            };
-            lines.push(format!("· {tag}: {note}"));
+    lines.push(String::new());
+    lines.push("▪ 지표별 판정".to_string());
+    let skew_label = all.get("skew_label").and_then(|v| v.as_str());
+    for sig in reading["signals"].as_array().into_iter().flatten() {
+        let score = sig["score"].as_i64().unwrap_or(0);
+        let tag = match (sig["axis"].as_str(), score) {
+            (Some("vol"), s) if s > 0 => "🟠 확대",
+            (Some("vol"), s) if s < 0 => "🟢 축소",
+            (Some("vol"), _) => "⚪ 보통",
+            (_, s) if s > 0 => "🔵 상방",
+            (_, s) if s < 0 => "🔴 하방",
+            _ => "⚪ 중립",
+        };
+        let label = sig["label"].as_str().unwrap_or("-");
+        let label = match (sig["key"].as_str(), skew_label) {
+            (Some("skew"), Some(l)) => format!("{label}({l})"),
+            _ => label.to_string(),
+        };
+        match text_of(&sig["note"]) {
+            Some(note) => lines.push(format!("{tag} · {label}: {note}")),
+            None => lines.push(format!("{tag} · {label}")),
         }
     }
     lines.push(String::new());
@@ -484,6 +510,12 @@ pub(crate) fn options_report_text(report: &Value) -> String {
             .to_string(),
     );
     lines.join("\n")
+}
+
+/// Eleven-step text needle for a vote average in [-1, 1].
+fn text_gauge(score: f64) -> String {
+    let pos = (((score.clamp(-1.0, 1.0) + 1.0) / 2.0) * 10.0).round() as usize;
+    (0..=10).map(|i| if i == pos { '●' } else { '─' }).collect()
 }
 
 fn mark(selected: bool, label: &str) -> String {

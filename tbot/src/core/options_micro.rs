@@ -582,10 +582,6 @@ pub fn interpret(report: &Value) -> Value {
     let days: Option<f64> = None; // "all" has no single expiry
     let funding: Option<f64> = None; // web only input; not available here
 
-    let mut bias: i64 = 0;
-    let mut vol: i64 = 0;
-    let mut reasons: Vec<String> = Vec::new();
-
     // Per-metric notes.
     let note_max_pain: Option<String> = match (mp, spot) {
         (Some(m), Some(s)) if s > 0.0 => {
@@ -695,125 +691,174 @@ pub fn interpret(report: &Value) -> Value {
         None => None,
     };
 
-    // Rule 1: gamma regime.
-    if let Some(f) = flip {
-        if let Some(s) = spot {
-            if s < f {
-                vol += 1;
-                reasons.push("숏감마 구간".to_string());
-            } else {
-                vol -= 1;
-                reasons.push("롱감마 구간".to_string());
-            }
-        }
-    } else if let Some(g) = gex {
-        if g < 0.0 {
-            vol += 1;
-            reasons.push("딜러 숏감마".to_string());
-        } else {
-            vol -= 1;
-            reasons.push("딜러 롱감마".to_string());
-        }
-    }
+    // Each indicator votes -1 / 0 / +1 on one axis, like a technical-rating gauge.
+    // dir: -1 하방, 0 중립, +1 상방. vol: -1 축소, 0 보통, +1 확대.
+    let mut signals: Vec<Value> = Vec::new();
+    let mut push = |key: &str,
+                    label: &str,
+                    axis: &str,
+                    score: i64,
+                    reason: Option<&str>,
+                    note: Option<String>| {
+        signals.push(json!({
+            "key": key,
+            "label": label,
+            "axis": axis,
+            "score": score,
+            "reason": reason,
+            "note": note,
+        }));
+    };
 
-    // Rule 2: DVOL.
-    if let Some(c) = dvol_chg {
-        if c >= 3.0 {
-            vol += 1;
-            reasons.push("DVOL 급등".to_string());
-        } else if c <= -3.0 {
-            vol -= 1;
-            reasons.push("DVOL 하락".to_string());
-        }
-    }
-    if let Some(d) = dvol {
-        if d > 60.0 {
-            vol += 1;
-            reasons.push("DVOL 높음".to_string());
-        }
-    }
-
-    // Rule 3: max pain pull.
-    if let (Some(m), Some(s), Some(dd)) = (mp, spot, days) {
-        if s > 0.0 && dd <= 7.0 {
+    // Direction: max pain pulls only near expiry.
+    if let (Some(m), Some(s)) = (mp, spot) {
+        if s > 0.0 {
             let d = (m - s) / s;
-            if d.abs() >= 0.01 {
+            let near = matches!(days, Some(dd) if dd <= 7.0);
+            let (score, reason) = if near && d.abs() >= 0.01 {
                 if d > 0.0 {
-                    bias += 1;
-                    reasons.push("맥스페인 위 끌림".to_string());
+                    (1, Some("맥스페인 위 끌림"))
                 } else {
-                    bias -= 1;
-                    reasons.push("맥스페인 아래 끌림".to_string());
+                    (-1, Some("맥스페인 아래 끌림"))
                 }
-            }
+            } else {
+                (0, None)
+            };
+            push(
+                "max_pain",
+                "맥스페인",
+                "dir",
+                score,
+                reason,
+                note_max_pain.clone(),
+            );
         }
     }
-
-    // Rule 4: PCR.
     if let Some(p) = pcr {
-        if p < 0.7 {
-            bias += 1;
-            reasons.push("콜 쏠림".to_string());
+        let (score, reason) = if p < 0.7 {
+            (1, Some("콜 쏠림"))
         } else if p > 1.3 {
-            bias += 1;
-            reasons.push("풋 과열 · 역발상".to_string());
+            (1, Some("풋 과열 · 역발상"))
         } else if p > 1.0 {
-            bias -= 1;
-            reasons.push("풋 헤지 많음".to_string());
-        }
+            (-1, Some("풋 헤지 많음"))
+        } else {
+            (0, None)
+        };
+        push("pcr", "풋/콜", "dir", score, reason, note_pcr.clone());
     }
-
-    // Rule 5: Skew.
     if let Some(s) = skew {
-        if s > 5.0 {
-            bias -= 1;
-            reasons.push("하락 대비 수요".to_string());
+        let (score, reason) = if s > 5.0 {
+            (-1, Some("하락 대비 수요"))
         } else if s < 0.0 {
-            bias += 1;
-            reasons.push("상승 베팅 우세".to_string());
-        }
+            (1, Some("상승 베팅 우세"))
+        } else {
+            (0, None)
+        };
+        push("skew", "25Δ 스큐", "dir", score, reason, note_skew.clone());
     }
-
-    // Rule 6: Funding (web only).
     if let Some(f) = funding {
-        if f > 0.0005 {
-            bias -= 1;
-            reasons.push("롱 과열".to_string());
+        let (score, reason, note) = if f > 0.0005 {
+            (-1, Some("롱 과열"), "롱 과열")
         } else if f < 0.0 {
-            bias -= 1;
-            reasons.push("숏 우세".to_string());
-        }
+            (-1, Some("숏 우세"), "숏 우세")
+        } else {
+            (0, None, "보통")
+        };
+        push(
+            "funding",
+            "펀딩",
+            "dir",
+            score,
+            reason,
+            Some(note.to_string()),
+        );
     }
-
-    // Rule 7: Walls.
     if let (Some(cw), Some(pw), Some(s)) = (call_wall, put_wall, spot) {
         if s > 0.0 {
             let up = (cw - s) / s;
             let down = (s - pw) / s;
-            if down < up / 2.0 {
-                bias += 1;
-                reasons.push("지지선 근처".to_string());
+            let (score, reason, note) = if down < up / 2.0 {
+                (
+                    1,
+                    Some("지지선 근처"),
+                    "지지선(풋 벽)이 더 가까움 · 아래가 받쳐짐",
+                )
             } else if up < down / 2.0 {
-                bias -= 1;
-                reasons.push("저항선 근처".to_string());
-            }
+                (
+                    -1,
+                    Some("저항선 근처"),
+                    "저항선(콜 벽)이 더 가까움 · 위가 막힘",
+                )
+            } else {
+                (0, None, "지지와 저항 사이 가운데쯤")
+            };
+            push(
+                "walls",
+                "지지·저항",
+                "dir",
+                score,
+                reason,
+                Some(note.to_string()),
+            );
         }
     }
 
-    let verdict_bias = if bias >= 2 {
-        "상방 우위"
-    } else if bias <= -2 {
-        "하방 우위"
-    } else {
-        "중립"
+    // Volatility.
+    if let Some(s) = spot {
+        let (score, reason) = match flip {
+            Some(f) if s < f => (1, Some("숏감마 구간")),
+            Some(_) => (-1, Some("롱감마 구간")),
+            None => (0, None),
+        };
+        push("flip", "감마 플립", "vol", score, reason, note_flip.clone());
+    }
+    if let Some(g) = gex {
+        let (score, reason) = if g < 0.0 {
+            (1, Some("딜러 숏감마"))
+        } else if g > 0.0 {
+            (-1, Some("딜러 롱감마"))
+        } else {
+            (0, None)
+        };
+        push("gex", "딜러 감마", "vol", score, reason, note_gex.clone());
+    }
+    if let Some(d) = dvol {
+        let (score, reason) = match dvol_chg {
+            Some(c) if c >= 3.0 => (1, Some("DVOL 급등")),
+            Some(c) if c <= -3.0 => (-1, Some("DVOL 하락")),
+            _ if d > 60.0 => (1, Some("DVOL 높음")),
+            _ if d < 40.0 => (-1, Some("DVOL 낮음")),
+            _ => (0, None),
+        };
+        push("dvol", "DVOL", "vol", score, reason, note_dvol.clone());
+    }
+
+    let tally = |axis: &str, labels: [&str; 5]| -> Value {
+        let scores: Vec<i64> = signals
+            .iter()
+            .filter(|s| s["axis"] == axis)
+            .map(|s| s["score"].as_i64().unwrap_or(0))
+            .collect();
+        let n = scores.len();
+        let net: i64 = scores.iter().sum();
+        let avg = if n == 0 { 0.0 } else { net as f64 / n as f64 };
+        json!({
+            "score": avg,
+            "net": net,
+            "label": rating_label(avg, labels),
+            "down": scores.iter().filter(|&&x| x < 0).count(),
+            "neutral": scores.iter().filter(|&&x| x == 0).count(),
+            "up": scores.iter().filter(|&&x| x > 0).count(),
+        })
     };
-    let verdict_vol = if vol >= 1 {
-        "변동성 확대 쪽"
-    } else if vol <= -1 {
-        "변동성 축소 쪽"
-    } else {
-        "변동성 보통"
-    };
+    let direction = tally("dir", ["강한 하방", "하방", "중립", "상방", "강한 상방"]);
+    let volatility = tally("vol", ["크게 축소", "축소", "보통", "확대", "크게 확대"]);
+    let reasons: Vec<String> = signals
+        .iter()
+        .filter_map(|s| s["reason"].as_str().map(str::to_string))
+        .collect();
+    let verdict_bias = direction["label"].as_str().unwrap_or("중립").to_string();
+    let verdict_vol = format!("변동성 {}", volatility["label"].as_str().unwrap_or("보통"));
 
     let range_line: Option<String> = match (put_wall, call_wall, spot) {
         (Some(pw), Some(cw), Some(s)) => Some(format!(
@@ -843,14 +888,32 @@ pub fn interpret(report: &Value) -> Value {
             "dvol": note_dvol,
             "skew": note_skew,
         },
-        "bias": bias,
-        "vol": vol,
+        "signals": signals,
+        "direction": direction,
+        "volatility": volatility,
+        "bias": direction["net"],
+        "vol": volatility["net"],
         "reasons": reasons,
         "verdict_bias": verdict_bias,
         "verdict_vol": verdict_vol,
         "range": range_line,
         "summary": summary,
     })
+}
+
+/// Five-step label for an average vote in [-1, 1] (like a technical-rating gauge).
+pub fn rating_label(avg: f64, labels: [&str; 5]) -> &str {
+    if avg >= 0.6 {
+        labels[4]
+    } else if avg >= 0.3 {
+        labels[3]
+    } else if avg > -0.3 {
+        labels[2]
+    } else if avg > -0.6 {
+        labels[1]
+    } else {
+        labels[0]
+    }
 }
 
 #[cfg(test)]
@@ -1167,7 +1230,14 @@ mod tests {
         let out = interpret(&rep);
         assert_eq!(out["bias"].as_i64().unwrap(), -1);
         assert_eq!(out["verdict_bias"].as_str().unwrap(), "중립");
-        assert_eq!(out["verdict_vol"].as_str().unwrap(), "변동성 확대 쪽");
+        // flip +1, gex +1, dvol 0 -> avg 0.67
+        assert_eq!(out["verdict_vol"].as_str().unwrap(), "변동성 크게 확대");
+        // dir votes: max pain 0 (no expiry), pcr -1, skew -1, walls +1
+        assert_eq!(out["direction"]["down"].as_u64().unwrap(), 2);
+        assert_eq!(out["direction"]["neutral"].as_u64().unwrap(), 1);
+        assert_eq!(out["direction"]["up"].as_u64().unwrap(), 1);
+        assert_eq!(out["volatility"]["up"].as_u64().unwrap(), 2);
+        assert_eq!(out["signals"].as_array().unwrap().len(), 7);
         let rs: Vec<String> = out["reasons"]
             .as_array()
             .unwrap()
@@ -1180,5 +1250,16 @@ mod tests {
         assert!(rs.iter().any(|s| s == "지지선 근처"), "reasons={:?}", rs);
         let summary = out["summary"].as_str().unwrap();
         assert!(summary.contains("규칙 기반 해석이며 매매 신호가 아닙니다."));
+    }
+
+    #[test]
+    fn test_rating_label_steps() {
+        let l = ["강한 하방", "하방", "중립", "상방", "강한 상방"];
+        assert_eq!(rating_label(1.0, l), "강한 상방");
+        assert_eq!(rating_label(0.5, l), "상방");
+        assert_eq!(rating_label(0.25, l), "중립");
+        assert_eq!(rating_label(-0.25, l), "중립");
+        assert_eq!(rating_label(-0.5, l), "하방");
+        assert_eq!(rating_label(-0.75, l), "강한 하방");
     }
 }
