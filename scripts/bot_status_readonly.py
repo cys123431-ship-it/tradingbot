@@ -401,6 +401,8 @@ def collect(root, *, with_exchange=True):
     config = _load_json(root / "config.json", {})
     report = {
         "generated_at": time.time(),
+        # ops/BOT_DISABLED: the Python bot is retired on purpose (the Rust bot runs).
+        "python_bot_disabled": (root / "ops" / "BOT_DISABLED").exists(),
         "network": exchange_network(config) if config else None,
         "process": process_status(root),
         "tbot": tbot_status(root),
@@ -430,10 +432,18 @@ def render(report):
     lines = [f"🤖 봇 상태 ({_kst(report['generated_at'])} KST)"]
     proc = report["process"]
     age = proc.get("heartbeat_age_sec")
-    alive = age is not None and age <= 180 and proc.get("launcher_processes") == 1
-    lines.append(
-        f"프로세스: {'정상' if alive else '확인 필요'} · 실행 {proc.get('launcher_processes')}개 · 하트비트 {age}초 전"
-    )
+    retired = bool(report.get("python_bot_disabled"))
+    if retired:
+        running = proc.get("launcher_processes") or 0
+        lines.append(
+            "파이썬 봇: 꺼둠 (러스트 봇으로 운영)" if not running
+            else f"⚠️ 파이썬 봇: 꺼둠 설정인데 {running}개 실행 중"
+        )
+    else:
+        alive = age is not None and age <= 180 and proc.get("launcher_processes") == 1
+        lines.append(
+            f"프로세스: {'정상' if alive else '확인 필요'} · 실행 {proc.get('launcher_processes')}개 · 하트비트 {age}초 전"
+        )
     sysinfo = report.get("system") or {}
     load = sysinfo.get("load_avg")
     if load and len(load) >= 3:
@@ -455,21 +465,27 @@ def render(report):
     swap_txt = "-" if swap_total is None else (f"{swap_total - (swap_free or 0)}/{swap_total} MB" if swap_total else "없음")
     threads = sysinfo.get("bot_threads")
     threads = "-" if threads is None else str(threads)
-    lines.append(
-        f"서버: 부하 {load_txt} (CPU {cpu_count_txt}개) · 메모리 가용 {avail}/{total} MB · 스왑 {swap_txt} · 봇 CPU {bot_cpu}% · 메모리 {rss} MB · 스레드 {threads}"
-    )
+    server = f"서버: 부하 {load_txt} (CPU {cpu_count_txt}개) · 메모리 가용 {avail}/{total} MB · 스왑 {swap_txt}"
+    if not retired:
+        server += f" · 봇 CPU {bot_cpu}% · 메모리 {rss} MB · 스레드 {threads}"
+    lines.append(server)
     tbot = report.get("tbot") or {}
     if tbot.get("engine_processes") or tbot.get("telegram_processes") or tbot.get("heartbeat_age_sec") is not None:
+        tb_age = tbot.get("heartbeat_age_sec")
+        tb_ok = (tbot.get("engine_processes") == 1 and tbot.get("telegram_processes") == 1
+                 and tb_age is not None and tb_age <= 180)
         lines.append(
-            f"러스트 봇: 엔진 {tbot.get('engine_processes')}개 · 텔레그램 {tbot.get('telegram_processes')}개"
-            f" · 하트비트 {tbot.get('heartbeat_age_sec')}초 전"
+            f"러스트 봇: {'정상' if tb_ok else '확인 필요'} · 엔진 {tbot.get('engine_processes')}개"
+            f" · 텔레그램 {tbot.get('telegram_processes')}개 · 하트비트 {tb_age}초 전"
         )
     top = sysinfo.get("top_memory") or []
     if top:
         lines.append("메모리 상위: " + " · ".join(
             f"{redact(e['name'])}×{e['count']} {e['rss_mb']:.0f}+스왑{e['swap_mb']:.0f}MB" for e in top
         ))
-    wd = sysinfo.get("watchdog")
+    # The watchdog, the main-engine line and the log errors all come from the
+    # Python bot; when it is retired they are stale history, not live state.
+    wd = None if retired else sysinfo.get("watchdog")
     if isinstance(wd, dict):
         blocks_total = wd.get("blocks_total")
         max_block = wd.get("max_block_sec")
@@ -504,7 +520,7 @@ def render(report):
                 except Exception:
                     lines.append("    " + str(st_line))
     lines.append(f"거래소: {report.get('network') or '업비트/알 수 없음'} (/setup)")
-    main = report["main_engine"]
+    main = None if retired else report["main_engine"]
     if main:
         lines.append(
             f"메인 선물: {'일시정지' if main.get('paused') else '동작 중'} · 활성 {main.get('active_strategy') or '-'} · "
@@ -553,7 +569,7 @@ def render(report):
             lines.append(f"  최근 오류: {redact(item['last_error'])}")
         for event in item.get("recent", [])[:5]:
             lines.append(f"  {_kst(event.get('ts'))} {redact(event.get('text'))}")
-    if report["log_errors"]:
+    if report["log_errors"] and not retired:
         lines.append("")
         lines.append("⚠️ 최근 로그 오류")
         lines.extend(f"  {line}" for line in report["log_errors"])

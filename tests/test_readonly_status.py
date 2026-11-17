@@ -137,3 +137,24 @@ def test_tbot_log_tail_redacts_and_handles_missing_logs(tmp_path, monkeypatch):
     assert out[0] == "===== tbot-engine.log =====" and "engine: listening" in out[1]
     assert "ABCdefGHIjklMNOpqrSTUvwxYZ0123456789ab" not in "\n".join(out)
     assert out[-1] == "(no log)"
+
+
+def test_retired_python_bot_hides_its_stale_state(tmp_path, monkeypatch):
+    (tmp_path / "ops").mkdir()
+    (tmp_path / "ops" / "BOT_DISABLED").write_text("")
+    monkeypatch.setattr(status, "log_errors", lambda limit=8: ["ERROR:__main__:old python error"])
+    report = status.collect(tmp_path, with_exchange=False)
+    report["process"] = {"heartbeat_age_sec": 1_564_108, "launcher_processes": 0}
+    report["main_engine"] = {"active_strategy": "ema200_utbot_rsi_2h", "paused": False}
+    report["system"]["watchdog"] = {"blocks_total": 11, "max_block_sec": 268.0}
+    report["tbot"] = {"engine_processes": 1, "telegram_processes": 1, "heartbeat_age_sec": 9}
+    text = status.render(report)
+    assert "파이썬 봇: 꺼둠" in text
+    assert "확인 필요" not in text
+    assert "러스트 봇: 정상" in text
+    assert "메인 선물" not in text and "이벤트 루프" not in text and "old python error" not in text
+
+    report["process"]["launcher_processes"] = 1
+    assert "⚠️ 파이썬 봇: 꺼둠 설정인데 1개 실행 중" in status.render(report)
+    report["tbot"]["heartbeat_age_sec"] = 900
+    assert "러스트 봇: 확인 필요" in status.render(report)
