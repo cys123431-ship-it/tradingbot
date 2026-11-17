@@ -131,6 +131,43 @@ pub fn norm_pdf(x: f64) -> f64 {
     inv * (-0.5 * x * x).exp()
 }
 
+/// Standard normal CDF via erf (Abramowitz-Stegun 7.1.26).
+pub fn norm_cdf(x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
+    }
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    // N(x) = (1 + erf(x / sqrt 2)) / 2
+    let ax = x.abs() / std::f64::consts::SQRT_2;
+    let p = 0.3275911;
+    let a1 = 0.254829592;
+    let a2 = -0.284496736;
+    let a3 = 1.421413741;
+    let a4 = -1.453152027;
+    let a5 = 1.061405429;
+    let t = 1.0 / (1.0 + p * ax);
+    let poly = (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t;
+    let erf = 1.0 - poly * (-ax * ax).exp();
+    0.5 * (1.0 + sign * erf)
+}
+
+/// Black-Scholes delta (r = 0) of one option on one unit of underlying.
+pub fn bs_delta(spot: f64, strike: f64, iv: f64, years: f64, is_call: bool) -> f64 {
+    if [spot, strike, iv, years]
+        .iter()
+        .any(|x| x.is_nan() || *x <= 0.0)
+    {
+        return 0.0;
+    }
+    let sqrt_t = years.sqrt();
+    let d1 = ((spot / strike).ln() + 0.5 * iv * iv * years) / (iv * sqrt_t);
+    if is_call {
+        norm_cdf(d1)
+    } else {
+        norm_cdf(d1) - 1.0
+    }
+}
+
 /// Black-Scholes gamma (r = 0) of one option on one unit of underlying.
 pub fn bs_gamma(spot: f64, strike: f64, iv: f64, years: f64) -> f64 {
     // `<= 0.0 || is_nan` so a NaN input also returns 0.0.
@@ -293,6 +330,77 @@ pub fn expiries(rows: &[OptionRow], now_ms: i64) -> Vec<i64> {
     v
 }
 
+/// 25-delta skew (put IV - call IV, in vol points) for ONE expiry.
+/// Caller filters rows to a single expiry.
+pub fn skew_25d(rows: &[OptionRow], spot: f64, now_ms: i64) -> Option<f64> {
+    if spot.is_nan() || spot <= 0.0 {
+        return None;
+    }
+    let floor_years = 1.0 / 8760.0;
+    let years_ms = 365.0 * 24.0 * 3600.0 * 1000.0;
+    let mut best_put: Option<(f64, f64)> = None; // (distance to -0.25, mark_iv)
+    let mut best_call: Option<(f64, f64)> = None; // (distance to +0.25, mark_iv)
+    for r in rows {
+        if r.expiry_ms <= now_ms {
+            continue;
+        }
+        let mut years = (r.expiry_ms - now_ms) as f64 / years_ms;
+        if years < floor_years {
+            years = floor_years;
+        }
+        let iv = r.mark_iv / 100.0;
+        let d = bs_delta(spot, r.strike, iv, years, r.is_call);
+        if r.is_call {
+            let dist = (d - 0.25).abs();
+            if best_call.is_none_or(|(bd, _)| dist < bd) {
+                best_call = Some((dist, r.mark_iv));
+            }
+        } else {
+            let dist = (d + 0.25).abs();
+            if best_put.is_none_or(|(bd, _)| dist < bd) {
+                best_put = Some((dist, r.mark_iv));
+            }
+        }
+    }
+    match (best_put, best_call) {
+        (Some((_, p)), Some((_, c))) => Some(p - c),
+        _ => None,
+    }
+}
+
+/// (support, resistance): strike with largest summed put OI strictly below spot
+/// and strike with largest summed call OI strictly above spot.
+pub fn walls_around(rows: &[OptionRow], spot: f64) -> (Option<f64>, Option<f64>) {
+    use std::collections::BTreeMap;
+    if spot.is_nan() || spot <= 0.0 {
+        return (None, None);
+    }
+    let mut put_map: BTreeMap<u64, (f64, f64)> = BTreeMap::new();
+    let mut call_map: BTreeMap<u64, (f64, f64)> = BTreeMap::new();
+    for r in rows {
+        let key = (r.strike * 1e6).round() as u64;
+        if r.is_call {
+            if r.strike > spot {
+                let e = call_map.entry(key).or_insert((r.strike, 0.0));
+                e.1 += r.open_interest;
+            }
+        } else if r.strike < spot {
+            let e = put_map.entry(key).or_insert((r.strike, 0.0));
+            e.1 += r.open_interest;
+        }
+    }
+    let pick = |m: &BTreeMap<u64, (f64, f64)>| -> Option<f64> {
+        let mut best: Option<(f64, f64)> = None;
+        for &(k, oi) in m.values() {
+            if best.is_none_or(|(bo, bk)| oi > bo || (oi == bo && k < bk)) {
+                best = Some((oi, k));
+            }
+        }
+        best.map(|(_, k)| k)
+    };
+    (pick(&put_map), pick(&call_map))
+}
+
 fn expiry_label(expiry_ms: i64) -> String {
     // Convert epoch ms (UTC, at 08:00) to civil date.
     let days = expiry_ms.div_euclid(86_400_000);
@@ -344,6 +452,29 @@ fn opt_pair(v: Option<(f64, f64)>) -> Value {
     }
 }
 
+/// Format a number with thousands separators: 64000 -> "64,000".
+fn fmt_thousands(x: f64) -> String {
+    if !x.is_finite() {
+        return "0".to_string();
+    }
+    let neg = x < 0.0;
+    let units = x.abs().round() as u64;
+    let s = units.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+    let n = bytes.len();
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (n - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
 pub fn report(rows: &[OptionRow], spot: f64, now_ms: i64, max_expiries: usize) -> Value {
     let live: Vec<OptionRow> = rows
         .iter()
@@ -358,6 +489,22 @@ pub fn report(rows: &[OptionRow], spot: f64, now_ms: i64, max_expiries: usize) -
     let all_zg = zero_gamma(&live, spot, now_ms);
     let call_walls = oi_walls(&live, true, 3);
     let put_walls = oi_walls(&live, false, 3);
+    let (all_support, all_resistance) = walls_around(&live, spot);
+
+    let exp_list = expiries(&live, now_ms);
+
+    // First expiry with days >= 7 drives the "all" skew.
+    let mut all_skew: Option<f64> = None;
+    let mut all_skew_label: Option<String> = None;
+    for &e in exp_list.iter() {
+        let days = (e - now_ms) as f64 / 86_400_000.0;
+        if days >= 7.0 {
+            let erows: Vec<OptionRow> = live.iter().filter(|r| r.expiry_ms == e).cloned().collect();
+            all_skew = skew_25d(&erows, spot, now_ms);
+            all_skew_label = Some(expiry_label(e));
+            break;
+        }
+    }
 
     let all = json!({
         "max_pain": opt_num(all_max_pain),
@@ -368,9 +515,15 @@ pub fn report(rows: &[OptionRow], spot: f64, now_ms: i64, max_expiries: usize) -
         "put_walls": walls_json(&put_walls),
         "call_oi": all_call,
         "put_oi": all_put,
+        "support": opt_num(all_support),
+        "resistance": opt_num(all_resistance),
+        "skew_25d": opt_num(all_skew),
+        "skew_label": match &all_skew_label {
+            Some(s) => json!(s),
+            None => Value::Null,
+        },
     });
 
-    let exp_list = expiries(&live, now_ms);
     let mut exp_json: Vec<Value> = Vec::new();
     for &e in exp_list.iter().take(max_expiries) {
         let erows: Vec<OptionRow> = live.iter().filter(|r| r.expiry_ms == e).cloned().collect();
@@ -380,6 +533,8 @@ pub fn report(rows: &[OptionRow], spot: f64, now_ms: i64, max_expiries: usize) -
         let gex = net_gex(&erows, spot, now_ms);
         let cw = oi_walls(&erows, true, 1).into_iter().next();
         let pw = oi_walls(&erows, false, 1).into_iter().next();
+        let sk = skew_25d(&erows, spot, now_ms);
+        let (sup, res) = walls_around(&erows, spot);
         let days = (e - now_ms) as f64 / 86_400_000.0;
         exp_json.push(json!({
             "expiry_ms": e,
@@ -392,6 +547,9 @@ pub fn report(rows: &[OptionRow], spot: f64, now_ms: i64, max_expiries: usize) -
             "put_wall": opt_pair(pw),
             "call_oi": c,
             "put_oi": p,
+            "skew_25d": opt_num(sk),
+            "support": opt_num(sup),
+            "resistance": opt_num(res),
         }));
     }
 
@@ -400,6 +558,298 @@ pub fn report(rows: &[OptionRow], spot: f64, now_ms: i64, max_expiries: usize) -
         "now_ms": now_ms,
         "all": all,
         "expiries": exp_json,
+    })
+}
+
+fn get_f64(v: &Value, key: &str) -> Option<f64> {
+    v.get(key).and_then(|x| x.as_f64())
+}
+
+/// Rule-based interpretation of a report for the "all" section.
+pub fn interpret(report: &Value) -> Value {
+    let spot = get_f64(report, "spot");
+    let dvol = get_f64(report, "dvol");
+    let dvol_chg = get_f64(report, "dvol_change_24h");
+    let all = report.get("all").cloned().unwrap_or(Value::Null);
+
+    let mp = get_f64(&all, "max_pain");
+    let flip = get_f64(&all, "zero_gamma");
+    let gex = get_f64(&all, "net_gex");
+    let pcr = get_f64(&all, "pcr");
+    let skew = get_f64(&all, "skew_25d");
+    let call_wall = get_f64(&all, "resistance");
+    let put_wall = get_f64(&all, "support");
+    let days: Option<f64> = None; // "all" has no single expiry
+    let funding: Option<f64> = None; // web only input; not available here
+
+    let mut bias: i64 = 0;
+    let mut vol: i64 = 0;
+    let mut reasons: Vec<String> = Vec::new();
+
+    // Per-metric notes.
+    let note_max_pain: Option<String> = match (mp, spot) {
+        (Some(m), Some(s)) if s > 0.0 => {
+            let d = (m - s) / s;
+            if d.abs() < 0.01 {
+                Some("지수와 거의 같음 · 만기까지 이 근처에 머물려는 힘".to_string())
+            } else {
+                let dir = if d > 0.0 { "위" } else { "아래" };
+                let tail = match days {
+                    Some(dd) if dd <= 7.0 => "만기가 가까워 그쪽으로 끌릴 수 있음",
+                    _ => "만기가 멀어 끌림은 약함",
+                };
+                Some(format!(
+                    "지수보다 {:.1}% {} · {}",
+                    d.abs() * 100.0,
+                    dir,
+                    tail
+                ))
+            }
+        }
+        _ => None,
+    };
+
+    let note_flip: Option<String> = match (flip, spot) {
+        (None, _) => Some("범위 안에 없음 · 딜러 감마가 한쪽으로 치우침".to_string()),
+        (Some(f), Some(s)) if f > 0.0 => {
+            let dist = (s - f).abs() / f * 100.0;
+            if s >= f {
+                Some(format!(
+                    "지수가 {:.1}% 위 · 딜러가 반대로 헤지해 움직임이 줄어드는 구간",
+                    dist
+                ))
+            } else {
+                Some(format!(
+                    "지수가 {:.1}% 아래 · 딜러가 같은 방향으로 헤지해 움직임이 커지는 구간",
+                    dist
+                ))
+            }
+        }
+        _ => None,
+    };
+
+    let note_gex: Option<String> = match (gex, spot) {
+        (Some(g), Some(s)) if s > 0.0 => {
+            let btc = g.abs() / s;
+            if g < 0.0 {
+                Some(format!(
+                    "1% 움직이면 딜러가 약 {} BTC를 같은 방향으로 거래 (변동성 증폭)",
+                    fmt_thousands(btc)
+                ))
+            } else {
+                Some(format!(
+                    "1% 움직이면 딜러가 약 {} BTC를 반대 방향으로 거래 (변동성 완충)",
+                    fmt_thousands(btc)
+                ))
+            }
+        }
+        _ => None,
+    };
+
+    let note_pcr: Option<String> = match pcr {
+        Some(p) => {
+            let s = if p < 0.7 {
+                "콜이 훨씬 많음 · 상승 기대 쏠림"
+            } else if p < 1.0 {
+                "균형에 가까움 (콜 약간 우세)"
+            } else if p <= 1.3 {
+                "풋이 많음 · 하락 헤지 수요"
+            } else {
+                "풋 쏠림이 큼 · 과도한 비관 (반대 신호가 되기도 함)"
+            };
+            Some(s.to_string())
+        }
+        None => None,
+    };
+
+    let note_dvol: Option<String> = match dvol {
+        Some(d) => {
+            let level = if d < 40.0 {
+                "낮음"
+            } else if d <= 60.0 {
+                "보통"
+            } else {
+                "높음"
+            };
+            let change = match dvol_chg {
+                Some(c) if c >= 3.0 => " · 24시간 급등, 불안 확대",
+                Some(c) if c <= -3.0 => " · 24시간 하락, 안정",
+                _ => " · 24시간 변화 작음",
+            };
+            Some(format!("변동성 {}{}", level, change))
+        }
+        None => None,
+    };
+
+    let note_skew: Option<String> = match skew {
+        Some(s) => {
+            let t = if s > 5.0 {
+                "풋이 비쌈 · 하락 대비 수요 강함"
+            } else if s >= 0.0 {
+                "풋이 약간 비쌈 · 평소 수준"
+            } else {
+                "콜이 비쌈 · 상승 베팅 우세"
+            };
+            Some(t.to_string())
+        }
+        None => None,
+    };
+
+    // Rule 1: gamma regime.
+    if let Some(f) = flip {
+        if let Some(s) = spot {
+            if s < f {
+                vol += 1;
+                reasons.push("숏감마 구간".to_string());
+            } else {
+                vol -= 1;
+                reasons.push("롱감마 구간".to_string());
+            }
+        }
+    } else if let Some(g) = gex {
+        if g < 0.0 {
+            vol += 1;
+            reasons.push("딜러 숏감마".to_string());
+        } else {
+            vol -= 1;
+            reasons.push("딜러 롱감마".to_string());
+        }
+    }
+
+    // Rule 2: DVOL.
+    if let Some(c) = dvol_chg {
+        if c >= 3.0 {
+            vol += 1;
+            reasons.push("DVOL 급등".to_string());
+        } else if c <= -3.0 {
+            vol -= 1;
+            reasons.push("DVOL 하락".to_string());
+        }
+    }
+    if let Some(d) = dvol {
+        if d > 60.0 {
+            vol += 1;
+            reasons.push("DVOL 높음".to_string());
+        }
+    }
+
+    // Rule 3: max pain pull.
+    if let (Some(m), Some(s), Some(dd)) = (mp, spot, days) {
+        if s > 0.0 && dd <= 7.0 {
+            let d = (m - s) / s;
+            if d.abs() >= 0.01 {
+                if d > 0.0 {
+                    bias += 1;
+                    reasons.push("맥스페인 위 끌림".to_string());
+                } else {
+                    bias -= 1;
+                    reasons.push("맥스페인 아래 끌림".to_string());
+                }
+            }
+        }
+    }
+
+    // Rule 4: PCR.
+    if let Some(p) = pcr {
+        if p < 0.7 {
+            bias += 1;
+            reasons.push("콜 쏠림".to_string());
+        } else if p > 1.3 {
+            bias += 1;
+            reasons.push("풋 과열 · 역발상".to_string());
+        } else if p > 1.0 {
+            bias -= 1;
+            reasons.push("풋 헤지 많음".to_string());
+        }
+    }
+
+    // Rule 5: Skew.
+    if let Some(s) = skew {
+        if s > 5.0 {
+            bias -= 1;
+            reasons.push("하락 대비 수요".to_string());
+        } else if s < 0.0 {
+            bias += 1;
+            reasons.push("상승 베팅 우세".to_string());
+        }
+    }
+
+    // Rule 6: Funding (web only).
+    if let Some(f) = funding {
+        if f > 0.0005 {
+            bias -= 1;
+            reasons.push("롱 과열".to_string());
+        } else if f < 0.0 {
+            bias -= 1;
+            reasons.push("숏 우세".to_string());
+        }
+    }
+
+    // Rule 7: Walls.
+    if let (Some(cw), Some(pw), Some(s)) = (call_wall, put_wall, spot) {
+        if s > 0.0 {
+            let up = (cw - s) / s;
+            let down = (s - pw) / s;
+            if down < up / 2.0 {
+                bias += 1;
+                reasons.push("지지선 근처".to_string());
+            } else if up < down / 2.0 {
+                bias -= 1;
+                reasons.push("저항선 근처".to_string());
+            }
+        }
+    }
+
+    let verdict_bias = if bias >= 2 {
+        "상방 우위"
+    } else if bias <= -2 {
+        "하방 우위"
+    } else {
+        "중립"
+    };
+    let verdict_vol = if vol >= 1 {
+        "변동성 확대 쪽"
+    } else if vol <= -1 {
+        "변동성 축소 쪽"
+    } else {
+        "변동성 보통"
+    };
+
+    let range_line: Option<String> = match (put_wall, call_wall, spot) {
+        (Some(pw), Some(cw), Some(s)) => Some(format!(
+            "지지 ${} · 저항 ${} (지수 ${})",
+            fmt_thousands(pw),
+            fmt_thousands(cw),
+            fmt_thousands(s)
+        )),
+        _ => None,
+    };
+
+    let mut summary = format!("종합: {} · {}.", verdict_bias, verdict_vol);
+    if !reasons.is_empty() {
+        summary.push_str(" 근거: ");
+        summary.push_str(&reasons.join(", "));
+        summary.push('.');
+    }
+    summary.push(' ');
+    summary.push_str("규칙 기반 해석이며 매매 신호가 아닙니다.");
+
+    json!({
+        "notes": {
+            "max_pain": note_max_pain,
+            "flip": note_flip,
+            "gex": note_gex,
+            "pcr": note_pcr,
+            "dvol": note_dvol,
+            "skew": note_skew,
+        },
+        "bias": bias,
+        "vol": vol,
+        "reasons": reasons,
+        "verdict_bias": verdict_bias,
+        "verdict_vol": verdict_vol,
+        "range": range_line,
+        "summary": summary,
     })
 }
 
@@ -589,5 +1039,146 @@ mod tests {
         assert!(e0.get("put_wall").is_some());
         assert!(e0.get("call_oi").is_some());
         assert!(e0.get("put_oi").is_some());
+    }
+
+    #[test]
+    fn test_norm_cdf() {
+        assert!((norm_cdf(0.0) - 0.5).abs() < 1e-7); // A&S 7.1.26 is good to ~1.5e-7
+        assert!((norm_cdf(1.96) - 0.975).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_bs_delta_atm_call() {
+        let d = bs_delta(100.0, 100.0, 0.5, 1.0, true);
+        let expected = norm_cdf(0.25);
+        assert!((d - expected).abs() < 1e-9, "d={} expected={}", d, expected);
+    }
+
+    #[test]
+    fn test_skew_25d_positive() {
+        let now_ms = 0;
+        let day_ms = 86_400_000i64;
+        let exp = 30 * day_ms;
+        // Puts priced with higher IV than calls -> positive skew.
+        let rows = vec![
+            OptionRow {
+                expiry_ms: exp,
+                strike: 90.0,
+                is_call: false,
+                open_interest: 10.0,
+                mark_iv: 70.0,
+            },
+            OptionRow {
+                expiry_ms: exp,
+                strike: 85.0,
+                is_call: false,
+                open_interest: 10.0,
+                mark_iv: 68.0,
+            },
+            OptionRow {
+                expiry_ms: exp,
+                strike: 110.0,
+                is_call: true,
+                open_interest: 10.0,
+                mark_iv: 55.0,
+            },
+            OptionRow {
+                expiry_ms: exp,
+                strike: 115.0,
+                is_call: true,
+                open_interest: 10.0,
+                mark_iv: 54.0,
+            },
+        ];
+        let s = skew_25d(&rows, 100.0, now_ms).unwrap();
+        assert!(s > 0.0, "skew={}", s);
+    }
+
+    #[test]
+    fn test_walls_around() {
+        let rows = vec![
+            OptionRow {
+                expiry_ms: 1000,
+                strike: 90.0,
+                is_call: false,
+                open_interest: 40.0,
+                mark_iv: 50.0,
+            },
+            OptionRow {
+                expiry_ms: 1000,
+                strike: 95.0,
+                is_call: false,
+                open_interest: 10.0,
+                mark_iv: 50.0,
+            },
+            OptionRow {
+                expiry_ms: 1000,
+                strike: 110.0,
+                is_call: true,
+                open_interest: 30.0,
+                mark_iv: 50.0,
+            },
+            OptionRow {
+                expiry_ms: 1000,
+                strike: 120.0,
+                is_call: true,
+                open_interest: 5.0,
+                mark_iv: 50.0,
+            },
+            // Strikes at/above spot for puts and at/below for calls must be ignored.
+            OptionRow {
+                expiry_ms: 1000,
+                strike: 100.0,
+                is_call: false,
+                open_interest: 999.0,
+                mark_iv: 50.0,
+            },
+            OptionRow {
+                expiry_ms: 1000,
+                strike: 100.0,
+                is_call: true,
+                open_interest: 999.0,
+                mark_iv: 50.0,
+            },
+        ];
+        let (sup, res) = walls_around(&rows, 100.0);
+        assert_eq!(sup, Some(90.0));
+        assert_eq!(res, Some(110.0));
+    }
+
+    #[test]
+    fn test_interpret_rules() {
+        // S below flip, pcr 1.2, skew 6, support close below S,
+        // resistance far above S -> vol expansion, bearish bias, neutral verdict.
+        let rep = json!({
+            "spot": 64000.0,
+            "dvol": 55.0,
+            "dvol_change_24h": 0.5,
+            "all": {
+                "max_pain": 70000.0,
+                "zero_gamma": 66000.0,
+                "net_gex": -1000000.0,
+                "pcr": 1.2,
+                "skew_25d": 6.0,
+                "support": 63000.0,
+                "resistance": 80000.0,
+            }
+        });
+        let out = interpret(&rep);
+        assert_eq!(out["bias"].as_i64().unwrap(), -1);
+        assert_eq!(out["verdict_bias"].as_str().unwrap(), "중립");
+        assert_eq!(out["verdict_vol"].as_str().unwrap(), "변동성 확대 쪽");
+        let rs: Vec<String> = out["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(rs.iter().any(|s| s == "숏감마 구간"), "reasons={:?}", rs);
+        assert!(rs.iter().any(|s| s == "풋 헤지 많음"), "reasons={:?}", rs);
+        assert!(rs.iter().any(|s| s == "하락 대비 수요"), "reasons={:?}", rs);
+        assert!(rs.iter().any(|s| s == "지지선 근처"), "reasons={:?}", rs);
+        let summary = out["summary"].as_str().unwrap();
+        assert!(summary.contains("규칙 기반 해석이며 매매 신호가 아닙니다."));
     }
 }
