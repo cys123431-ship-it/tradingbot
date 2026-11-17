@@ -324,10 +324,123 @@ pub(crate) fn menu_page_for(action: &str) -> MenuPage {
     {
         return MenuPage::Risk;
     }
-    if matches!(action, "menu:more" | "signals" | "rules" | "reconcile") {
+    if matches!(
+        action,
+        "menu:more" | "signals" | "rules" | "reconcile" | "options"
+    ) {
         return MenuPage::More;
     }
     MenuPage::Main
+}
+
+/// `1234567.8` -> `"1,234,568"`.
+fn thousands(x: f64) -> String {
+    let neg = x < 0.0;
+    let digits = format!("{:.0}", x.abs());
+    let mut out = String::new();
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if neg {
+        format!("-{out}")
+    } else {
+        out
+    }
+}
+
+/// Dollar amount in millions with a sign, e.g. `+$12.3M`.
+fn usd_millions(x: f64) -> String {
+    let sign = if x >= 0.0 { "+" } else { "-" };
+    format!("{sign}${:.1}M", x.abs() / 1e6)
+}
+
+/// Public alias of [`options_report_text`] for integration tests.
+pub fn options_report_text_for_tests(report: &Value) -> String {
+    options_report_text(report)
+}
+
+/// Telegram text of `deribit::btc_options_report` (read-only information).
+pub(crate) fn options_report_text(report: &Value) -> String {
+    let num = |v: Option<&Value>| v.and_then(|x| x.as_f64());
+    let usd = |v: Option<f64>| {
+        v.map(|x| format!("${}", thousands(x)))
+            .unwrap_or_else(|| "-".into())
+    };
+    let wall = |w: &Value| -> Option<String> {
+        let a = w.as_array()?;
+        Some(format!(
+            "${} ({} BTC)",
+            thousands(a.first()?.as_f64()?),
+            thousands(a.get(1)?.as_f64()?)
+        ))
+    };
+    let spot = num(report.get("spot")).unwrap_or(0.0);
+    let mut lines = vec!["🧮 BTC 옵션 지표 (Deribit)".to_string()];
+    let dvol = match (num(report.get("dvol")), num(report.get("dvol_change_24h"))) {
+        (Some(d), Some(c)) => format!(" · DVOL {d:.1} (24시간 {c:+.1})"),
+        (Some(d), None) => format!(" · DVOL {d:.1}"),
+        _ => String::new(),
+    };
+    lines.push(format!("지수 ${}{dvol}", thousands(spot)));
+    let all = report.get("all").cloned().unwrap_or(Value::Null);
+    lines.push(String::new());
+    lines.push("▪ 전체 만기 합산".to_string());
+    let pcr = num(all.get("pcr"))
+        .map(|x| format!("{x:.2}"))
+        .unwrap_or_else(|| "-".into());
+    lines.push(format!(
+        "맥스페인 {} · 풋/콜 OI {pcr}",
+        usd(num(all.get("max_pain")))
+    ));
+    let walls = |key: &str| -> String {
+        all.get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(wall).collect::<Vec<_>>().join(" · "))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "-".into())
+    };
+    lines.push(format!("콜 벽(저항): {}", walls("call_walls")));
+    lines.push(format!("풋 벽(지지): {}", walls("put_walls")));
+    let gex = num(all.get("net_gex")).unwrap_or(0.0);
+    let regime = match num(all.get("zero_gamma")) {
+        Some(z) if spot >= z => {
+            format!("감마 플립 ${} · 지수가 위 → 변동성 완충 구간", thousands(z))
+        }
+        Some(z) => format!("감마 플립 ${} · 지수가 아래 → 추세 가속 구간", thousands(z)),
+        None => "감마 플립: 범위 안에 없음".to_string(),
+    };
+    lines.push(format!("딜러 감마 {} / 1% · {regime}", usd_millions(gex)));
+    if let Some(exps) = report.get("expiries").and_then(|v| v.as_array()) {
+        lines.push(String::new());
+        lines.push("▪ 가까운 만기".to_string());
+        for e in exps {
+            let label = e.get("label").and_then(|v| v.as_str()).unwrap_or("?");
+            let days = num(e.get("days")).unwrap_or(0.0);
+            let pcr = num(e.get("pcr"))
+                .map(|x| format!("{x:.2}"))
+                .unwrap_or_else(|| "-".into());
+            let cw = e
+                .get("call_wall")
+                .and_then(wall)
+                .unwrap_or_else(|| "-".into());
+            let pw = e
+                .get("put_wall")
+                .and_then(wall)
+                .unwrap_or_else(|| "-".into());
+            lines.push(format!(
+                "{label} ({days:.1}일): 맥스페인 {} · PCR {pcr}\n  콜벽 {cw} · 풋벽 {pw}",
+                usd(num(e.get("max_pain")))
+            ));
+        }
+    }
+    lines.push(String::new());
+    lines.push(
+        "※ 딜러 감마는 콜 +, 풋 − 표준 가정입니다. 참고 지표이며 매매 신호가 아닙니다.".to_string(),
+    );
+    lines.join("\n")
 }
 
 fn mark(selected: bool, label: &str) -> String {
@@ -1895,7 +2008,10 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                     markup_button("🧾 최근 판단", "bm:signals"),
                     markup_button("🔄 거래소 재대조", "bm:reconcile"),
                 ]);
-                rows.push(vec![markup_button("📘 전략 규칙", "bm:rules")]);
+                rows.push(vec![
+                    markup_button("📘 전략 규칙", "bm:rules"),
+                    markup_button("🧮 BTC 옵션 지표", "bm:options"),
+                ]);
             }
         }
 
@@ -3489,6 +3605,18 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 (format!("{message}\n\n{status}"), kb!())
             }
             "signals" => (self.format_signals().await, kb!()),
+            "options" => {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let client = crate::app::deribit::DeribitClient::new();
+                let text = match crate::app::deribit::btc_options_report(&client, now_ms, 4).await {
+                    Ok(report) => options_report_text(&report),
+                    Err(e) => format!("⚠️ BTC 옵션 데이터를 받지 못했습니다 (Deribit): {e}"),
+                };
+                (text, kb!())
+            }
             "rules" => (self.rules_text(&cfg), kb!()),
             "reconcile" => {
                 if let Err(e) = self.engine_call("reset_reconciliation", json!({})).await {

@@ -1272,3 +1272,28 @@ async fn main_menu_is_short_and_sub_pages_lead_back() {
     assert!(callbacks(&press(&ctx, "guard").await.1).contains(&"bm:menu:risk".to_string()));
     assert!(callbacks(&press(&ctx, "minbal").await.1).contains(&"bm:menu:risk".to_string()));
 }
+
+#[tokio::test]
+async fn options_button_is_on_the_more_page() {
+    let tmp = common::temp_dir("tg_options_btn");
+    let ctx = controller(&tmp);
+    let cbs = callbacks(&press(&ctx, "menu:more").await.1);
+    assert!(cbs.contains(&"bm:options".to_string()), "{cbs:?}");
+}
+
+/// Live read of Deribit public data; run with `cargo test -- --ignored`.
+#[tokio::test]
+#[ignore]
+async fn options_report_live_smoke() {
+    let client = tbot::app::deribit::DeribitClient::new();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let report = tbot::app::deribit::btc_options_report(&client, now, 4)
+        .await
+        .unwrap();
+    let text = tbot::app::telegram_bot::options_report_text_for_tests(&report);
+    println!("{text}");
+    assert!(text.contains("맥스페인"));
+}
