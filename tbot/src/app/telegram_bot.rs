@@ -273,6 +273,63 @@ fn markup(rows: Vec<Vec<Value>>) -> Value {
     json!({"inline_keyboard": rows})
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MenuPage {
+    Main,
+    Market,
+    Entry,
+    Sma,
+    Risk,
+    More,
+}
+
+/// Which menu page to show after `action` (the callback data without the "bm:" prefix).
+pub(crate) fn menu_page_for(action: &str) -> MenuPage {
+    if matches!(
+        action,
+        "menu:market" | "mode:dry" | "mode:live" | "confirm_live"
+    ) || action.starts_with("scope:")
+        || action.starts_with("coin:")
+    {
+        return MenuPage::Market;
+    }
+    if matches!(action, "menu:entry" | "xma_help")
+        || action.starts_with("entry:")
+        || action.starts_with("xma:")
+        || action.starts_with("xmap:")
+        || action.starts_with("lb:")
+        || action.starts_with("rw:")
+        || action.starts_with("rot:")
+        || action.starts_with("pls:")
+    {
+        return MenuPage::Entry;
+    }
+    if matches!(action, "menu:sma" | "sma_help")
+        || action.starts_with("sma:")
+        || action.starts_with("tf:")
+        || action.starts_with("slow:")
+    {
+        return MenuPage::Sma;
+    }
+    if action == "menu:risk"
+        || action.starts_with("lev:")
+        || action.starts_with("mf:")
+        || action.starts_with("es:")
+        || action.starts_with("stopma:")
+        || action.starts_with("plock:")
+        || action.starts_with("scalein:")
+        || action.starts_with("dll:")
+        || action.starts_with("mls:")
+        || action.starts_with("minbal:")
+    {
+        return MenuPage::Risk;
+    }
+    if matches!(action, "menu:more" | "signals" | "rules" | "reconcile") {
+        return MenuPage::More;
+    }
+    MenuPage::Main
+}
+
 fn mark(selected: bool, label: &str) -> String {
     if selected {
         format!("✅ {label}")
@@ -1079,7 +1136,9 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                     let (status, _) = self.status_screen().await;
                     format!("🔻 청산 MA: {}\n\n{status}", exit_ma_text(&cfg))
                 }
-                Err(e) => format!("⚠️ 청산 MA 설정 실패: {e}\n예) /btcma exit 25 · /btcma exit off"),
+                Err(e) => {
+                    format!("⚠️ 청산 MA 설정 실패: {e}\n예) /btcma exit 25 · /btcma exit off")
+                }
             };
             let (_, markup) = self.status_screen().await;
             return vec![Outgoing::Send {
@@ -1127,7 +1186,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         let text = self.format_status().await;
         let cfg = self.config().await;
         let state = self.load_state_or_empty().await;
-        let markup = self.build_keyboard(&cfg, None, Some(&state));
+        let markup = self.build_keyboard(&cfg, None, Some(&state), MenuPage::Main);
         (text, markup)
     }
 
@@ -1164,7 +1223,11 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         self.engine_call("exchange_mode", json!({}))
             .await
             .ok()
-            .and_then(|v| v.get("mode").and_then(|m| m.as_str()).map(|s| s.to_string()))
+            .and_then(|v| {
+                v.get("mode")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+            })
             .unwrap_or_default()
     }
 
@@ -1188,7 +1251,8 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         if positions.is_empty() {
             return (vec!["· 보유 포지션: 없음".to_string()], false);
         }
-        let mut lines = vec!["· ⚠️ 보유 포지션이 있어 전환할 수 없습니다. 먼저 청산하세요:".to_string()];
+        let mut lines =
+            vec!["· ⚠️ 보유 포지션이 있어 전환할 수 없습니다. 먼저 청산하세요:".to_string()];
         for p in &positions {
             lines.push(format!(
                 "  - {} {} {} {}개 ({})",
@@ -1209,7 +1273,10 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             for change in changes.as_array().into_iter().flatten() {
                 lines.push(format!(
                     "· ⚠️ {}: {} — {} → {}",
-                    change.get("strategy").and_then(|v| v.as_str()).unwrap_or(""),
+                    change
+                        .get("strategy")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
                     change.get("field").and_then(|v| v.as_str()).unwrap_or(""),
                     change.get("from").and_then(|v| v.as_str()).unwrap_or(""),
                     change.get("to").and_then(|v| v.as_str()).unwrap_or(""),
@@ -1222,8 +1289,14 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
     fn exchange_menu_keyboard(network: &str) -> Value {
         markup(vec![
             vec![
-                markup_button(mark(network == "testnet", "🧪 바이낸스 테스트넷"), "bm:exch:testnet"),
-                markup_button(mark(network == "mainnet", "💰 바이낸스 메인넷"), "bm:exch:mainnet"),
+                markup_button(
+                    mark(network == "testnet", "🧪 바이낸스 테스트넷"),
+                    "bm:exch:testnet",
+                ),
+                markup_button(
+                    mark(network == "mainnet", "💰 바이낸스 메인넷"),
+                    "bm:exch:mainnet",
+                ),
             ],
             vec![markup_button("🏦 업비트 KRW 현물", "bm:exch:upbit")],
             vec![markup_button("📊 상태로", "bm:status")],
@@ -1296,7 +1369,11 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             Ok(v) => v,
             Err(e) => {
                 let mode = self.exchange_mode_now().await;
-                let network = if mode == BINANCE_MAINNET { "mainnet" } else { "testnet" };
+                let network = if mode == BINANCE_MAINNET {
+                    "mainnet"
+                } else {
+                    "testnet"
+                };
                 return (
                     format!("⚠️ 거래소 전환 확인 실패: {e}"),
                     Self::exchange_menu_keyboard(network),
@@ -1310,7 +1387,10 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 .unwrap_or("거래소를 전환할 수 없습니다.");
             return (message.to_string(), Self::exchange_menu_keyboard(""));
         }
-        let mode = preview.get("current").and_then(|v| v.as_str()).unwrap_or("");
+        let mode = preview
+            .get("current")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let (mut lines, _) = Self::held_positions_lines(&preview);
         if preview.get("same").and_then(|v| v.as_bool()) == Some(true) {
             lines.insert(0, "ℹ️ 이미 이 거래소를 사용 중입니다.".to_string());
@@ -1333,7 +1413,11 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             network_label(net_name_of(plan)),
             exchange_mode_label(mode),
             mode_now,
-            if mode_now == "LIVE" { "실주문" } else { "가상" },
+            if mode_now == "LIVE" {
+                "실주문"
+            } else {
+                "가상"
+            },
             lines.join("\n")
         );
         let network = net_name_of(plan);
@@ -1350,15 +1434,13 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         let keyboard = if held || preview.get("same").and_then(|v| v.as_bool()) == Some(true) {
             Self::exchange_menu_keyboard(network)
         } else {
-            markup(vec![
-                vec![
-                    markup_button(
-                        format!("✅ {}로 전환", network_label(network)),
-                        format!("bm:exch:confirm:{plan}"),
-                    ),
-                    markup_button("취소", "bm:exchange"),
-                ],
-            ])
+            markup(vec![vec![
+                markup_button(
+                    format!("✅ {}로 전환", network_label(network)),
+                    format!("bm:exch:confirm:{plan}"),
+                ),
+                markup_button("취소", "bm:exchange"),
+            ]])
         };
         (body, keyboard)
     }
@@ -1376,17 +1458,25 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             .await;
         let (cfg_now, network, text) = match result {
             Ok(v) => {
-                let mode = v.get("mode").and_then(|m| m.as_str()).unwrap_or(target.as_str());
+                let mode = v
+                    .get("mode")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or(target.as_str());
                 let network = v.get("network").and_then(|n| n.as_str()).unwrap_or("");
                 let mut lines = vec![
-                    format!("✅ 거래소/네트워크 전환 완료: {}", exchange_mode_label(mode)),
+                    format!(
+                        "✅ 거래소/네트워크 전환 완료: {}",
+                        exchange_mode_label(mode)
+                    ),
                     String::new(),
                 ];
                 let plan_lines = Self::exchange_plan_lines(v.get("plan"));
                 if plan_lines.is_empty() {
                     lines.push("· 감시목록·단일 코인은 그대로입니다.".to_string());
                 } else {
-                    lines.push("감시목록·단일 코인을 현재 거래소 기준으로 정리했습니다.".to_string());
+                    lines.push(
+                        "감시목록·단일 코인을 현재 거래소 기준으로 정리했습니다.".to_string(),
+                    );
                     lines.extend(plan_lines);
                 }
                 lines.push(String::new());
@@ -1399,7 +1489,11 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             }
             Err(e) => {
                 let mode = self.exchange_mode_now().await;
-                let network = if mode == BINANCE_MAINNET { "mainnet" } else { "testnet" };
+                let network = if mode == BINANCE_MAINNET {
+                    "mainnet"
+                } else {
+                    "testnet"
+                };
                 (
                     self.config().await,
                     network.to_string(),
@@ -1411,7 +1505,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         let markup = if network.is_empty() {
             Self::exchange_menu_keyboard("")
         } else {
-            self.build_keyboard(&cfg_now, None, Some(&state))
+            self.build_keyboard(&cfg_now, None, Some(&state), MenuPage::Market)
         };
         (text, markup)
     }
@@ -1506,266 +1600,309 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         cfg: &Value,
         confirm: Option<(&str, &str)>,
         state: Option<&Value>,
+        page: MenuPage,
     ) -> Value {
         let enabled = py_truthy(cfg_get(cfg, "enabled"));
-        let trading_mode = cfg_str(cfg, "trading_mode", "");
-        let network = cfg_str(cfg, "network", "");
-        let scan_scope = cfg_str(cfg, "scan_scope", "");
-        let entry_mode = cfg_str(cfg, "entry_mode", "");
-        let timeframe = cfg_str(cfg, "timeframe", "");
-        let alt_size = cfg_int(cfg, "alt_universe_size", 50);
-        let single = cfg_str(cfg, "single_symbol", "");
-        let single = if single.is_empty() { "BTCUSDT" } else { single };
 
         let mut rows: Vec<Vec<Value>> = Vec::new();
-        rows.push(vec![
-            markup_button(mark(enabled, "▶️ 전략 ON"), "bm:on"),
-            markup_button(mark(!enabled, "⏹ 신규진입 OFF"), "bm:off"),
-        ]);
-        rows.push(vec![markup_button(
-            "🛑 완전 끄기 (진입 OFF + 포지션 청산)",
-            "bm:full_off",
-        )]);
-        let holding = state.is_some_and(|s| py_truthy(s.get("trade")));
-        if trading_mode == "LIVE" && !holding {
-            rows.push(vec![markup_button(
-                "🤝 수동 포지션 관리 맡기기",
-                "bm:adopt",
-            )]);
-        }
-        if has_reentry_wait(state) {
-            rows.push(vec![markup_button(
-                "🔓 재진입 대기 해제",
-                "bm:reentry_clear",
-            )]);
-        }
-        rows.push(vec![
-            markup_button(mark(trading_mode == "DRY_RUN", "🧪 DRY_RUN"), "bm:mode:dry"),
-            markup_button(mark(trading_mode == "LIVE", "💥 LIVE"), "bm:mode:live"),
-        ]);
-        // Exchange/network line (network == "" means an unreadable mode).
-        if !network.is_empty() {
-            let after = if network == "mainnet" { "testnet" } else { "mainnet" };
-            rows.push(vec![
-                markup_button(
-                    mark(network == "testnet", "🧪 바이낸스 테스트넷"),
-                    "bm:exch:testnet",
-                ),
-                markup_button(
-                    mark(network == "mainnet", "💰 바이낸스 메인넷"),
-                    "bm:exch:mainnet",
-                ),
-                markup_button(format!("🔄 {after}로 전환"), format!("bm:exch:confirm:{after}")),
-            ]);
-        } else {
-            rows.push(vec![markup_button("🔄 거래소/네트워크 전환", "bm:exchange")]);
-        }
-        let pick_label = if scan_scope == "single" {
-            mark(true, &format!("🎯 {single}"))
-        } else {
-            "🎯 코인 지정".to_string()
-        };
-        rows.push(vec![
-            markup_button(
-                mark(
-                    !matches!(scan_scope, "alts" | "all" | "single" | TRADFI_SCOPE),
-                    "🪙 BTC만",
-                ),
-                "bm:scope:btc",
-            ),
-            markup_button(
-                mark(scan_scope == "alts", &format!("🌐 알트 상위{alt_size}")),
-                "bm:scope:alts",
-            ),
-            markup_button(pick_label, "bm:pick"),
-        ]);
-        rows.push(vec![markup_button(
-            mark(scan_scope == "all", "🛰 전체 코인 스캔 (BTC 포함)"),
-            "bm:scope:all",
-        )]);
-        rows.push(vec![markup_button(
-            mark(scan_scope == TRADFI_SCOPE, "🏦 TradFi만 (메인넷)"),
-            "bm:scope:tradfi",
-        )]);
-        rows.push(vec![
-            markup_button(
-                mark(entry_mode != "trend", "⚡ 돌파 시 진입"),
-                "bm:entry:cross",
-            ),
-            markup_button(
-                mark(entry_mode == "trend", "📈 방향 유지 중 진입"),
-                "bm:entry:trend",
-            ),
-        ]);
-        let (exit_on, exit_period) = exit_ma_setting(cfg);
-        rows.push(vec![markup_button(
-            exit_ma_button(cfg),
-            if exit_on { "bm:xma:off" } else { "bm:xma:on" },
-        )]);
-        let mut exit_row: Vec<Value> = EXIT_MA_PRESETS
-            .iter()
-            .map(|period| {
-                markup_button(
-                    mark(exit_on && exit_period == *period, &format!("청산 MA {period}")),
-                    format!("bm:xmap:{period}"),
-                )
-            })
-            .collect();
-        exit_row.push(markup_button("✏️ 청산 MA 직접 입력", "bm:xma_help"));
-        rows.push(exit_row);
-        rows.push(vec![markup_button(
-            format!("💰 최소 잔고: {}", min_balance_label(cfg)),
-            "bm:minbal",
-        )]);
-        rows.push(vec![markup_button(
-            format!("🛡 손실 한도: {}", loss_guard_label(cfg)),
-            "bm:guard",
-        )]);
-        let lookback_on = cfg_int(cfg, "cross_lookback_bars", 1) >= 2;
-        rows.push(vec![markup_button(
-            mark(lookback_on, "⏮ 2봉 전 크로스도 진입"),
-            if lookback_on { "bm:lb:1" } else { "bm:lb:2" },
-        )]);
-        let pls_count = cfg_int(cfg, "profit_lock_switch_count", 0);
-        let pls_cb = if pls_count == 0 {
-            "bm:pls:on"
-        } else {
-            "bm:pls:off"
-        };
-        rows.push(vec![markup_button(
-            profit_lock_switch_button(cfg, state),
-            pls_cb,
-        )]);
-        let rot_on = py_truthy(cfg_get(cfg, "rotate_after_exit"));
-        rows.push(vec![markup_button(
-            mark(rot_on, "🔁 청산 후 다른 코인 바로 진입"),
-            if rot_on { "bm:rot:off" } else { "bm:rot:on" },
-        )]);
-        let reentry = cfg_int(cfg, "reentry_wait_bars", 3);
-        rows.push(
-            REENTRY_WAIT_CHOICES
-                .iter()
-                .map(|choice| {
-                    let label = if *choice == 0 {
-                        "재진입 크로스까지".to_string()
+
+        match page {
+            MenuPage::Main => {
+                rows.push(vec![
+                    markup_button(mark(enabled, "▶️ ON"), "bm:on"),
+                    markup_button(mark(!enabled, "⏹ 진입 OFF"), "bm:off"),
+                    markup_button("🛑 완전 끄기", "bm:full_off"),
+                ]);
+                let trading_mode = cfg_str(cfg, "trading_mode", "");
+                let holding = state.is_some_and(|s| py_truthy(s.get("trade")));
+                if trading_mode == "LIVE" && !holding {
+                    rows.push(vec![markup_button(
+                        "🤝 수동 포지션 관리 맡기기",
+                        "bm:adopt",
+                    )]);
+                }
+                if has_reentry_wait(state) {
+                    rows.push(vec![markup_button(
+                        "🔓 재진입 대기 해제",
+                        "bm:reentry_clear",
+                    )]);
+                }
+                rows.push(vec![
+                    markup_button("📊 상태", "bm:status"),
+                    markup_button("📈 성과", "bm:stats"),
+                    markup_button("🔻 청산", "bm:close"),
+                ]);
+                rows.push(vec![
+                    markup_button("🪙 종목·모드", "bm:menu:market"),
+                    markup_button("🎯 진입·청산", "bm:menu:entry"),
+                    markup_button("📐 SMA·봉", "bm:menu:sma"),
+                ]);
+                rows.push(vec![
+                    markup_button("🛡 위험·자금", "bm:menu:risk"),
+                    markup_button("🧰 기타", "bm:menu:more"),
+                ]);
+            }
+            MenuPage::Market => {
+                let trading_mode = cfg_str(cfg, "trading_mode", "");
+                let scan_scope = cfg_str(cfg, "scan_scope", "");
+                let alt_size = cfg_int(cfg, "alt_universe_size", 50);
+                let single = cfg_str(cfg, "single_symbol", "");
+                let single = if single.is_empty() { "BTCUSDT" } else { single };
+
+                rows.push(vec![
+                    markup_button(mark(trading_mode == "DRY_RUN", "🧪 DRY_RUN"), "bm:mode:dry"),
+                    markup_button(mark(trading_mode == "LIVE", "💥 LIVE"), "bm:mode:live"),
+                ]);
+                // Exchange/network line (network == "" means an unreadable mode).
+                let network = cfg_str(cfg, "network", "");
+                if !network.is_empty() {
+                    let after = if network == "mainnet" {
+                        "testnet"
                     } else {
-                        format!("재진입 {choice}봉 후")
+                        "mainnet"
                     };
-                    markup_button(mark(reentry == *choice, &label), format!("bm:rw:{choice}"))
-                })
-                .collect(),
-        );
-        let presets = PERIOD_PRESETS;
-        let head: Vec<Value> = presets
-            .iter()
-            .take(2)
-            .map(|(_l, f, s)| btc_sma_button(cfg, *f, *s))
-            .collect();
-        let tail: Vec<Value> = presets
-            .iter()
-            .skip(2)
-            .map(|(_l, f, s)| btc_sma_button(cfg, *f, *s))
-            .collect();
-        rows.push(head);
-        rows.push(tail);
-        rows.push(vec![markup_button(
-            "✏️ 직접 입력: /btcma 1 200",
-            "bm:sma_help",
-        )]);
-        let tf_buttons = |slice: &[&'static str]| -> Vec<Value> {
-            slice
-                .iter()
-                .map(|tf| {
+                    rows.push(vec![
+                        markup_button(
+                            mark(network == "testnet", "🧪 바이낸스 테스트넷"),
+                            "bm:exch:testnet",
+                        ),
+                        markup_button(
+                            mark(network == "mainnet", "💰 바이낸스 메인넷"),
+                            "bm:exch:mainnet",
+                        ),
+                        markup_button(
+                            format!("🔄 {after}로 전환"),
+                            format!("bm:exch:confirm:{after}"),
+                        ),
+                    ]);
+                } else {
+                    rows.push(vec![markup_button(
+                        "🔄 거래소/네트워크 전환",
+                        "bm:exchange",
+                    )]);
+                }
+                let pick_label = if scan_scope == "single" {
+                    mark(true, &format!("🎯 {single}"))
+                } else {
+                    "🎯 코인 지정".to_string()
+                };
+                rows.push(vec![
                     markup_button(
-                        mark(timeframe == *tf, timeframe_labels(tf)),
-                        format!("bm:tf:{tf}"),
-                    )
-                })
-                .collect()
-        };
-        rows.push(tf_buttons(&TIMEFRAMES[..4]));
-        rows.push(tf_buttons(&TIMEFRAMES[4..]));
-        let leverage = cfg_int(cfg, "leverage", 5);
-        rows.push(
-            LEVERAGE_CHOICES
-                .iter()
-                .map(|lev| {
+                        mark(
+                            !matches!(scan_scope, "alts" | "all" | "single" | TRADFI_SCOPE),
+                            "🪙 BTC만",
+                        ),
+                        "bm:scope:btc",
+                    ),
                     markup_button(
-                        mark(leverage == *lev, &format!("{lev}x")),
-                        format!("bm:lev:{lev}"),
-                    )
-                })
-                .collect(),
-        );
-        let stop = cfg_int(cfg, "emergency_stop_roi_percent", 0);
-        rows.push(
-            EMERGENCY_STOP_CHOICES
-                .iter()
-                .map(|choice| {
-                    let label = if *choice == 0 {
-                        "비상손절 OFF".to_string()
-                    } else {
-                        format!("-{choice}%")
-                    };
-                    markup_button(mark(stop == *choice, &label), format!("bm:es:{choice}"))
-                })
-                .collect(),
-        );
-        rows.push(vec![
-            markup_button(
-                mark(stop_ma_on(cfg), "🧱 SMA25 손절"),
-                if stop_ma_on(cfg) {
-                    "bm:stopma:off"
+                        mark(scan_scope == "alts", &format!("🌐 알트 상위{alt_size}")),
+                        "bm:scope:alts",
+                    ),
+                    markup_button(pick_label, "bm:pick"),
+                ]);
+                rows.push(vec![markup_button(
+                    mark(scan_scope == "all", "🛰 전체 코인 스캔 (BTC 포함)"),
+                    "bm:scope:all",
+                )]);
+                rows.push(vec![markup_button(
+                    mark(scan_scope == TRADFI_SCOPE, "🏦 TradFi만 (메인넷)"),
+                    "bm:scope:tradfi",
+                )]);
+            }
+            MenuPage::Entry => {
+                let entry_mode = cfg_str(cfg, "entry_mode", "");
+                rows.push(vec![
+                    markup_button(
+                        mark(entry_mode != "trend", "⚡ 돌파 시 진입"),
+                        "bm:entry:cross",
+                    ),
+                    markup_button(
+                        mark(entry_mode == "trend", "📈 방향 유지 중 진입"),
+                        "bm:entry:trend",
+                    ),
+                ]);
+                let (exit_on, exit_period) = exit_ma_setting(cfg);
+                rows.push(vec![markup_button(
+                    exit_ma_button(cfg),
+                    if exit_on { "bm:xma:off" } else { "bm:xma:on" },
+                )]);
+                let mut exit_row: Vec<Value> = EXIT_MA_PRESETS
+                    .iter()
+                    .map(|period| {
+                        markup_button(
+                            mark(
+                                exit_on && exit_period == *period,
+                                &format!("청산 MA {period}"),
+                            ),
+                            format!("bm:xmap:{period}"),
+                        )
+                    })
+                    .collect();
+                exit_row.push(markup_button("✏️ 청산 MA 직접 입력", "bm:xma_help"));
+                rows.push(exit_row);
+                let lookback_on = cfg_int(cfg, "cross_lookback_bars", 1) >= 2;
+                rows.push(vec![markup_button(
+                    mark(lookback_on, "⏮ 2봉 전 크로스도 진입"),
+                    if lookback_on { "bm:lb:1" } else { "bm:lb:2" },
+                )]);
+                let reentry = cfg_int(cfg, "reentry_wait_bars", 3);
+                rows.push(
+                    REENTRY_WAIT_CHOICES
+                        .iter()
+                        .map(|choice| {
+                            let label = if *choice == 0 {
+                                "재진입 크로스까지".to_string()
+                            } else {
+                                format!("재진입 {choice}봉 후")
+                            };
+                            markup_button(
+                                mark(reentry == *choice, &label),
+                                format!("bm:rw:{choice}"),
+                            )
+                        })
+                        .collect(),
+                );
+                let rot_on = py_truthy(cfg_get(cfg, "rotate_after_exit"));
+                rows.push(vec![markup_button(
+                    mark(rot_on, "🔁 청산 후 다른 코인 바로 진입"),
+                    if rot_on { "bm:rot:off" } else { "bm:rot:on" },
+                )]);
+                let pls_count = cfg_int(cfg, "profit_lock_switch_count", 0);
+                let pls_cb = if pls_count == 0 {
+                    "bm:pls:on"
                 } else {
-                    "bm:stopma:on"
-                },
-            ),
-            markup_button(
-                mark(profit_lock_on(cfg), "🔒 수익 잠금"),
-                if profit_lock_on(cfg) {
-                    "bm:plock:off"
-                } else {
-                    "bm:plock:on"
-                },
-            ),
-        ]);
-        {
-            let on = cfg_get(cfg, "scale_in_enabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            rows.push(vec![markup_button(
-                mark(on, "➕ 물타기 (추세 유지 시)"),
-                if on {
-                    "bm:scalein:off"
-                } else {
-                    "bm:scalein:on"
-                },
-            )]);
+                    "bm:pls:off"
+                };
+                rows.push(vec![markup_button(
+                    profit_lock_switch_button(cfg, state),
+                    pls_cb,
+                )]);
+            }
+            MenuPage::Sma => {
+                let timeframe = cfg_str(cfg, "timeframe", "");
+                let presets = PERIOD_PRESETS;
+                let head: Vec<Value> = presets
+                    .iter()
+                    .take(2)
+                    .map(|(_l, f, s)| btc_sma_button(cfg, *f, *s))
+                    .collect();
+                let tail: Vec<Value> = presets
+                    .iter()
+                    .skip(2)
+                    .map(|(_l, f, s)| btc_sma_button(cfg, *f, *s))
+                    .collect();
+                rows.push(head);
+                rows.push(tail);
+                rows.push(vec![markup_button(
+                    "✏️ 직접 입력: /btcma 1 200",
+                    "bm:sma_help",
+                )]);
+                let tf_buttons = |slice: &[&'static str]| -> Vec<Value> {
+                    slice
+                        .iter()
+                        .map(|tf| {
+                            markup_button(
+                                mark(timeframe == *tf, timeframe_labels(tf)),
+                                format!("bm:tf:{tf}"),
+                            )
+                        })
+                        .collect()
+                };
+                rows.push(tf_buttons(&TIMEFRAMES[..4]));
+                rows.push(tf_buttons(&TIMEFRAMES[4..]));
+            }
+            MenuPage::Risk => {
+                let leverage = cfg_int(cfg, "leverage", 5);
+                rows.push(
+                    LEVERAGE_CHOICES
+                        .iter()
+                        .map(|lev| {
+                            markup_button(
+                                mark(leverage == *lev, &format!("{lev}x")),
+                                format!("bm:lev:{lev}"),
+                            )
+                        })
+                        .collect(),
+                );
+                let current = (py_n(cfg_get(cfg, "margin_fraction")) * 100.0).round() as i64;
+                rows.push(
+                    MARGIN_FRACTION_CHOICES
+                        .iter()
+                        .map(|n| {
+                            markup_button(
+                                mark(current == *n, &format!("증거금 {n}%")),
+                                format!("bm:mf:{n}"),
+                            )
+                        })
+                        .collect(),
+                );
+                let stop = cfg_int(cfg, "emergency_stop_roi_percent", 0);
+                rows.push(
+                    EMERGENCY_STOP_CHOICES
+                        .iter()
+                        .map(|choice| {
+                            let label = if *choice == 0 {
+                                "비상손절 OFF".to_string()
+                            } else {
+                                format!("-{choice}%")
+                            };
+                            markup_button(mark(stop == *choice, &label), format!("bm:es:{choice}"))
+                        })
+                        .collect(),
+                );
+                rows.push(vec![
+                    markup_button(
+                        mark(stop_ma_on(cfg), "🧱 SMA25 손절"),
+                        if stop_ma_on(cfg) {
+                            "bm:stopma:off"
+                        } else {
+                            "bm:stopma:on"
+                        },
+                    ),
+                    markup_button(
+                        mark(profit_lock_on(cfg), "🔒 수익 잠금"),
+                        if profit_lock_on(cfg) {
+                            "bm:plock:off"
+                        } else {
+                            "bm:plock:on"
+                        },
+                    ),
+                ]);
+                {
+                    let on = cfg_get(cfg, "scale_in_enabled")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    rows.push(vec![markup_button(
+                        mark(on, "➕ 물타기 (추세 유지 시)"),
+                        if on {
+                            "bm:scalein:off"
+                        } else {
+                            "bm:scalein:on"
+                        },
+                    )]);
+                }
+                rows.push(vec![markup_button(
+                    format!("💰 최소 잔고: {}", min_balance_label(cfg)),
+                    "bm:minbal",
+                )]);
+                rows.push(vec![markup_button(
+                    format!("🛡 손실 한도: {}", loss_guard_label(cfg)),
+                    "bm:guard",
+                )]);
+            }
+            MenuPage::More => {
+                rows.push(vec![
+                    markup_button("🧾 최근 판단", "bm:signals"),
+                    markup_button("🔄 거래소 재대조", "bm:reconcile"),
+                ]);
+                rows.push(vec![markup_button("📘 전략 규칙", "bm:rules")]);
+            }
         }
-        let current = (py_n(cfg_get(cfg, "margin_fraction")) * 100.0).round() as i64;
-        rows.push(
-            MARGIN_FRACTION_CHOICES
-                .iter()
-                .map(|n| {
-                    markup_button(
-                        mark(current == *n, &format!("증거금 {n}%")),
-                        format!("bm:mf:{n}"),
-                    )
-                })
-                .collect(),
-        );
-        rows.push(vec![
-            markup_button("📊 상태", "bm:status"),
-            markup_button("📈 성과 통계", "bm:stats"),
-        ]);
-        rows.push(vec![
-            markup_button("🧾 최근 판단", "bm:signals"),
-            markup_button("🔄 거래소 재대조", "bm:reconcile"),
-        ]);
-        rows.push(vec![
-            markup_button("📘 전략 규칙", "bm:rules"),
-            markup_button("🔻 포지션 청산", "bm:close"),
-        ]);
+
+        if page != MenuPage::Main {
+            rows.push(vec![markup_button("↩️ 메인 메뉴", "bm:status")]);
+        }
+
         if let Some((confirm_text, confirm_cb)) = confirm {
             rows.insert(
                 0,
@@ -1816,7 +1953,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             })
             .collect();
         let mut rows: Vec<Vec<Value>> = buttons.chunks(4).map(|c| c.to_vec()).collect();
-        rows.push(vec![markup_button("↩️ 돌아가기", "bm:status")]);
+        rows.push(vec![markup_button("↩️ 돌아가기", "bm:menu:market")]);
         let _ = PICK_LIST_SIZE; // engine enforces the size
         markup(rows)
     }
@@ -1880,7 +2017,10 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 "익절 자동 전환: {}",
                 profit_lock_switch_text(cfg, Some(state))
             ),
-            format!("청산 후 다른 코인 전환: {}", rotation_text_with_exit_ma(cfg)),
+            format!(
+                "청산 후 다른 코인 전환: {}",
+                rotation_text_with_exit_ma(cfg)
+            ),
             format!(
                 "봉: {} (마감봉 기준) · SMA {fast}/{slow}",
                 timeframe_labels(cfg_str(cfg, "timeframe", ""))
@@ -2430,7 +2570,10 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             Ok(Value::String(m)) => m,
             _ => return,
         };
-        let mut state = match self.engine_call("load_state", json!({ "mode": mode })).await {
+        let mut state = match self
+            .engine_call("load_state", json!({ "mode": mode }))
+            .await
+        {
             Ok(Value::Object(m)) => m,
             _ => return,
         };
@@ -2478,7 +2621,10 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             Value::String(m) => m,
             _ => return Ok(()),
         };
-        let mut state = match self.engine_call("load_state", json!({ "mode": mode })).await? {
+        let mut state = match self
+            .engine_call("load_state", json!({ "mode": mode }))
+            .await?
+        {
             Value::Object(m) => m,
             _ => return Ok(()),
         };
@@ -2514,6 +2660,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
     // ------------------------------------------------------ action handler (ported verbatim)
 
     pub async fn handle_btc_ma_cross_action(&self, action: &str) -> (String, Value) {
+        let page = menu_page_for(action);
         if let Some(rest) = action.strip_prefix("exch:") {
             return match rest.strip_prefix("confirm:") {
                 Some(target) => self.exchange_switch(target).await,
@@ -2529,11 +2676,11 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             Ok(_) => {
                 let status = self.format_status().await;
                 let state = Value::Object(Map::new());
-                return (status, self.build_keyboard(&cfg, None, Some(&state)));
+                return (status, self.build_keyboard(&cfg, None, Some(&state), page));
             }
             Err(e) => {
                 let text = Self::engine_error_text(&e);
-                return (text, self.build_keyboard(&cfg, None, None));
+                return (text, self.build_keyboard(&cfg, None, None, page));
             }
         };
         let state = self.load_state_or_empty().await;
@@ -2541,20 +2688,20 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
 
         macro_rules! kb {
             () => {
-                self.build_keyboard(&self.config().await, None, Some(&state))
+                self.build_keyboard(&self.config().await, None, Some(&state), page)
             };
             ($confirm:expr) => {
-                self.build_keyboard(&self.config().await, Some($confirm), Some(&state))
+                self.build_keyboard(&self.config().await, Some($confirm), Some(&state), page)
             };
         }
         macro_rules! kb_owned {
             () => {{
                 let cfg_now = self.config().await;
-                self.build_keyboard(&cfg_now, None, Some(&state))
+                self.build_keyboard(&cfg_now, None, Some(&state), page)
             }};
             ($confirm:expr) => {{
                 let cfg_now = self.config().await;
-                self.build_keyboard(&cfg_now, Some($confirm), Some(&state))
+                self.build_keyboard(&cfg_now, Some($confirm), Some(&state), page)
             }};
         }
 
@@ -2660,7 +2807,9 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 let (fast_name, slow_name) = sma_names(&cfg);
                 let (exit_on, exit_period) = exit_ma_setting(&cfg);
                 let exit_basis = if exit_on {
-                    format!("· {fast_name}/SMA{exit_period} 청산 MA 크로스 → 청산 (반대 진입 없음)\n")
+                    format!(
+                        "· {fast_name}/SMA{exit_period} 청산 MA 크로스 → 청산 (반대 진입 없음)\n"
+                    )
                 } else {
                     format!("· {fast_name}/{slow_name} 반대 크로스 → 청산 후 반대 진입\n")
                 };
@@ -2694,7 +2843,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 let cfg_now = self.config().await;
                 (
                     format!("{text}\n\n{status}"),
-                    self.build_keyboard(&cfg_now, None, Some(&state_now)),
+                    self.build_keyboard(&cfg_now, None, Some(&state_now), page),
                 )
             }
             "reentry_clear" => {
@@ -2720,14 +2869,17 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 let cfg_now = self.config().await;
                 (
                     format!("{text}\n\n{status}"),
-                    self.build_keyboard(&cfg_now, None, Some(&state_now)),
+                    self.build_keyboard(&cfg_now, None, Some(&state_now), page),
                 )
             }
             "confirm_full_off" => {
                 let text = self.full_off().await;
                 let state_now = self.load_state_or_empty().await;
                 let cfg_now = self.config().await;
-                (text, self.build_keyboard(&cfg_now, None, Some(&state_now)))
+                (
+                    text,
+                    self.build_keyboard(&cfg_now, None, Some(&state_now), page),
+                )
             }
             a if starts_with_any(a, &["mode:", "tf:"]) && holding => (
                 "⚠️ 포지션 보유 중에는 모드/봉을 바꿀 수 없습니다. 먼저 정리하세요.".to_string(),
@@ -2798,7 +2950,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 let rows = vec![
                     daily_row,
                     streak_row,
-                    vec![markup_button("↩️ 돌아가기", "bm:status")],
+                    vec![markup_button("↩️ 돌아가기", "bm:menu:risk")],
                 ];
                 (
                     format!(
@@ -2849,7 +3001,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                     })
                     .collect();
                 let mut rows: Vec<Vec<Value>> = buttons.chunks(3).map(|c| c.to_vec()).collect();
-                rows.push(vec![markup_button("↩️ 돌아가기", "bm:status")]);
+                rows.push(vec![markup_button("↩️ 돌아가기", "bm:menu:risk")]);
                 (
                     format!(
                         "💰 최소 잔고를 고르세요.\n\
@@ -3376,7 +3528,9 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             "confirm_close" => {
                 // Python clears a waiting re-entry before asking for the close.
                 if let Err(e) = self.clear_reentry_if_blocked().await {
-                    log_line(&format!("telegram: confirm_close reentry clear failed: {e}"));
+                    log_line(&format!(
+                        "telegram: confirm_close reentry clear failed: {e}"
+                    ));
                 }
                 let result = match self
                     .engine_call("close_position", json!({ "reason": "manual" }))
@@ -3439,9 +3593,9 @@ pub(crate) fn unknown_command_note(command: &str) -> Option<&'static str> {
         // opened the exchange/network switch at the end), and the rest were
         // its entries. tbot has no settings menu; everything is a button.
         "status" | "state" => Some("상태는 /btcmacross (또는 /macross) 화면에서 확인하세요."),
-        "resume" | "pause" | "unpause" => Some(
-            "정지/재개는 /stop 다음에 /btcmacross 메뉴의 버튼으로 하세요.",
-        ),
+        "resume" | "pause" | "unpause" => {
+            Some("정지/재개는 /stop 다음에 /btcmacross 메뉴의 버튼으로 하세요.")
+        }
         _ => None,
     }
 }
@@ -3455,8 +3609,10 @@ pub fn parse_exit_ma_command(args: &[String]) -> Result<(bool, i64), String> {
         .filter(|a| !a.is_empty())
         .collect();
     // "/btcma exit 25" passes the leading keyword through; it is not a value.
-    while matches!(tokens.first().map(|s| s.as_str()), Some("exit" | "xma" | "exitma" | "청산"))
-    {
+    while matches!(
+        tokens.first().map(|s| s.as_str()),
+        Some("exit" | "xma" | "exitma" | "청산")
+    ) {
         tokens.remove(0);
     }
     let Some(head) = tokens.first().cloned() else {

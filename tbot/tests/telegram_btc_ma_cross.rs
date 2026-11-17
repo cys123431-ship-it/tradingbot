@@ -312,10 +312,12 @@ async fn telegram_menu_timeframe_emergency_stop_and_exclusivity() {
     let ctx = controller(&tmp);
     let (text, markup) = press(&ctx, "status").await;
     assert!(text.contains("3/200 SMA") && text.contains("/exchange"));
-    let cbs = callbacks(&markup);
+    let _ = markup;
+    let cbs = callbacks(&press(&ctx, "menu:sma").await.1);
     for tf in ["15m", "30m", "1h", "2h", "4h"] {
         assert!(cbs.contains(&format!("bm:tf:{tf}")));
     }
+    let cbs = callbacks(&press(&ctx, "menu:risk").await.1);
     for choice in [0, 10, 20, 30, 50] {
         assert!(cbs.contains(&format!("bm:es:{choice}")));
     }
@@ -359,7 +361,8 @@ async fn sma_buttons_and_header() {
     let tmp = common::temp_dir("tg_sma");
     let ctx = controller(&tmp);
     let (text, markup) = press(&ctx, "status").await;
-    let cbs = callbacks(&markup);
+    let _ = markup;
+    let cbs = callbacks(&press(&ctx, "menu:sma").await.1);
     assert!(cbs.contains(&"bm:sma:3:200".to_string()));
     assert!(cbs.contains(&"bm:sma:3:120".to_string()));
     assert!(cbs.contains(&"bm:sma:1:200".to_string()));
@@ -437,7 +440,7 @@ async fn large_slow_period_lifts_candle_history() {
 async fn timeframe_buttons_include_3m_and_5m() {
     let tmp = common::temp_dir("tg_tf");
     let ctx = controller(&tmp);
-    let cbs = callbacks(&press(&ctx, "status").await.1);
+    let cbs = callbacks(&press(&ctx, "menu:sma").await.1);
     for tf in ["3m", "5m", "15m", "30m", "1h", "2h", "4h"] {
         assert!(cbs.contains(&format!("bm:tf:{tf}")));
     }
@@ -451,7 +454,7 @@ async fn timeframe_buttons_include_3m_and_5m() {
 async fn coin_pick_buttons() {
     let tmp = common::temp_dir("tg_coin_pick");
     let ctx = single_controller(&tmp);
-    assert!(callbacks(&ctx.press("status").await.1).contains(&"bm:pick".to_string()));
+    assert!(callbacks(&ctx.press("menu:market").await.1).contains(&"bm:pick".to_string()));
     let (text, markup) = ctx.press("pick").await;
     let picks = callbacks(&markup);
     assert!(text.contains("/macoin"), "{text}");
@@ -517,7 +520,8 @@ async fn telegram_switch_button_toggles_and_shows_the_count() {
     let tmp = common::temp_dir("tg_pls_btn");
     let ctx = controller(&tmp);
     let (text, markup) = press(&ctx, "status").await;
-    let buttons = labeled(&markup);
+    let _ = markup;
+    let buttons = labeled(&press(&ctx, "menu:entry").await.1);
     assert!(buttons.iter().any(|(label, data)| data == "bm:pls:off"
         && label.starts_with("🔁")
         && label.contains("ON (0/3)")));
@@ -544,7 +548,7 @@ async fn telegram_switch_button_toggles_and_shows_the_count() {
 async fn leverage_button_saves_and_applies_from_the_next_entry() {
     let tmp = common::temp_dir("tg_lev");
     let ctx = controller(&tmp);
-    let (_, markup) = press(&ctx, "status").await;
+    let (_, markup) = press(&ctx, "menu:risk").await;
     let cbs = callbacks(&markup);
     for lev in [2, 3, 4, 5] {
         assert!(cbs.contains(&format!("bm:lev:{lev}")));
@@ -659,7 +663,10 @@ async fn unknown_command_replies_instead_of_silence() {
     let tbot::app::telegram_bot::Outgoing::Send { text, .. } = &out[0] else {
         panic!("expected a Send reply");
     };
-    assert!(text.contains("/nosuchcmd"), "reply names the command: {text}");
+    assert!(
+        text.contains("/nosuchcmd"),
+        "reply names the command: {text}"
+    );
     assert!(text.contains("/help"), "reply points elsewhere: {text}");
 }
 
@@ -667,7 +674,8 @@ async fn unknown_command_replies_instead_of_silence() {
 async fn unknown_command_without_note_still_answers() {
     let tmp = common::temp_dir("tg_unknown_cmd2");
     let ctx = controller(&tmp);
-    let msg = json!({"update_id": 1, "message": {"chat": {"id": 1}, "text": "/nonsense@YosebiBot"}});
+    let msg =
+        json!({"update_id": 1, "message": {"chat": {"id": 1}, "text": "/nonsense@YosebiBot"}});
     let out = ctx.bot.handle_update(&msg).await;
     assert_eq!(out.len(), 1);
     let tbot::app::telegram_bot::Outgoing::Send { text, .. } = &out[0] else {
@@ -754,7 +762,7 @@ async fn full_off_warns_about_a_position_in_the_other_mode() {
 async fn lookback_button_toggles_two_bar_cross_entries() {
     let tmp = common::temp_dir("bm_lookback");
     let ctx = controller(&tmp);
-    let (_, markup) = press(&ctx, "status").await;
+    let (_, markup) = press(&ctx, "menu:entry").await;
     assert!(callbacks(&markup).contains(&"bm:lb:2".to_string()));
 
     let (text, markup) = press(&ctx, "lb:2").await;
@@ -776,7 +784,7 @@ async fn lookback_button_toggles_two_bar_cross_entries() {
 async fn all_coins_scope_button_is_separate_from_top_alts() {
     let tmp = common::temp_dir("bm_scope_all");
     let ctx = controller(&tmp);
-    let (_, markup) = press(&ctx, "status").await;
+    let (_, markup) = press(&ctx, "menu:market").await;
     let cbs = callbacks(&markup);
     assert!(cbs.contains(&"bm:scope:all".to_string()));
     assert!(cbs.contains(&"bm:scope:alts".to_string()));
@@ -795,7 +803,7 @@ async fn all_coins_scope_button_is_separate_from_top_alts() {
 async fn minimum_balance_submenu_sets_the_threshold() {
     let tmp = common::temp_dir("bm_min_balance");
     let ctx = controller(&tmp);
-    let (_, markup) = press(&ctx, "status").await;
+    let (_, markup) = press(&ctx, "menu:risk").await;
     assert!(callbacks(&markup).contains(&"bm:minbal".to_string()));
 
     let (text, markup) = press(&ctx, "minbal").await;
@@ -804,7 +812,7 @@ async fn minimum_balance_submenu_sets_the_threshold() {
     for n in [0, 60, 70, 80, 90, 100] {
         assert!(cbs.contains(&format!("bm:minbal:{n}")), "{cbs:?}");
     }
-    assert!(cbs.contains(&"bm:status".to_string()));
+    assert!(cbs.contains(&"bm:menu:risk".to_string()));
 
     let (text, _) = press(&ctx, "minbal:70").await;
     assert_eq!(ctx.section()["min_balance_usdt"], json!(70));
@@ -822,7 +830,7 @@ async fn minimum_balance_submenu_sets_the_threshold() {
 async fn loss_guard_submenu_sets_both_limits() {
     let tmp = common::temp_dir("bm_loss_guard");
     let ctx = controller(&tmp);
-    let (_, markup) = press(&ctx, "status").await;
+    let (_, markup) = press(&ctx, "menu:risk").await;
     assert!(callbacks(&markup).contains(&"bm:guard".to_string()));
 
     let (text, markup) = press(&ctx, "guard").await;
@@ -906,7 +914,7 @@ async fn adopt_button_only_in_live_and_refuses_without_a_position() {
 async fn stop_lock_and_margin_buttons_save_the_config() {
     let tmp = common::temp_dir("tg_stoplockmf");
     let ctx = controller(&tmp);
-    let (_, markup) = press(&ctx, "status").await;
+    let (_, markup) = press(&ctx, "menu:risk").await;
     let cbs = callbacks(&markup);
     for cb in [
         "bm:stopma:off",
@@ -944,7 +952,7 @@ async fn stop_lock_and_margin_buttons_save_the_config() {
 async fn scale_in_button_toggles() {
     let tmp = common::temp_dir("tg_scalein");
     let ctx = controller(&tmp);
-    let (_, markup) = press(&ctx, "status").await;
+    let (_, markup) = press(&ctx, "menu:risk").await;
     let cbs = callbacks(&markup);
     assert!(cbs.contains(&"bm:scalein:on".to_string()));
 
@@ -966,6 +974,7 @@ async fn exit_ma_buttons_and_command() {
     let ctx = controller(&tmp);
 
     let (text, markup) = press(&ctx, "status").await;
+    let markup = press(&ctx, "menu:entry").await.1;
     let cbs = callbacks(&markup);
     assert!(cbs.contains(&"bm:xma:on".to_string()), "{cbs:?}");
     assert!(cbs.contains(&"bm:xmap:25".to_string()), "{cbs:?}");
@@ -1044,13 +1053,19 @@ async fn exit_ma_column_in_status_and_rules() {
     let rules = press(&ctx, "rules").await.0;
     assert!(rules.contains("추가 청산 MA: ON"), "{rules}");
     assert!(rules.contains("반대 진입 없음"), "{rules}");
-    assert!(rules.contains("청산 MA ON: 청산 MA 크로스와 반대 크로스"), "{rules}");
+    assert!(
+        rules.contains("청산 MA ON: 청산 MA 크로스와 반대 크로스"),
+        "{rules}"
+    );
     assert!(rules.contains("크로스 마감 진입만"), "{rules}");
 
     press(&ctx, "xma:off").await;
     let rules = press(&ctx, "rules").await.0;
     assert!(rules.contains("추가 청산 MA: OFF"), "{rules}");
-    assert!(rules.contains("시장가 청산 후 즉시 반대 방향 진입"), "{rules}");
+    assert!(
+        rules.contains("시장가 청산 후 즉시 반대 방향 진입"),
+        "{rules}"
+    );
     assert!(!rules.contains("청산 MA ON:"), "{rules}");
 }
 
@@ -1115,7 +1130,10 @@ async fn btcma_exit_command_sets_and_rejects() {
     let tmp = common::temp_dir("tg_exitma_cmd");
     let ctx = controller(&tmp);
 
-    let outs = ctx.bot.handle_update(&json!({"message": {"chat": {"id": 1}, "text": "/btcma exit 25"}})).await;
+    let outs = ctx
+        .bot
+        .handle_update(&json!({"message": {"chat": {"id": 1}, "text": "/btcma exit 25"}}))
+        .await;
     let tbot::app::telegram_bot::Outgoing::Send { text, markup, .. } = &outs[0] else {
         panic!("unexpected {outs:?}");
     };
@@ -1129,7 +1147,10 @@ async fn btcma_exit_command_sets_and_rejects() {
     assert_eq!(normalized_cfg(&ctx).await["exit_ma_period"], json!(69));
 
     // A bad value answers with the reason and leaves the config alone.
-    let outs = ctx.bot.handle_update(&json!({"message": {"chat": {"id": 1}, "text": "/btcma exit 1"}})).await;
+    let outs = ctx
+        .bot
+        .handle_update(&json!({"message": {"chat": {"id": 1}, "text": "/btcma exit 1"}}))
+        .await;
     let tbot::app::telegram_bot::Outgoing::Send { text, .. } = &outs[0] else {
         panic!("unexpected {outs:?}");
     };
@@ -1229,4 +1250,25 @@ async fn normalized_cfg(ctx: &Ctx) -> Value {
         .call("config_get", Some("btc_ma"), json!({}))
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn main_menu_is_short_and_sub_pages_lead_back() {
+    let tmp = common::temp_dir("tg_menu_pages");
+    let ctx = controller(&tmp);
+    let (_, markup) = press(&ctx, "status").await;
+    let rows = markup["inline_keyboard"].as_array().unwrap().len();
+    assert!(rows <= 6, "main menu has {rows} rows");
+    let cbs = callbacks(&markup);
+    for page in ["market", "entry", "sma", "risk", "more"] {
+        assert!(cbs.contains(&format!("bm:menu:{page}")), "{page} missing");
+        let sub = callbacks(&press(&ctx, &format!("menu:{page}")).await.1);
+        assert_eq!(sub.last().map(String::as_str), Some("bm:status"), "{page}");
+    }
+    // a setting change keeps the user on the page of that setting
+    assert!(callbacks(&press(&ctx, "lev:3").await.1).contains(&"bm:lev:4".to_string()));
+    assert!(callbacks(&press(&ctx, "tf:1h").await.1).contains(&"bm:tf:4h".to_string()));
+    // sub screens go back to their page
+    assert!(callbacks(&press(&ctx, "guard").await.1).contains(&"bm:menu:risk".to_string()));
+    assert!(callbacks(&press(&ctx, "minbal").await.1).contains(&"bm:menu:risk".to_string()));
 }
