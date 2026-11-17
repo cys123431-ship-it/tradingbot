@@ -42,7 +42,11 @@
   .c6 { grid-column: span 6; }
   .c3 { grid-column: span 3; }
   .c12 { grid-column: span 12; }
+  .r7 { grid-row: span 7; }
+  .r6 { grid-row: span 6; }
+  .r5 { grid-row: span 5; }
   .r4 { grid-row: span 4; }
+  .r3 { grid-row: span 3; }
   .r2 { grid-row: span 2; }
   .r1 { grid-row: span 1; }
 
@@ -51,7 +55,7 @@
   .tile.name .wordmark {
     font-family: var(--font-display);
     font-weight: 600;
-    font-size: var(--size-display);
+    font-size: 60px;
     letter-spacing: -0.04em;
     line-height: 0.95;
     color: var(--bg);
@@ -66,24 +70,24 @@
   .metric .num {
     font-family: var(--font-display);
     font-weight: 600;
-    font-size: 56px;
+    font-size: 40px;
     line-height: 1;
     letter-spacing: -0.03em;
     color: var(--ink);
     white-space: nowrap;
   }
-  .metric .num.sm { font-size: 44px; }
-  .metric .lbl { font-size: var(--size-small); color: var(--muted); margin-top: var(--space-2); }
+  .metric .num.sm { font-size: 32px; }
+  .metric .lbl { font-size: 12.5px; color: var(--muted); margin-top: var(--space-1); }
   .metric .sub { font-size: var(--size-small); color: var(--muted); margin-top: auto; }
-  .metric .note { font-size: var(--size-small); color: var(--ink); margin-top: auto; line-height: 1.4; }
-  .tile.statement .reading { margin-top: var(--space-3); font-size: 14px; line-height: 1.55; color: var(--muted); max-width: 52ch; }
+  .metric .note { font-size: 12.5px; color: var(--ink); margin-top: auto; line-height: 1.35; }
+  .tile.statement .reading { margin-top: var(--space-2); font-size: 13px; line-height: 1.5; color: var(--muted); max-width: 52ch; }
   .tile.statement .reading div + div { margin-top: var(--space-1); }
   .tile.statement .reading strong { color: var(--ink); font-weight: 600; }
 
   /* statement */
   .gauges { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-3); }
   .gauge { display: flex; flex-direction: column; align-items: center; text-align: center; min-width: 0; }
-  .gauge svg { width: 100%; max-width: 190px; height: auto; display: block; }
+  .gauge svg { width: 100%; max-width: 160px; height: auto; display: block; }
   .g-title { font-size: var(--size-small); color: var(--muted); }
   .g-label { font-family: var(--font-display); font-weight: 600; font-size: 26px; letter-spacing: -0.02em; line-height: 1.15; color: var(--ink); }
   .g-label[data-tone="down"] { color: var(--x-down); }
@@ -94,9 +98,9 @@
   .g-counts span { display: flex; flex-direction: column; align-items: center; }
   .g-counts em { font-style: normal; font-size: 12px; color: var(--muted); }
   .g-counts b { font-size: 18px; font-weight: 600; color: var(--ink); line-height: 1.2; }
-  .sig { position: absolute; top: 14px; right: 14px; display: flex; flex-direction: column; align-items: center; font-size: 14px; font-weight: 600; line-height: 1.2; }
+  .sig { position: absolute; top: 10px; right: 12px; display: flex; flex-direction: column; align-items: center; font-size: 14px; font-weight: 600; line-height: 1.2; }
   .sig[hidden] { display: none; }
-  .sig svg { width: 60px; height: auto; display: block; }
+  .sig svg { width: 52px; height: auto; display: block; }
   .sig span { color: var(--muted); }
   .sig span[data-tone="down"] { color: var(--x-down); }
   .sig span[data-tone="up"] { color: var(--x-up); }
@@ -125,6 +129,31 @@
   }
   .selector button[aria-pressed="true"] .ed { color: var(--ink); }
 
+  /* technical rating */
+  .c4 { grid-column: span 4; }
+  .tile[hidden] { display: none; }
+  .tile.tech-head { flex-direction: row; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: var(--space-2); padding-top: 10px; padding-bottom: 10px; }
+  .tile.tech-head h2 { margin: 0; }
+  .tf-tabs { display: flex; gap: 2px; background: var(--bg); border-radius: var(--radius); padding: 3px; }
+  .tf-tabs button { background: none; border: none; border-radius: 6px; padding: 5px 12px; font-family: var(--font-body); font-size: var(--size-small); color: var(--muted); cursor: pointer; }
+  .tf-tabs button[aria-pressed="true"] { background: var(--ink); color: var(--bg); font-weight: 600; }
+  .tg-row { display: grid; grid-template-columns: 1fr 1.25fr 1fr; gap: var(--space-3); align-items: center; }
+  .tg.main svg { max-width: 200px; }
+  #gaugeDir svg, #gaugeVol svg { max-width: 210px; }
+  .tile.statement .gauges { margin-top: var(--space-2); }
+  .tg.main .g-label { font-size: 30px; }
+  .tech-line { margin-top: var(--space-2); text-align: center; font-size: 14px; color: var(--ink); }
+  .tech-table table { font-size: 12.5px; }
+  .tech-table th, .tech-table td { padding: 3px 6px; }
+  .tech-table tbody tr + tr td { border-top: 1px solid var(--line); }
+  td.act { font-weight: 600; color: var(--muted); }
+  td.act[data-tone="down"] { color: var(--x-down); }
+  td.act[data-tone="up"] { color: var(--x-up); }
+  #techPiv tr.pivot-p td { font-weight: 600; }
+  #techMatrix tr.total td { font-weight: 600; border-top: 1px solid var(--ink); }
+  .tech-read { font-size: 14px; line-height: 1.6; color: var(--muted); }
+  .tech-read .lead { font-family: var(--font-display); font-size: 22px; font-weight: 600; color: var(--ink); margin-bottom: var(--space-1); }
+
   /* tables */
   .tables { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-3); margin-top: var(--space-2); }
   .tables h3 {
@@ -135,8 +164,8 @@
     margin-bottom: var(--space-2);
   }
   .tables .side { min-width: 0; overflow-x: auto; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: right; padding: 4px 6px; font-weight: 400; white-space: nowrap; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: right; padding: 3px 6px; font-weight: 400; white-space: nowrap; }
   th:first-child, td:first-child { text-align: left; }
   thead th { color: var(--muted); font-weight: 400; border-bottom: 1px solid var(--line); padding-bottom: 6px; }
   tbody td { color: var(--ink); }
@@ -218,9 +247,9 @@
   .neg { font-variant-numeric: tabular-nums; }
 
   @media (min-width: 760px) and (max-width: 1199px) {
-    .tile.name .wordmark { font-size: clamp(48px, 6.4vw, var(--size-display)); }
-    .metric .num { font-size: clamp(30px, 4.2vw, 56px); }
-    .metric .num.sm { font-size: clamp(26px, 3.4vw, 44px); }
+    .tile.name .wordmark { font-size: clamp(40px, 5vw, 60px); }
+    .metric .num { font-size: clamp(26px, 3.2vw, 40px); }
+    .metric .num.sm { font-size: clamp(22px, 2.7vw, 32px); }
     .g-label { font-size: 22px; }
     .sig { position: static; flex-direction: row; gap: 6px; align-self: flex-start; margin-bottom: 4px; font-size: 13px; }
     .sig svg { width: 36px; }
@@ -241,6 +270,12 @@
     .g-counts { gap: var(--space-2); padding: 4px 8px; }
     .tile.name .wordmark { font-size: clamp(48px, 15vw, var(--size-display)); }
     .tables { grid-template-columns: 1fr; }
+    .c4 { grid-column: span 2; }
+    .tile.tech-gauges, .tile.tech-table { grid-row: auto; }
+    .tg-row { grid-template-columns: 1fr 1fr; }
+    .tg.main { grid-column: span 2; grid-row: 1; }
+    .tf-tabs { width: 100%; justify-content: space-between; }
+    .tf-tabs button { padding: 5px 6px; }
     .tile.statement { grid-row: span 4; }
     .tile.name { grid-row: span 2; }
     .tile.metric { grid-row: auto; min-height: 128px; }
@@ -272,7 +307,7 @@
   </div>
 
   <!-- 2. statement 6x4 + 4 metric tiles -->
-  <div class="tile statement c6 r4">
+  <div class="tile statement c6 r6">
     <div class="gauges">
       <div class="gauge" id="gaugeDir"><div class="g-title">방향</div><div class="g-label">불러오는 중…</div></div>
       <div class="gauge" id="gaugeVol"><div class="g-title">변동성</div><div class="g-label">불러오는 중…</div></div>
@@ -302,7 +337,7 @@
   <div class="tile metric c3 r2">
     <div class="sig" id="sigPcr" hidden></div>
     <div class="num sm" id="pcrNum">불러오는 중…</div>
-    <div class="lbl">풋/콜 OI</div>
+    <div class="lbl">풋/콜 OI · 콜 <span id="callOiNum">—</span> · 풋 <span id="putOiNum">—</span> BTC</div>
     <div class="note" id="notePcr"></div>
   </div>
 
@@ -319,13 +354,38 @@
     <div class="lbl">25Δ 스큐 (풋 − 콜, %p)</div>
     <div class="note" id="noteSkew"></div>
   </div>
-  <div class="tile metric c3 r2">
-    <div class="num sm" id="callOiNum">불러오는 중…</div>
-    <div class="lbl">콜 OI 합 (BTC)</div>
+  <!-- 3b. technical rating (Binance candles) -->
+  <div class="tile tech-head c12">
+    <h2>BTC 기술적 분석 <span class="hint" id="techHint">바이낸스 BTCUSDT 무기한 · 불러오는 중…</span></h2>
+    <div class="tf-tabs" id="tfTabs" role="group" aria-label="시간 단위"></div>
   </div>
-  <div class="tile metric c3 r2">
-    <div class="num sm" id="putOiNum">불러오는 중…</div>
-    <div class="lbl">풋 OI 합 (BTC)</div>
+  <div class="tile tech-gauges c12 r4">
+    <div class="tg-row">
+      <div class="gauge tg" id="tgOsc"></div>
+      <div class="gauge tg main" id="tgSum"></div>
+      <div class="gauge tg" id="tgMa"></div>
+    </div>
+    <div class="tech-line" id="techLine"></div>
+  </div>
+  <div class="tile tech-table c4 r7" id="techOscTile">
+    <h2>오실레이터</h2>
+    <table id="techOsc"><thead></thead><tbody></tbody></table>
+  </div>
+  <div class="tile tech-table c4 r7" id="techMaTile">
+    <h2>이동평균</h2>
+    <table id="techMa"><thead></thead><tbody></tbody></table>
+  </div>
+  <div class="tile tech-table c4 r7" id="techPivTile">
+    <h2>피벗 <span class="hint" id="pivHint"></span></h2>
+    <table id="techPiv"><thead></thead><tbody></tbody></table>
+  </div>
+  <div class="tile tech-table c6 r4" id="techMatrixTile" hidden>
+    <h2>시간대별 등급</h2>
+    <table id="techMatrix"><thead></thead><tbody></tbody></table>
+  </div>
+  <div class="tile c6 r4" id="techReadTile" hidden>
+    <h2>시간 통합 해석</h2>
+    <div class="tech-read" id="techRead"></div>
   </div>
 
   <!-- 4. tables -->
@@ -1072,6 +1132,8 @@
     return out;
   }
 
+  window.BoardGauge = gaugeSvg;
+
   function renderGauge(id, t, kind) {
     var el = document.getElementById(id);
     if (!el) return;
@@ -1471,5 +1533,7 @@
   init();
 })();
 </script>
+<script src="ta.js"></script>
+<script src="tech.js"></script>
 </body>
 </html>

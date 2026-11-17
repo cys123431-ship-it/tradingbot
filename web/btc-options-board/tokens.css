@@ -31,10 +31,10 @@
   --border-width: 1px;
   --shadow: none;
   /* 추가 */
-  --x-gap: 8px;
-  --x-margin: 12px;
-  --x-tile-pad: 22px;
-  --x-row: 92px;
+  --x-gap: 6px;
+  --x-margin: 8px;
+  --x-tile-pad: 14px;
+  --x-row: 66px;
   /* 판정 색 (하방·상방·변동성 축소·확대) */
   --x-down: #d63c3c;
   --x-up: #1a4be0;
