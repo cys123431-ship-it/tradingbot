@@ -201,6 +201,12 @@
 
   .neg { font-variant-numeric: tabular-nums; }
 
+  @media (min-width: 760px) and (max-width: 1199px) {
+    .tile.name .wordmark { font-size: clamp(48px, 6.4vw, var(--size-display)); }
+    .metric .num { font-size: clamp(30px, 4.2vw, 56px); }
+    .metric .num.sm { font-size: clamp(26px, 3.4vw, 44px); }
+    .tile.statement p { font-size: clamp(24px, 2.8vw, 34px); }
+  }
   @media (max-width: 759px) {
     .board { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-auto-rows: auto; }
     .tile { min-height: calc(var(--x-row) * 2 + var(--x-gap)); }
@@ -275,11 +281,11 @@
   </div>
   <div class="tile metric c3 r2">
     <div class="num sm" id="callOiNum">불러오는 중…</div>
-    <div class="lbl">콜 OI 합</div>
+    <div class="lbl">콜 OI 합 (BTC)</div>
   </div>
   <div class="tile metric c3 r2">
     <div class="num sm" id="putOiNum">불러오는 중…</div>
-    <div class="lbl">풋 OI 합</div>
+    <div class="lbl">풋 OI 합 (BTC)</div>
   </div>
 
   <!-- 4. tables -->
@@ -407,10 +413,6 @@
     var sign = n < 0 ? '−' : '+';
     var v = Math.abs(n) / 1e6;
     return sign + '$' + v.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + 'M';
-  }
-  function fmtBtc(n) {
-    if (n === null || n === undefined || !isFinite(n)) return '—';
-    return fmtInt(n) + ' BTC';
   }
   function fmtPct2(n) {
     if (n === null || n === undefined || !isFinite(n)) return '—';
@@ -741,8 +743,8 @@
     setText('flipNum', m.flip === null || m.flip === undefined ? '범위 밖' : fmtUsd(m.flip));
     setText('gexNum', m.gex === null ? '—' : fmtMillions(m.gex));
     setText('pcrNum', m.pcr === null ? '—' : m.pcr.toFixed(2));
-    setText('callOiNum', m.callOi ? fmtBtc(m.callOi) : '0 BTC');
-    setText('putOiNum', m.putOi ? fmtBtc(m.putOi) : '0 BTC');
+    setText('callOiNum', fmtInt(m.callOi || 0));
+    setText('putOiNum', fmtInt(m.putOi || 0));
     setText('skewNum', m.skew === null || m.skew === undefined ? '-' : fmtSignedNum(m.skew, 2) + '%p');
 
     // dvol

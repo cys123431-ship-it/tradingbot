@@ -11,7 +11,11 @@
 - 계산식은 봇의 `tbot/src/core/options_micro.rs`와 같습니다(텔레그램 `/btcmacross` → 🧰 기타 → 🧮 BTC 옵션 지표).
 - 참고용 정보이며 매매 신호가 아닙니다.
 
-## 보기
+## 주소
+
+https://btc-options-board.btc-options-board.workers.dev
+
+## 로컬에서 보기
 
 `index.html`을 브라우저로 열면 바로 동작합니다(같은 폴더의 `tokens.css` 필요).
 
