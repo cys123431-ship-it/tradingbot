@@ -1425,7 +1425,12 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         signal: Option<&Value>,
     ) -> Option<Value> {
         let signal = signal?;
-        if signal.is_null() || !cfg.get("exit_ma_enabled").map(value_truthy).unwrap_or(false) {
+        if signal.is_null()
+            || !cfg
+                .get("exit_ma_enabled")
+                .map(value_truthy)
+                .unwrap_or(false)
+        {
             return None;
         }
         let trade_side = trade.get("side").and_then(|v| v.as_str()).unwrap_or("");
@@ -1482,7 +1487,10 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         }
         let trade_side = trade.get("side").and_then(|v| v.as_str()).unwrap_or("");
         let sig_side = signal.get("side").and_then(|v| v.as_str()).unwrap_or("");
-        let exit_on = cfg.get("exit_ma_enabled").map(value_truthy).unwrap_or(false);
+        let exit_on = cfg
+            .get("exit_ma_enabled")
+            .map(value_truthy)
+            .unwrap_or(false);
         if !sig_side.is_empty() && sig_side != trade_side {
             if exit_on {
                 // Custom exit ON: a cross exit closes only (CROSS_EXIT); the
@@ -1630,7 +1638,11 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         if let Some(late) = self.late_cross_signal(cfg, state, result) {
             return Some(late);
         }
-        if cfg.get("exit_ma_enabled").map(value_truthy).unwrap_or(false) {
+        if cfg
+            .get("exit_ma_enabled")
+            .map(value_truthy)
+            .unwrap_or(false)
+        {
             // Only the original SMA(fast)/SMA(slow) cross may open a position.
             let has_trend = result
                 .get("trend_side")
@@ -2693,7 +2705,10 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             "fast_period".to_string(),
             cfg.get("fast_period").cloned().unwrap_or(Value::Null),
         );
-        let exit_enabled = cfg.get("exit_ma_enabled").map(value_truthy).unwrap_or(false);
+        let exit_enabled = cfg
+            .get("exit_ma_enabled")
+            .map(value_truthy)
+            .unwrap_or(false);
         trade.insert("exit_ma_enabled".to_string(), Value::Bool(exit_enabled));
         trade.insert(
             "exit_ma_period".to_string(),
@@ -2705,10 +2720,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         );
         trade.insert(
             "custom_exit_kind".to_string(),
-            signal
-                .get("exit_kind")
-                .cloned()
-                .unwrap_or(Value::Null),
+            signal.get("exit_kind").cloned().unwrap_or(Value::Null),
         );
         trade.insert(
             "tick_size".to_string(),

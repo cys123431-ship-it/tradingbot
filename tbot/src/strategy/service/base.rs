@@ -29,7 +29,6 @@ pub const BINANCE_TESTNET: &str = "binance_testnet";
 pub const BINANCE_MAINNET: &str = "binance_mainnet";
 pub const UPBIT_MODE: &str = "upbit";
 
-
 impl<E: FuturesExchange + 'static> SmaCrossService<E> {
     // ------------------------------------------------------------------ basics
 

@@ -9,9 +9,9 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use tbot::app::config_file::{dump_indent4, ConfigFile};
+use tbot::app::engine::Engine;
 #[allow(unused_imports)]
 use tbot::app::ipc::EngineApi;
-use tbot::app::engine::Engine;
 use tbot::app::telegram_api::TelegramApi;
 use tbot::app::telegram_bot::TelegramBot;
 
@@ -61,7 +61,11 @@ fn buttons(markup: &Value) -> Vec<String> {
         .map(|rows| {
             rows.iter()
                 .flat_map(|r| r.as_array().cloned().unwrap_or_default())
-                .filter_map(|b| b.get("callback_data").and_then(|v| v.as_str()).map(String::from))
+                .filter_map(|b| {
+                    b.get("callback_data")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -81,10 +85,8 @@ async fn controller(tmp_path: &Path, api: Value) -> Ctx {
 
 async fn controller_with(tmp_path: &Path, api: Value, live: bool) -> Ctx {
     use tbot::store::clock::SystemClock;
-    use tbot::strategy::service::{
-        BoxFut, SmaCrossService, Variant,
-    };
     use tbot::strategy::service::ServiceDeps;
+    use tbot::strategy::service::{BoxFut, SmaCrossService, Variant};
 
     let cfg_path = tmp_path.join("config.json");
     write_cfg(
@@ -235,7 +237,10 @@ async fn an_open_position_blocks_the_switch() {
     let ctx = controller_with(&tmp, testnet_api(), true).await;
     // A live entry on the fake exchange leaves a real position open.
     let seen = ctx.fake.with_state(|s| s.position.clone());
-    assert!(seen.is_some(), "the harness cycle must open a position: {seen:?}");
+    assert!(
+        seen.is_some(),
+        "the harness cycle must open a position: {seen:?}"
+    );
     let (preview, markup) = ctx.press("bm:exch:mainnet").await;
     assert!(preview.contains("보유 포지션"), "{preview}");
     assert!(

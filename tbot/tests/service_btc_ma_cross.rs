@@ -1400,8 +1400,8 @@ async fn scale_in_also_applies_in_dry_run() {
 
 // ------------------------------------------------------- custom exit MA (추가 청산)
 
-use tbot::core::sma_cross::{evaluate_cross, CrossConfig};
 use tbot::core::candles::Candle;
+use tbot::core::sma_cross::{evaluate_cross, CrossConfig};
 
 /// 160 flat closes then `tail` closes: SMA25 turns with the tail while
 /// SMA25/120 stay flat, so the exit line can be steered on its own.
@@ -1525,10 +1525,7 @@ fn exit_line_turns_with_the_fast_line() {
     let down_rows = ramp_rows(84_000.0, 25.0, &down_tail);
     let down = exit_state(&down_rows, &cfg);
     assert!(down["sma_exit"].as_f64().is_some(), "{down}");
-    assert!(
-        down["sma_exit"].as_f64().unwrap() < 84_000.0,
-        "{down}"
-    );
+    assert!(down["sma_exit"].as_f64().unwrap() < 84_000.0, "{down}");
 }
 
 #[tokio::test]
@@ -1537,7 +1534,11 @@ async fn exit_line_closes_the_long_without_reversing() {
     // line falls through the 85,000 exit line.
     let mut tail = vec![85_000.0; 30];
     tail.extend(std::iter::repeat_n(83_000.0, 15));
-    let h = exit_harness("exit_close_long", ramp_rows(84_000.0, 12.5, &tail), exit_cfg(true, 25));
+    let h = exit_harness(
+        "exit_close_long",
+        ramp_rows(84_000.0, 12.5, &tail),
+        exit_cfg(true, 25),
+    );
     h.fake.with_state(|s| {
         s.mark = 85_000.0;
         s.position = Some(json!({
@@ -1596,10 +1597,7 @@ async fn exit_line_closes_the_long_without_reversing() {
         .all(|o| o["side"].as_str() != Some("BUY")));
     let state = h.state_live();
     assert!(
-        !state
-            .get("trade")
-            .map(|t| t.is_object())
-            .unwrap_or(false),
+        !state.get("trade").map(|t| t.is_object()).unwrap_or(false),
         "{state:?}"
     );
     let notes = h.notes.lock().unwrap().clone();
@@ -1635,7 +1633,11 @@ async fn exit_line_wins_over_an_opposite_cross() {
         json!("CUSTOM_MA_EXIT"),
         "{result}"
     );
-    assert_eq!(result["trade"]["custom_exit_kind"], json!("cross"), "{result}");
+    assert_eq!(
+        result["trade"]["custom_exit_kind"],
+        json!("cross"),
+        "{result}"
+    );
     assert_eq!(
         h.fake
             .with_state(|s| s.position.as_ref().map(|p| p["side"].clone())),
@@ -1652,7 +1654,8 @@ async fn exit_line_wins_over_an_opposite_cross() {
     assert!(
         notes
             .iter()
-            .any(|n| n.contains("CUSTOM_MA_EXIT") && n.contains("재진입은 다음 크로스 마감까지 대기")),
+            .any(|n| n.contains("CUSTOM_MA_EXIT")
+                && n.contains("재진입은 다음 크로스 마감까지 대기")),
         "{notes:?}"
     );
 }
@@ -1675,14 +1678,9 @@ fn exit_line_is_off_by_default_and_ignores_bad_periods() {
     for period in [0_i64, 1, 501, 10_000] {
         let cfg = cross_config(true, period);
         assert_eq!(tbot::core::sma_cross::exit_period(&cfg), None, "{period}");
-        let value = serde_json::to_value(evaluate_cross(
-            &candles(&rows),
-            &cfg,
-            now,
-            "BTCUSDT",
-            None,
-        ))
-        .unwrap();
+        let value =
+            serde_json::to_value(evaluate_cross(&candles(&rows), &cfg, now, "BTCUSDT", None))
+                .unwrap();
         assert!(value.get("sma_exit").is_none(), "{period} {value}");
     }
 

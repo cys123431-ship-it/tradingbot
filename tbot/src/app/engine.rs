@@ -332,7 +332,10 @@ impl<E: FuturesExchange + 'static> Engine<E> {
                     .trim()
                     .to_lowercase();
                 let force = req.arg("force").and_then(|v| v.as_bool()).unwrap_or(false);
-                let dry_run = req.arg("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+                let dry_run = req
+                    .arg("dry_run")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 if dry_run {
                     self.exchange_switch_preview(&target).await
                 } else {
@@ -745,7 +748,10 @@ impl<E: FuturesExchange + 'static> Engine<E> {
                 let to = if kept.is_empty() {
                     "BTCUSDT".to_string()
                 } else {
-                    kept.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")
+                    kept.iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
                 };
                 changes.push(json!({
                     "strategy": label,
@@ -829,8 +835,7 @@ impl<E: FuturesExchange + 'static> Engine<E> {
             if let Some(ts) = last {
                 let elapsed = now_secs_f64() - ts;
                 if elapsed < EXCHANGE_SWITCH_COOLDOWN_SECS {
-                    let remain =
-                        (EXCHANGE_SWITCH_COOLDOWN_SECS - elapsed).ceil().max(1.0) as i64;
+                    let remain = (EXCHANGE_SWITCH_COOLDOWN_SECS - elapsed).ceil().max(1.0) as i64;
                     return Err(format!(
                         "거래소 전환은 너무 자주 실행할 수 없습니다. {remain}초 후 다시 시도하세요."
                     ));
@@ -843,11 +848,9 @@ impl<E: FuturesExchange + 'static> Engine<E> {
         if !force {
             let held = self.open_positions().await?;
             if !held.is_empty() {
-                let mut lines = vec![
-                    "보유 포지션이 있어 거래소를 바꾸지 않았습니다.\n\
+                let mut lines = vec!["보유 포지션이 있어 거래소를 바꾸지 않았습니다.\n\
                      · 거래소를 바꾸면 보유 포지션과 SL/TP 주문의 관리가 끊깁니다."
-                        .to_string(),
-                ];
+                    .to_string()];
                 for p in held {
                     lines.push(format!(
                         "· {} {} {} {}개 ({})",
@@ -917,14 +920,21 @@ impl<E: FuturesExchange + 'static> Engine<E> {
                 for (section, values) in rollback {
                     match cfg.update_values(&section, values).await {
                         Ok(_) => {}
-                        Err(e) => log_line(&format!("engine: exchange rollback {section} failed: {e}")),
+                        Err(e) => {
+                            log_line(&format!("engine: exchange rollback {section} failed: {e}"))
+                        }
                     }
                 }
                 Err(format!("{text} (이전 거래소 설정으로 롤백했습니다)"))
             })
         };
         for section in ["btc_ma_cross", "ma_cross"] {
-            let mut values = self.cfg.section(section).as_object().cloned().unwrap_or_default();
+            let mut values = self
+                .cfg
+                .section(section)
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
             apply_plan(&mut values, &plan);
             let mut changes = values
                 .into_iter()
@@ -933,7 +943,11 @@ impl<E: FuturesExchange + 'static> Engine<E> {
             if changes.is_empty() {
                 continue;
             }
-            if let Err(e) = self.cfg.update_values(section, std::mem::take(&mut changes)).await {
+            if let Err(e) = self
+                .cfg
+                .update_values(section, std::mem::take(&mut changes))
+                .await
+            {
                 return restore(e).await;
             }
         }
