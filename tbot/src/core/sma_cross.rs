@@ -31,6 +31,11 @@ pub struct CrossConfig {
     pub exit_ma_enabled: Option<bool>,
     #[serde(default, deserialize_with = "de_lenient_opt_i64")]
     pub exit_ma_period: Option<i64>,
+    /// "align" = SMA(fast)/SMA(mid)/SMA(slow) alignment signals (XAU strategy).
+    #[serde(default)]
+    pub signal_mode: Option<String>,
+    #[serde(default, deserialize_with = "de_lenient_opt_i64")]
+    pub align_mid_period: Option<i64>,
 }
 
 /// Result of `evaluate_cross`.
@@ -60,6 +65,9 @@ pub struct CrossResult {
     pub sma_slow_prev: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sma_stop: Option<f64>,
+    /// Middle SMA of the alignment mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sma_mid: Option<f64>,
     /// Exit line state; this, `exit_ma_period`, `exit_side` and `exit_trend_side`
     /// are always present (null when unused), like Python.
     pub exit_ma_enabled: bool,
@@ -196,6 +204,7 @@ pub fn evaluate_cross(
         sma_fast_prev: None,
         sma_slow_prev: None,
         sma_stop: None,
+        sma_mid: None,
         exit_ma_enabled: cfg.exit_ma_enabled.unwrap_or(false),
         exit_ma_period: None,
         sma_exit: None,
@@ -267,6 +276,9 @@ pub fn evaluate_cross(
             };
         }
     }
+    if cfg.signal_mode.as_deref() == Some("align") {
+        return finish_align(result, cfg, &closes, &fast, &slow, bar, span, symbol);
+    }
     result.trend_side = if f_now > s_now {
         Some("LONG".to_string())
     } else if f_now < s_now {
@@ -319,6 +331,83 @@ pub fn evaluate_cross(
     result.signal_id = Some(format!(
         "{}:SMA{}/{}:{}:{}:{}",
         symbol, fast_p, slow_p, timeframe, side, bar[0] as i64
+    ));
+    result
+}
+
+/// Alignment signals: bullish = SMA(fast) > SMA(mid) > SMA(slow), bearish the
+/// mirror. `trend_side` is the alignment that holds on the last closed bar with
+/// SMA(fast) beyond the exit line on that side; `side` is set only on the bar
+/// where that alignment newly forms (it did not hold on the bar before).
+#[allow(clippy::too_many_arguments)]
+fn finish_align(
+    mut result: CrossResult,
+    cfg: &CrossConfig,
+    closes: &[f64],
+    fast: &[Option<f64>],
+    slow: &[Option<f64>],
+    bar: Candle,
+    span: i64,
+    symbol: &str,
+) -> CrossResult {
+    let mid_p = cfg.align_mid_period.unwrap_or(5).max(2) as usize;
+    let mid = sma_opt(closes, mid_p);
+    let at = |v: &[Option<f64>], back: usize| -> Option<f64> {
+        v.len().checked_sub(back + 1).and_then(|i| v[i])
+    };
+    let (Some(f_now), Some(f_prev), Some(m_now), Some(m_prev), Some(s_now), Some(s_prev)) = (
+        at(fast, 0),
+        at(fast, 1),
+        at(&mid, 0),
+        at(&mid, 1),
+        at(slow, 0),
+        at(slow, 1),
+    ) else {
+        result.skip_reason = Some("INSUFFICIENT_CANDLES:ALIGN".to_string());
+        return result;
+    };
+    result.sma_mid = Some(m_now);
+    let bull = |f: f64, m: f64, s: f64| f > m && m > s;
+    let bear = |f: f64, m: f64, s: f64| f < m && m < s;
+    let beyond_long = result.sma_exit.map(|x| f_now > x).unwrap_or(true);
+    let beyond_short = result.sma_exit.map(|x| f_now < x).unwrap_or(true);
+    let bull_now = bull(f_now, m_now, s_now);
+    let bear_now = bear(f_now, m_now, s_now);
+    result.trend_side = if bull_now && beyond_long {
+        Some("LONG".to_string())
+    } else if bear_now && beyond_short {
+        Some("SHORT".to_string())
+    } else {
+        None
+    };
+    let max_age = cfg.signal_max_age_seconds.min(span as f64 / 2000.0);
+    result.stale = result.signal_age_seconds.unwrap_or(0.0) > max_age;
+    let side = if bull_now && beyond_long && !bull(f_prev, m_prev, s_prev) {
+        Some("LONG")
+    } else if bear_now && beyond_short && !bear(f_prev, m_prev, s_prev) {
+        Some("SHORT")
+    } else {
+        None
+    };
+    let Some(side) = side else {
+        let reason = match result.trend_side.as_deref() {
+            Some("LONG") => "ALIGNMENT_HELD_LONG",
+            Some("SHORT") => "ALIGNMENT_HELD_SHORT",
+            _ if bull_now || bear_now => "ALIGNED_BEHIND_EXIT_LINE",
+            _ => "NOT_ALIGNED",
+        };
+        result.skip_reason = Some(reason.to_string());
+        return result;
+    };
+    if result.stale {
+        result.skip_reason = Some("SIGNAL_STALE".to_string());
+        return result;
+    }
+    result.side = Some(side.to_string());
+    result.skip_reason = Some(String::new());
+    result.signal_id = Some(format!(
+        "{}:ALIGN{}/{}/{}:{}:{}:{}",
+        symbol, cfg.fast_period, mid_p, cfg.slow_period, cfg.timeframe, side, bar[0] as i64
     ));
     result
 }
@@ -421,4 +510,130 @@ pub fn scale_in_stop_price(
     let direction = if side == "LONG" { 1.0 } else { -1.0 };
     let first_margin = first_entry * first_quantity / leverage;
     Some(avg_entry - direction * (loss_roi / 100.0 * first_margin) / quantity)
+}
+
+#[cfg(test)]
+mod align_tests {
+    use super::*;
+
+    const SPAN: i64 = 14_400_000;
+
+    fn cfg(exit_p: i64) -> CrossConfig {
+        serde_json::from_value(serde_json::json!({
+            "timeframe": "4h", "fast_period": 1, "slow_period": 120,
+            "signal_max_age_seconds": 180, "exit_ma_enabled": true,
+            "exit_ma_period": exit_p, "signal_mode": "align", "align_mid_period": 5,
+        }))
+        .unwrap()
+    }
+
+    /// Deterministic wavy series: long down leg, long up leg, down again.
+    fn rows(n: usize) -> Vec<Candle> {
+        let mut seed: u64 = 7;
+        let mut price = 100.0;
+        (0..n)
+            .map(|i| {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let noise = ((seed >> 33) as f64 / (1u64 << 31) as f64 - 0.5) * 0.8;
+                let drift = if i < 200 {
+                    -0.15
+                } else if i < 420 {
+                    0.22
+                } else {
+                    -0.2
+                };
+                let open = price;
+                price = (price + drift + noise).max(1.0);
+                [
+                    i as f64 * SPAN as f64,
+                    open,
+                    open.max(price) + 0.3,
+                    open.min(price) - 0.3,
+                    price,
+                    10.0,
+                ]
+            })
+            .collect()
+    }
+
+    fn sma_at(c: &[f64], p: usize, i: usize) -> Option<f64> {
+        (i + 1 >= p).then(|| c[i + 1 - p..=i].iter().sum::<f64>() / p as f64)
+    }
+
+    /// Reference: (trend_side, fresh side) on bar i, written independently.
+    fn reference(
+        c: &[f64],
+        i: usize,
+        exit_p: usize,
+    ) -> (Option<&'static str>, Option<&'static str>) {
+        let state = |j: usize| -> Option<&'static str> {
+            let (m, s) = (sma_at(c, 5, j)?, sma_at(c, 120, j)?);
+            if c[j] > m && m > s {
+                Some("LONG")
+            } else if c[j] < m && m < s {
+                Some("SHORT")
+            } else {
+                None
+            }
+        };
+        let x = sma_at(c, exit_p, i).unwrap();
+        let now = state(i).filter(|side| if *side == "LONG" { c[i] > x } else { c[i] < x });
+        let fresh = now.filter(|side| state(i - 1) != Some(*side));
+        (now, fresh)
+    }
+
+    #[test]
+    fn alignment_signals_match_reference_on_every_bar() {
+        let all = rows(600);
+        let closes: Vec<f64> = all.iter().map(|r| r[4]).collect();
+        let (mut fresh_seen, mut held_seen) = (0, 0);
+        for exit_p in [20usize, 30, 50] {
+            let c = cfg(exit_p as i64);
+            for i in 130..all.len() {
+                let now_ms = i as i64 * SPAN + SPAN + 1_000; // 1 s after bar i closes
+                let r = evaluate_cross(&all[..=i], &c, now_ms, "XAUUSDT", None);
+                let (trend, fresh) = reference(&closes, i, exit_p);
+                assert_eq!(
+                    r.trend_side.as_deref(),
+                    trend,
+                    "trend bar {i} exit {exit_p}"
+                );
+                assert_eq!(r.side.as_deref(), fresh, "side bar {i} exit {exit_p}");
+                if fresh.is_some() {
+                    fresh_seen += 1;
+                    assert!(r
+                        .signal_id
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains(":ALIGN1/5/120:4h:"));
+                } else if trend.is_some() {
+                    held_seen += 1;
+                    assert!(r
+                        .skip_reason
+                        .as_deref()
+                        .unwrap_or("")
+                        .starts_with("ALIGNMENT_HELD_"));
+                }
+            }
+        }
+        assert!(
+            fresh_seen >= 6 && held_seen >= 100,
+            "fresh {fresh_seen} held {held_seen}"
+        );
+    }
+
+    #[test]
+    fn stale_alignment_does_not_signal() {
+        let all = rows(600);
+        let closes: Vec<f64> = all.iter().map(|r| r[4]).collect();
+        let i = (130..600)
+            .find(|&i| reference(&closes, i, 30).1.is_some())
+            .unwrap();
+        let late = i as i64 * SPAN + SPAN + 600_000; // 10 min after the close
+        let r = evaluate_cross(&all[..=i], &cfg(30), late, "XAUUSDT", None);
+        assert_eq!(r.side, None);
+        assert_eq!(r.skip_reason.as_deref(), Some("SIGNAL_STALE"));
+    }
 }

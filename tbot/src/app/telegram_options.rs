@@ -752,28 +752,61 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         (text, build_btc_options_keyboard(&cfg, false, false, false))
     }
 
+    /// User rule for turning option entries ON (checked on the ON button and
+    /// again on the confirm button): API ok, futures strategies all OFF, and an
+    /// options-wallet balance above zero. Ok = check lines for the screen.
+    async fn options_on_checks(&self) -> Result<String, String> {
+        let preflight = self.opt_preflight().await;
+        let ok = truthy(preflight.get("ok"));
+        let can_trade_false = matches!(preflight.get("can_trade"), Some(Value::Bool(false)));
+        if !ok || can_trade_false {
+            let err = get_truthy_str(&preflight, "error")
+                .unwrap_or_else(|| "European Options 주문 권한이 비활성 상태입니다.".to_string());
+            return Err(format!(
+                "❌ 옵션 API 사전점검 실패\n{}\n\nReading·European Options 권한과 서버 IP 제한을 확인하세요.",
+                err
+            ));
+        }
+        let block = match self.opt_call("options_futures_block", json!({})).await {
+            Ok(Value::String(reason)) => Some(reason),
+            Ok(_) => None,
+            Err(e) => return Err(engine_error_text(&e)),
+        };
+        if let Some(reason) = block {
+            return Err(format!("❌ 옵션을 켤 수 없습니다\n{}", reason));
+        }
+        let available = safe_number(get_obj(&preflight, "balance").get("available"));
+        if available <= 0.0 {
+            return Err(
+                "❌ 옵션을 켤 수 없습니다\n옵션 지갑 가용 잔고가 없습니다. 바이낸스 옵션 지갑으로 USDT를 옮긴 뒤 다시 누르세요."
+                    .to_string(),
+            );
+        }
+        Ok(format!(
+            "✔ 선물 전략: 모두 꺼짐\n✔ 옵션 지갑 가용: {:.4} USDT",
+            available
+        ))
+    }
+
     /// `op:` callback (data without the prefix) -> (text, keyboard).
     pub async fn handle_options_action(&self, action: &str) -> (String, Value) {
         if action == "on" {
-            let preflight = self.opt_preflight().await;
-            let ok = truthy(preflight.get("ok"));
-            let can_trade_false = matches!(preflight.get("can_trade"), Some(Value::Bool(false)));
-            if !ok || can_trade_false {
-                let err = get_truthy_str(&preflight, "error").unwrap_or_else(|| {
-                    "European Options 주문 권한이 비활성 상태입니다.".to_string()
-                });
-                let text = format!(
-                    "❌ 옵션 API 사전점검 실패\n{}\n\nReading·European Options 권한과 서버 IP 제한을 확인하세요.",
-                    err
-                );
-                return (text, build_options_keyboard(false, false));
-            }
-            let text = "⚠️ 옵션 실주문을 시작하시겠습니까?\n\
-                        매수 프리미엄·예상 수수료 합계는 옵션 지갑 가용 잔고 안에서만 쓰며 \
-                        네이키드 매도는 하지 않습니다.";
-            return (text.to_string(), build_options_keyboard(true, false));
+            let checks = match self.options_on_checks().await {
+                Ok(lines) => lines,
+                Err(text) => return (text, build_options_keyboard(false, false)),
+            };
+            let text = format!(
+                "⚠️ 옵션 실주문을 시작하시겠습니까?\n\
+                 매수 프리미엄·예상 수수료 합계는 옵션 지갑 가용 잔고 안에서만 쓰며 \
+                 네이키드 매도는 하지 않습니다.\n\n{}\n확인을 누르면 한 번 더 점검한 뒤 켭니다.",
+                checks
+            );
+            return (text, build_options_keyboard(true, false));
         }
         if action == "confirm_on" {
+            if let Err(text) = self.options_on_checks().await {
+                return (text, build_options_keyboard(false, false));
+            }
             let changes = json!({ "enabled": true });
             if let Err(e) = self.opt_set(changes).await {
                 return (engine_error_text(&e), build_options_keyboard(false, false));
@@ -852,31 +885,32 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         let cfg = self.opt_config().await;
 
         if action == "on" {
-            let preflight = self.opt_preflight().await;
-            let ok = truthy(preflight.get("ok"));
-            let can_trade_false = matches!(preflight.get("can_trade"), Some(Value::Bool(false)));
-            if !ok || can_trade_false {
-                let err = get_truthy_str(&preflight, "error").unwrap_or_else(|| {
-                    "European Options 주문 권한이 비활성 상태입니다.".to_string()
-                });
-                let text = format!(
-                    "❌ 옵션 API 사전점검 실패\n{}\n\nReading·European Options 권한과 서버 IP 제한을 확인하세요.",
-                    err
-                );
+            let checks = match self.options_on_checks().await {
+                Ok(lines) => lines,
+                Err(text) => {
+                    let fresh = self.opt_config().await;
+                    return (
+                        text,
+                        build_btc_options_keyboard(&fresh, false, false, false),
+                    );
+                }
+            };
+            let text = format!(
+                "⚠️ BTC 옵션 실주문을 시작하시겠습니까?\n대상: {} 옵션만 · 예산: {} (프리미엄+예상 수수료 기준) · 네이키드 매도 없음.\n옵션은 만기까지 시간가치가 줄어 프리미엄 전액을 잃을 수 있습니다.\n\n{}\n확인을 누르면 한 번 더 점검한 뒤 켭니다.",
+                BTC_ONLY_UNDERLYING,
+                options_budget_text(&cfg),
+                checks
+            );
+            return (text, build_btc_options_keyboard(&cfg, true, false, false));
+        }
+        if action == "confirm_on" {
+            if let Err(text) = self.options_on_checks().await {
                 let fresh = self.opt_config().await;
                 return (
                     text,
                     build_btc_options_keyboard(&fresh, false, false, false),
                 );
             }
-            let text = format!(
-                "⚠️ BTC 옵션 실주문을 시작하시겠습니까?\n대상: {} 옵션만 · 예산: {} (프리미엄+예상 수수료 기준) · 네이키드 매도 없음.\n옵션은 만기까지 시간가치가 줄어 프리미엄 전액을 잃을 수 있습니다.",
-                BTC_ONLY_UNDERLYING,
-                options_budget_text(&cfg)
-            );
-            return (text, build_btc_options_keyboard(&cfg, true, false, false));
-        }
-        if action == "confirm_on" {
             let changes = json!({ "btc_only": true, "enabled": true });
             if let Err(e) = self.opt_set(changes).await {
                 let fresh = self.opt_config().await;
@@ -1054,6 +1088,7 @@ mod tests {
         status: Mutex<Value>,
         preflight: Mutex<Value>,
         run_cycle: Mutex<Value>,
+        futures_block: Mutex<Value>,
     }
 
     impl FakeEngine {
@@ -1063,8 +1098,13 @@ mod tests {
                 config: Mutex::new(config.clone()),
                 state: Mutex::new(state.clone()),
                 status: Mutex::new(status),
-                preflight: Mutex::new(json!({"ok": true, "can_trade": true})),
+                preflight: Mutex::new(json!({
+                    "ok": true,
+                    "can_trade": true,
+                    "balance": {"available": 24.0, "equity": 24.0},
+                })),
                 run_cycle: Mutex::new(json!({"action": "waiting", "reason": "테스트 판단"})),
+                futures_block: Mutex::new(Value::Null),
             }
         }
 
@@ -1130,6 +1170,10 @@ mod tests {
                 "options_preflight" => match self.preflight.lock() {
                     Ok(g) => Ok(g.clone()),
                     Err(_) => Ok(json!({})),
+                },
+                "options_futures_block" => match self.futures_block.lock() {
+                    Ok(g) => Ok(g.clone()),
+                    Err(_) => Ok(Value::Null),
                 },
                 "options_run_cycle" => match self.run_cycle.lock() {
                     Ok(g) => Ok(g.clone()),
@@ -1379,5 +1423,75 @@ mod tests {
         assert_eq!(channel_calls(&fake, "options_status"), 0);
         assert_eq!(channel_calls(&fake, "options_preflight"), 0);
         assert_eq!(channel_calls(&fake, "options_run_cycle"), 0);
+    }
+
+    fn set_futures_block(fake: &FakeEngine, v: Value) {
+        if let Ok(mut g) = fake.futures_block.lock() {
+            *g = v;
+        }
+    }
+
+    #[tokio::test]
+    async fn options_on_refused_while_a_futures_strategy_is_on() {
+        let fake = Arc::new(FakeEngine::new(
+            json!({"enabled": false}),
+            empty_state(),
+            base_status(),
+        ));
+        set_futures_block(
+            &fake,
+            json!("선물 전략(/xau)이 켜져 있어 옵션 신규 진입을 하지 않습니다."),
+        );
+        let bot = make_bot(fake.clone());
+        for (text, _) in [
+            bot.handle_btc_options_action("on").await,
+            bot.handle_options_action("on").await,
+        ] {
+            assert!(text.contains("옵션을 켤 수 없습니다"), "{text}");
+            assert!(text.contains("/xau"), "{text}");
+        }
+        assert!(set_calls(&fake).is_empty());
+    }
+
+    #[tokio::test]
+    async fn options_on_refused_with_an_empty_options_wallet() {
+        let fake = Arc::new(FakeEngine::new(
+            json!({"enabled": false}),
+            empty_state(),
+            base_status(),
+        ));
+        fake.set_preflight(
+            json!({"ok": true, "can_trade": true, "balance": {"available": 0.0, "equity": 0.0}}),
+        );
+        let bot = make_bot(fake.clone());
+        let (text, kb) = bot.handle_btc_options_action("on").await;
+        assert!(text.contains("옵션 지갑 가용 잔고가 없습니다"), "{text}");
+        assert!(!callbacks(&kb).iter().any(|c| c == "bo:confirm_on"));
+        assert!(set_calls(&fake).is_empty());
+    }
+
+    #[tokio::test]
+    async fn confirm_rechecks_and_refuses_when_conditions_changed() {
+        let fake = Arc::new(FakeEngine::new(
+            json!({"enabled": false}),
+            empty_state(),
+            base_status(),
+        ));
+        let bot = make_bot(fake.clone());
+        let (text, kb) = bot.handle_btc_options_action("on").await;
+        assert!(text.contains("✔ 선물 전략: 모두 꺼짐"), "{text}");
+        assert!(text.contains("✔ 옵션 지갑 가용: 24.0000 USDT"), "{text}");
+        assert!(callbacks(&kb).iter().any(|c| c == "bo:confirm_on"));
+        // A futures strategy was switched on between the two presses.
+        set_futures_block(
+            &fake,
+            json!("선물 전략(/btcmacross)이 켜져 있어 옵션 신규 진입을 하지 않습니다."),
+        );
+        let (text2, _) = bot.handle_btc_options_action("confirm_on").await;
+        assert!(text2.contains("옵션을 켤 수 없습니다"), "{text2}");
+        assert!(set_calls(&fake).is_empty());
+        let (text3, _) = bot.handle_options_action("confirm_on").await;
+        assert!(text3.contains("옵션을 켤 수 없습니다"), "{text3}");
+        assert!(set_calls(&fake).is_empty());
     }
 }

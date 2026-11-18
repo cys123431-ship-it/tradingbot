@@ -33,6 +33,9 @@ const OPTIONS_STATE_FILE: &str = "options_trading_state.json";
 /// sleeve is forced OFF, so a stale `enabled: true` left by the retired Python bot can
 /// never start real option orders right after a deploy.
 const OPTIONS_PORT_ACK: &str = "tbot_port_ack";
+/// config.json section and display label of the TradFi alignment strategy.
+const TRADFI_SECTION: &str = crate::strategy::config_tradfi::CONFIG_KEY;
+const TRADFI_LABEL: &str = "TradFi 1/5/120";
 
 /// Coin list size requested by the Telegram "pick a coin" keyboard.
 const PICK_LIST_SIZE: usize = 12;
@@ -44,6 +47,8 @@ pub struct Engine<E: FuturesExchange + 'static> {
     cfg: Arc<ConfigFile>,
     btc_ma: Arc<SmaCrossService<E>>,
     ma_plus: Arc<SmaCrossService<E>>,
+    /// TradFi-only 1/5/120 alignment strategy (`/tradfi`); None in hand-built test engines.
+    tradfi: Option<Arc<SmaCrossService<E>>>,
     /// Binance European Options sleeve (None in tests that build the engine by hand).
     options: Option<Arc<OptionsService<BinanceOptionsClient>>>,
     #[allow(dead_code)] // notices go through the service notifier
@@ -89,6 +94,12 @@ impl Engine<BinanceFutures> {
         };
 
         let btc_ma = build_service(&cfg, runtime_dir.clone(), Variant::BtcMa, notifier.clone())?;
+        let tradfi = Some(build_service(
+            &cfg,
+            runtime_dir.clone(),
+            Variant::TradFi,
+            notifier.clone(),
+        )?);
         let options = Some(build_options_service(&cfg, &runtime_dir, notifier.clone()));
         let ma_plus = build_service(&cfg, runtime_dir.clone(), Variant::MaPlus, notifier)?;
 
@@ -97,6 +108,7 @@ impl Engine<BinanceFutures> {
             cfg,
             btc_ma,
             ma_plus,
+            tradfi,
             options,
             telegram,
             started_at,
@@ -118,6 +130,7 @@ impl<E: FuturesExchange + 'static> Engine<E> {
             cfg,
             btc_ma,
             ma_plus,
+            tradfi: None,
             options: None,
             telegram: None,
             started_at: now_secs(),
@@ -155,6 +168,10 @@ impl<E: FuturesExchange + 'static> Engine<E> {
             let service = Arc::clone(&self.ma_plus);
             tokio::spawn(async move { engine.strategy_loop(service).await })
         };
+        let tradfi_loop = self.tradfi.clone().map(|service| {
+            let engine = Arc::clone(&self);
+            tokio::spawn(async move { engine.strategy_loop(service).await })
+        });
         let heartbeat = {
             let engine = Arc::clone(&self);
             tokio::spawn(async move { engine.heartbeat_loop().await })
@@ -185,6 +202,9 @@ impl<E: FuturesExchange + 'static> Engine<E> {
         btc_loop.abort();
         ma_loop.abort();
         heartbeat.abort();
+        if let Some(task) = tradfi_loop {
+            task.abort();
+        }
         if let Some(task) = options_loop {
             task.abort();
         }
@@ -232,28 +252,54 @@ impl<E: FuturesExchange + 'static> Engine<E> {
         }
     }
 
-    /// Force the options sleeve OFF once, the first time tbot runs it (see OPTIONS_PORT_ACK).
+    /// User rule: option entries always start OFF. Every engine start switches
+    /// them off; only the Telegram ON button (two checks) turns them on again.
     async fn options_port_gate(&self) {
         let section = self.cfg.section(OPTIONS_SECTION);
-        if section.get(OPTIONS_PORT_ACK).and_then(|v| v.as_bool()) == Some(true) {
-            return;
-        }
         let was_on = section
             .get("enabled")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let acked = section.get(OPTIONS_PORT_ACK).and_then(|v| v.as_bool()) == Some(true);
+        if !was_on && acked {
+            return;
+        }
         let mut changes = Map::new();
         changes.insert("enabled".to_string(), Value::Bool(false));
         changes.insert(OPTIONS_PORT_ACK.to_string(), Value::Bool(true));
         if let Err(e) = self.cfg.update_values(OPTIONS_SECTION, changes).await {
-            log_line(&format!("engine: options port gate write failed: {e}"));
+            log_line(&format!("engine: options start-off write failed: {e}"));
             return;
         }
         log_line(&format!(
-            "engine: options sleeve forced OFF on first tbot start (was_on={was_on})"
+            "engine: options entries forced OFF at engine start (was_on={was_on})"
         ));
     }
 
+    /// Option entries run only while every futures strategy is OFF.
+    fn futures_block_reason(cfg: &ConfigFile) -> Option<String> {
+        let on: Vec<&str> = [
+            ("btc_ma_cross", "/btcmacross"),
+            ("ma_cross", "/macross"),
+            (TRADFI_SECTION, "/tradfi"),
+        ]
+        .into_iter()
+        .filter(|(section, _)| {
+            cfg.section(section)
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        })
+        .map(|(_, command)| command)
+        .collect();
+        if on.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "선물 전략({})이 켜져 있어 옵션 신규 진입을 하지 않습니다. 옵션은 선물 전략이 모두 꺼져 있을 때만 작동합니다.",
+            on.join(", ")
+        ))
+    }
     async fn heartbeat_loop(&self) {
         loop {
             self.write_heartbeat().await;
@@ -277,13 +323,25 @@ impl<E: FuturesExchange + 'static> Engine<E> {
                 .unwrap_or(false);
             let ma_mode = self.ma_plus.mode(Some(&ma_cfg));
             let ma_last = self.last_action(&self.ma_plus).await.unwrap_or(Value::Null);
+            let mut strategies = json!({
+                "btc_ma": {"enabled": enabled, "mode": mode, "last_action": last_action},
+                "ma_plus": {"enabled": ma_enabled, "mode": ma_mode, "last_action": ma_last},
+            });
+            if let Some(tf) = self.tradfi.as_ref() {
+                let tf_cfg = self.cfg.section(TRADFI_SECTION);
+                let tf_enabled = tf_cfg
+                    .get("enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let tf_mode = tf.mode(Some(&tf_cfg));
+                let tf_last = self.last_action(tf).await.unwrap_or(Value::Null);
+                strategies["tradfi"] =
+                    json!({"enabled": tf_enabled, "mode": tf_mode, "last_action": tf_last});
+            }
             json!({
                 "ts": now_secs(),
                 "pid": std::process::id(),
-                "strategies": {
-                    "btc_ma": {"enabled": enabled, "mode": mode, "last_action": last_action},
-                    "ma_plus": {"enabled": ma_enabled, "mode": ma_mode, "last_action": ma_last},
-                }
+                "strategies": strategies,
             })
         }
         .await;
@@ -451,6 +509,31 @@ impl<E: FuturesExchange + 'static> Engine<E> {
                     .map_err(|e| e.to_string())?;
                 Ok(json!({"ccxt_symbol": symbol, "market_id": market}))
             }
+            "resolve_tradfi_any" => {
+                let service = self.service_for(&req)?;
+                let network = req
+                    .arg_str("network")
+                    .or_else(|| service.current_network(None))
+                    .ok_or_else(|| "ValueError: missing network".to_string())?;
+                let text = req.arg("text").cloned().unwrap_or(Value::Null);
+                let (symbol, market) = service
+                    .resolve_any_tradfi_coin(&network, &text)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({"ccxt_symbol": symbol, "market_id": market}))
+            }
+            "tradfi_symbols" => {
+                let service = self.service_for(&req)?;
+                let network = req
+                    .arg_str("network")
+                    .or_else(|| service.current_network(None))
+                    .ok_or_else(|| "ValueError: missing network".to_string())?;
+                let list = service
+                    .tradfi_any_symbols(&network)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(Value::Array(list.into_iter().map(Value::String).collect()))
+            }
             "resolve_tradfi_coin" => {
                 let service = self.service_for(&req)?;
                 let network = req
@@ -601,6 +684,12 @@ impl<E: FuturesExchange + 'static> Engine<E> {
                 self.cfg.update_values(OPTIONS_SECTION, changes).await
             }
             "options_preflight" => Ok(self.options_service()?.preflight().await),
+            "options_futures_block" => {
+                self.options_service()?;
+                Ok(Self::futures_block_reason(&self.cfg)
+                    .map(Value::String)
+                    .unwrap_or(Value::Null))
+            }
             "options_run_cycle" => {
                 let service = self.options_service()?;
                 let force_scan = req
@@ -681,6 +770,10 @@ impl<E: FuturesExchange + 'static> Engine<E> {
         match variant {
             "btc_ma" => Ok(Arc::clone(&self.btc_ma)),
             "ma_plus" => Ok(Arc::clone(&self.ma_plus)),
+            "tradfi" => self
+                .tradfi
+                .clone()
+                .ok_or_else(|| "ValueError: tradfi strategy is not configured".to_string()),
             other => Err(format!("ValueError: unknown strategy {other}")),
         }
     }
@@ -690,6 +783,7 @@ impl<E: FuturesExchange + 'static> Engine<E> {
         let strategies = [
             ("btc_ma_cross", "/btcmacross", ""),
             ("ma_cross", "/macross", " C"),
+            (TRADFI_SECTION, "/tradfi", ""),
         ];
         for (key, command, suffix) in strategies {
             if key == except_key {
@@ -739,6 +833,9 @@ impl<E: FuturesExchange + 'static> Engine<E> {
 
     /// "1/200 SMA" (+ suffix) from a strategy section's configured periods.
     fn sma_label(&self, section: &str, suffix: &str) -> String {
+        if section == TRADFI_SECTION {
+            return TRADFI_LABEL.to_string();
+        }
         let cfg = self.cfg.section(section);
         let default_slow = if section == "ma_cross" { 120 } else { 200 };
         let period = |key: &str, default: i64| {
@@ -760,10 +857,8 @@ impl<E: FuturesExchange + 'static> Engine<E> {
     /// strategies, in live mode (the mode that sends real orders).
     async fn open_positions(&self) -> Result<Vec<Value>, String> {
         let mut items = Vec::new();
-        for (suffix, service, section) in [
-            ("", &self.btc_ma, "btc_ma_cross"),
-            (" C", &self.ma_plus, "ma_cross"),
-        ] {
+        for (suffix, service, section) in self.sma_services() {
+            let service = &service;
             let label = self.sma_label(section, suffix);
             for network in ["testnet", "mainnet"] {
                 let rows = service
@@ -1042,7 +1137,7 @@ impl<E: FuturesExchange + 'static> Engine<E> {
             }
         }
         let mut errors = Vec::new();
-        for (_suffix, service) in [("", &self.btc_ma), (" C", &self.ma_plus)] {
+        for (_suffix, service, _section) in self.sma_services() {
             if let Err(e) = service.set_exchange_mode(mode).await {
                 errors.push(e);
             }
@@ -1070,10 +1165,7 @@ impl<E: FuturesExchange + 'static> Engine<E> {
 
     async fn emergency_stop(&self) -> Result<Value, String> {
         let mut lines: Vec<String> = Vec::new();
-        for (suffix, service, section) in [
-            ("", &self.btc_ma, "btc_ma_cross"),
-            (" C", &self.ma_plus, "ma_cross"),
-        ] {
+        for (suffix, service, section) in self.sma_services() {
             let label = self.sma_label(section, suffix);
             let was_on = self
                 .cfg
@@ -1119,6 +1211,18 @@ impl<E: FuturesExchange + 'static> Engine<E> {
         }
         lines.extend(self.stop_options().await);
         Ok(json!({"lines": lines}))
+    }
+
+    /// Every SMA-family futures strategy: (label suffix, service, config section).
+    fn sma_services(&self) -> Vec<(&'static str, Arc<SmaCrossService<E>>, &'static str)> {
+        let mut out = vec![
+            ("", Arc::clone(&self.btc_ma), "btc_ma_cross"),
+            (" C", Arc::clone(&self.ma_plus), "ma_cross"),
+        ];
+        if let Some(tf) = self.tradfi.as_ref() {
+            out.push(("", Arc::clone(tf), TRADFI_SECTION));
+        }
+        out
     }
 
     fn options_service(&self) -> Result<&Arc<OptionsService<BinanceOptionsClient>>, String> {
@@ -1193,6 +1297,7 @@ impl<E: FuturesExchange + 'static> EngineApi for Arc<Engine<E>> {
 fn section_for(strategy: &str) -> &'static str {
     match strategy {
         "ma_plus" => "ma_cross",
+        "tradfi" => TRADFI_SECTION,
         _ => "btc_ma_cross",
     }
 }
@@ -1206,6 +1311,7 @@ fn build_service(
     let section = match variant {
         Variant::BtcMa => "btc_ma_cross",
         Variant::MaPlus => "ma_cross",
+        Variant::TradFi => TRADFI_SECTION,
     };
 
     let cfg_get = {
@@ -1372,14 +1478,19 @@ fn build_options_service(
             }
         })
     });
-    Arc::new(OptionsService::new(
+    let service = Arc::new(OptionsService::new(
         cfg_getter,
         client,
         runtime_dir.join(OPTIONS_STATE_FILE),
         Some(notifier),
         Arc::new(SystemClock),
         sleeper,
-    ))
+    ));
+    let guard_cfg = Arc::clone(cfg);
+    service.set_entry_guard(Arc::new(move || {
+        Engine::<BinanceFutures>::futures_block_reason(&guard_cfg)
+    }));
+    service
 }
 
 fn env_map() -> HashMap<String, String> {

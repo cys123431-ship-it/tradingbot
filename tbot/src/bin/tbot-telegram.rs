@@ -62,6 +62,11 @@ async fn main() -> Result<(), String> {
             "maperiod".to_string(),
             "/macross SMA 기간 도움말".to_string(),
         ),
+        ("tradfi".to_string(), "TradFi 정배열 전략 메뉴".to_string()),
+        (
+            "tfcoin".to_string(),
+            "/tradfi 종목 지정 (TradFi만)".to_string(),
+        ),
         (
             "btcoptions".to_string(),
             "BTC 옵션 자동매매 메뉴".to_string(),

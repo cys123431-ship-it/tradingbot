@@ -32,7 +32,7 @@ use crate::safety::order_gateway::IdempotentOrderGateway;
 use crate::store::clock::Clock;
 use crate::store::ledger::StrategyLedger;
 use crate::store::order_state::SQLiteTradingStateStore;
-use crate::strategy::{config_btc_ma, config_ma_plus, tradfi};
+use crate::strategy::{config_btc_ma, config_ma_plus, config_tradfi, tradfi};
 
 /// `ServiceError` is `ExchangeError`; the class field carries the Python type name.
 pub type ServiceError = ExchangeError;
@@ -226,6 +226,8 @@ fn is_empty_value(v: &Value) -> bool {
 pub enum Variant {
     BtcMa,
     MaPlus,
+    /// TradFi-only SMA 1/5/120 alignment strategy (`/tradfi`), BtcMa-shaped config.
+    TradFi,
 }
 
 impl Variant {
@@ -233,6 +235,7 @@ impl Variant {
         match self {
             Variant::BtcMa => config_btc_ma::CLIENT_ID_STRATEGY,
             Variant::MaPlus => config_ma_plus::CLIENT_ID_STRATEGY,
+            Variant::TradFi => config_tradfi::CLIENT_ID_STRATEGY,
         }
     }
 
@@ -240,6 +243,7 @@ impl Variant {
         match self {
             Variant::BtcMa => "btc_ma_cross",
             Variant::MaPlus => "ma_cross",
+            Variant::TradFi => "tradfi_ma",
         }
     }
 
@@ -247,6 +251,7 @@ impl Variant {
         match self {
             Variant::BtcMa => "3/200 SMA",
             Variant::MaPlus => "SMA3/120 C",
+            Variant::TradFi => "TradFi 1/5/120",
         }
     }
 
@@ -254,12 +259,13 @@ impl Variant {
         match self {
             Variant::BtcMa => &["sl", "lock"],
             Variant::MaPlus => &["lock"],
+            Variant::TradFi => &["sl"],
         }
     }
 
     pub fn exit_reason_for_kind(self, kind: &str) -> Option<&'static str> {
         match (self, kind) {
-            (Variant::BtcMa, "sl") => Some("EMERGENCY_STOP"),
+            (Variant::BtcMa, "sl") | (Variant::TradFi, "sl") => Some("EMERGENCY_STOP"),
             (Variant::BtcMa, "lock") | (Variant::MaPlus, "lock") => Some("PROFIT_LOCK"),
             _ => None,
         }
@@ -269,6 +275,7 @@ impl Variant {
         match self {
             Variant::BtcMa => config_btc_ma::STRATEGY_VERSION,
             Variant::MaPlus => config_ma_plus::STRATEGY_VERSION,
+            Variant::TradFi => config_tradfi::STRATEGY_VERSION,
         }
     }
 
@@ -276,6 +283,7 @@ impl Variant {
         match self {
             Variant::BtcMa => config_btc_ma::normalize_btc_ma_cross_config(Some(raw)),
             Variant::MaPlus => config_ma_plus::normalize_ma_cross_config(Some(raw)),
+            Variant::TradFi => config_tradfi::normalize_tradfi_config(Some(raw)),
         }
     }
 }
@@ -380,6 +388,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             (Some(fast), Some(slow)) => match self.variant {
                 Variant::BtcMa => format!("{fast}/{slow} SMA"),
                 Variant::MaPlus => format!("{fast}/{slow} SMA C"),
+                Variant::TradFi => self.variant.label().to_string(),
             },
             _ => self.variant.label().to_string(),
         }

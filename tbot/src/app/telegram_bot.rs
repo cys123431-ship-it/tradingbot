@@ -1133,6 +1133,8 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             self.handle_btc_ma_cross_action(rest).await
         } else if let Some(rest) = data.strip_prefix("mc:") {
             self.handle_ma_cross_action(rest).await
+        } else if let Some(rest) = data.strip_prefix("tf:") {
+            self.handle_tradfi_action(rest).await
         } else if let Some(rest) = data.strip_prefix("bo:") {
             self.handle_btc_options_action(rest).await
         } else if let Some(rest) = data.strip_prefix("op:") {
@@ -1185,6 +1187,15 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                     markup: Some(markup),
                 }]
             }
+            "tradfi" => {
+                let (text, markup) = self.tradfi_screen().await;
+                vec![Outgoing::Send {
+                    chat_id,
+                    text,
+                    markup: Some(markup),
+                }]
+            }
+            "tfcoin" => self.handle_tfcoin(chat_id, &args).await,
             "btcoptions" => {
                 let (text, markup) = self.btc_options_screen().await;
                 vec![Outgoing::Send {
@@ -1247,6 +1258,8 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
              /btcma <패스트> <슬로우> — /btcmacross SMA 기간 변경 (예: /btcma 1 200)\n\
              /btcma exit <기간> — /btcmacross 청산 MA 변경, 끄기는 /btcma exit off (예: /btcma exit 69)\n\
              /btcmaperiod — SMA 기간 도움말\n\
+             /tradfi — TradFi 정배열 전략 메뉴 (금·원유·미국주식, 4시간봉 SMA 1·5·120)
+             /tfcoin <종목> — /tradfi 종목 지정, TradFi만 가능 (예: /tfcoin CL)
              /btcoptions — BTC 옵션 자동매매 메뉴 (바이낸스 유럽식 옵션, 매수 전용)\n\
              /options — 옵션 자동매매 메뉴 (멀티코인)\n\
              /exchange — 거래소/네트워크 전환 (바이낸스 테스트넷 · 메인넷, 구 /setup)\n\

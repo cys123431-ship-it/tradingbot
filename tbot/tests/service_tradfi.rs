@@ -115,6 +115,10 @@ fn tradfi_harness(
 }
 
 fn build_with_network(h: &ScopeHarness, network: &str) -> SmaCrossService<MultiFake> {
+    build_variant(h, network, Variant::BtcMa)
+}
+
+fn build_variant(h: &ScopeHarness, network: &str, variant: Variant) -> SmaCrossService<MultiFake> {
     let cfg_arc = h.cfg.clone();
     let config_getter: Arc<dyn Fn() -> Value + Send + Sync> =
         Arc::new(move || cfg_arc.lock().unwrap().clone());
@@ -152,7 +156,7 @@ fn build_with_network(h: &ScopeHarness, network: &str) -> SmaCrossService<MultiF
         config_file_writer: None,
         store_clock: Arc::new(tbot::store::clock::SystemClock),
     };
-    SmaCrossService::new(Variant::BtcMa, deps)
+    SmaCrossService::new(variant, deps)
 }
 
 // ---------------------------------------------------------------- leverage
@@ -477,6 +481,66 @@ async fn pinned_tradfi_coin_is_mainnet_only() {
         .resolve_single_coin("testnet", &json!("AAPL"))
         .await
         .unwrap_err();
+    assert!(
+        err.message.starts_with("TRADFI_MAINNET_ONLY"),
+        "{}",
+        err.message
+    );
+}
+
+// ------------------------------------------------- TradFi-only strategy (/tradfi)
+
+fn tradfi_only(root: &std::path::Path, network: &str, symbol: &str) -> ScopeHarness {
+    let mut h = pinned_harness(root, network);
+    h.cfg.lock().unwrap()["single_symbol"] = json!(symbol);
+    h.service = build_variant(&h, network, Variant::TradFi);
+    h
+}
+
+#[tokio::test]
+async fn tradfi_only_strategy_takes_any_tradfi_and_refuses_crypto() {
+    let root = temp_dir("tradfi_only");
+    let h = tradfi_only(&root, "mainnet", "XAG");
+    let cfg = h.service.config();
+    assert_eq!(cfg["scan_scope"], json!("single"));
+    assert_eq!(cfg["timeframe"], json!("4h"));
+    assert_eq!(cfg["signal_mode"], json!("align"));
+    // Commodities other than gold are fine here (unlike the /macoin TradFi pin).
+    let universe = h.service.scan_universe("mainnet", &cfg).await.unwrap();
+    assert_eq!(universe[0].1, "XAGUSDT");
+    let (_, aapl) = h
+        .service
+        .resolve_any_tradfi_coin("mainnet", &json!("aapl"))
+        .await
+        .unwrap();
+    assert_eq!(aapl, "AAPLUSDT");
+    let err = h
+        .service
+        .resolve_any_tradfi_coin("mainnet", &json!("ETH"))
+        .await
+        .unwrap_err();
+    assert!(err.message.starts_with("NOT_TRADFI"), "{}", err.message);
+    let mut list = h.service.tradfi_any_symbols("mainnet").await.unwrap();
+    list.sort();
+    assert_eq!(list, vec!["AAPLUSDT".to_string(), "XAGUSDT".to_string()]);
+}
+
+#[tokio::test]
+async fn tradfi_only_strategy_never_scans_a_crypto_pin() {
+    let root = temp_dir("tradfi_only_crypto");
+    // config.json edited by hand to a crypto coin: the universe is refused.
+    let h = tradfi_only(&root, "mainnet", "ETHUSDT");
+    let cfg = h.service.config();
+    let err = h.service.scan_universe("mainnet", &cfg).await.unwrap_err();
+    assert!(err.message.starts_with("NOT_TRADFI"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn tradfi_only_strategy_is_mainnet_only() {
+    let root = temp_dir("tradfi_only_testnet");
+    let h = tradfi_only(&root, "testnet", "XAG");
+    let cfg = h.service.config();
+    let err = h.service.scan_universe("testnet", &cfg).await.unwrap_err();
     assert!(
         err.message.starts_with("TRADFI_MAINNET_ONLY"),
         "{}",

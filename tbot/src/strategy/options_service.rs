@@ -45,6 +45,8 @@ pub const SCAN_OUTCOME_LABELS: [(&str, &str); 15] = [
 pub type Notifier = Arc<dyn Fn(String) -> BoxFut<()> + Send + Sync>;
 pub type Sleeper = Arc<dyn Fn(f64) -> BoxFut<()> + Send + Sync>;
 pub type ConfigGetter = Arc<dyn Fn() -> Value + Send + Sync>;
+/// `Some(reason)` blocks new option entries (existing positions are still managed).
+pub type EntryGuard = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
 /// Internal error type mirroring Python exceptions.
 #[derive(Debug)]
@@ -477,6 +479,9 @@ pub struct OptionsService<C: OptionsApi> {
     pub(crate) ownership_recovery_done: Mutex<bool>,
     pub(crate) mark_cache: Mutex<HashMap<String, Value>>,
     pub(crate) ticker_cache: Mutex<HashMap<String, Value>>,
+    /// Returns a reason when new entries must not happen (e.g. a futures
+    /// strategy is ON). Checked on every scan, after the ON/OFF check.
+    entry_guard: std::sync::Mutex<Option<EntryGuard>>,
 }
 
 impl<C: OptionsApi> OptionsService<C> {
@@ -509,6 +514,7 @@ impl<C: OptionsApi> OptionsService<C> {
             ownership_recovery_done,
             mark_cache,
             ticker_cache,
+            entry_guard: std::sync::Mutex::new(None),
         };
         let loaded = service.load_state_migrated();
         if let Ok(mut guard) = service.state.lock() {
@@ -526,6 +532,19 @@ impl<C: OptionsApi> OptionsService<C> {
     /// A clone of the current state map.
     pub fn state(&self) -> Map<String, Value> {
         self.state.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Install the new-entry guard (the engine blocks options while futures run).
+    pub fn set_entry_guard(&self, guard: EntryGuard) {
+        if let Ok(mut slot) = self.entry_guard.lock() {
+            *slot = Some(guard);
+        }
+    }
+
+    /// The guard's current block reason, if any.
+    pub fn entry_block_reason(&self) -> Option<String> {
+        let guard = self.entry_guard.lock().ok().and_then(|g| g.clone())?;
+        guard()
     }
 
     pub fn state_unreadable(&self) -> bool {
@@ -2171,6 +2190,9 @@ impl<C: OptionsApi> OptionsService<C> {
         }
         if !py_truthy(cfg.get("enabled").unwrap_or(&Value::Null)) {
             return self.record_reason("옵션 자동매매 OFF — 신규 진입하지 않습니다.", false, None);
+        }
+        if let Some(reason) = self.entry_block_reason() {
+            return self.record_reason(&reason, false, None);
         }
         if force_scan {
             let cooldown = st::pyf(cfg.get("manual_scan_cooldown_seconds"), 60.0);

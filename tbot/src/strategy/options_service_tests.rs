@@ -1587,3 +1587,33 @@ fn adaptive_service(dir: &Path) -> AdaptiveHarness {
 fn st_get_any<C: OptionsApi>(svc: &OptionsService<C>, key: &str) -> Value {
     svc.st_get(key)
 }
+
+// ---------------------------------------------------------------------------
+// User rule (2026-11-18): option entries only while every futures strategy is OFF.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn futures_strategy_on_blocks_option_entries() {
+    let dir = tempdir();
+    let h = service(&dir, true);
+    let futures_on = Arc::new(Mutex::new(true));
+    let flag = futures_on.clone();
+    h.svc.set_entry_guard(Arc::new(move || {
+        if *flag.lock().unwrap() {
+            Some("선물 전략(/tradfi)이 켜져 있어 옵션 신규 진입을 하지 않습니다.".to_string())
+        } else {
+            None
+        }
+    }));
+    let result = h.svc.run_cycle(true, false).await;
+    assert_eq!(result["action"], "waiting");
+    assert!(
+        result["reason"].as_str().unwrap_or("").contains("/tradfi"),
+        "{result}"
+    );
+    assert!(h.client.snapshot_orders().is_empty());
+
+    *futures_on.lock().unwrap() = false;
+    let result = h.svc.run_cycle(true, false).await;
+    assert_eq!(result["action"], "entered", "{result}");
+}

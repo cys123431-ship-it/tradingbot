@@ -248,6 +248,12 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         if scope == TRADFI_SCOPE {
             return self.tradfi_universe(network, cfg).await;
         }
+        if scope == "single" && self.variant == Variant::TradFi {
+            // TradFi-only strategy: a crypto symbol is refused, never traded.
+            let text = cfg.get("single_symbol").cloned().unwrap_or(Value::Null);
+            let (ccxt_symbol, market_id) = self.resolve_any_tradfi_coin(network, &text).await?;
+            return Ok(vec![(ccxt_symbol, market_id, None)]);
+        }
         if scope == "single" {
             let text = cfg.get("single_symbol").cloned().unwrap_or(Value::Null);
             let (ccxt_symbol, market_id) = self.resolve_single_coin(network, &text).await?;
@@ -291,6 +297,44 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         self.resolve_market(network, text, "tradfi").await
     }
 
+    /// Any Binance TradFi perpetual (gold, oil, equities...), never crypto.
+    /// Used by the TradFi-only strategy (`/tradfi`).
+    pub async fn resolve_any_tradfi_coin(
+        &self,
+        network: &str,
+        text: &Value,
+    ) -> Result<(String, String), ServiceError> {
+        self.resolve_market(network, text, "tradfi_any").await
+    }
+
+    /// Market ids of every trading Binance TradFi perpetual (for the menu).
+    pub async fn tradfi_any_symbols(&self, network: &str) -> Result<Vec<String>, ServiceError> {
+        if !self.tradfi_network_allowed("tradfi", network) {
+            return Err(ServiceError::new("ValueError", TRADFI_MAINNET_ONLY_REASON));
+        }
+        let exchange = self.exchange(network).await?;
+        let markets = match exchange.markets() {
+            Some(m) => m,
+            None => exchange.load_markets().await?,
+        };
+        let mut out: Vec<String> = markets
+            .iter()
+            .filter(|(symbol, market)| {
+                coinselect::market_is_tradifi_perpetual(symbol, Some(market))
+                    && market.get("active").and_then(|v| v.as_bool()) != Some(false)
+            })
+            .filter_map(|(_, market)| {
+                market
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_uppercase)
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
     async fn resolve_market(
         &self,
         network: &str,
@@ -315,7 +359,9 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         if base.is_empty() {
             return Err(ServiceError::new("ValueError", "SYMBOL_EMPTY"));
         }
-        if requirement == "tradfi" && !self.tradfi_network_allowed("tradfi", network) {
+        if (requirement == "tradfi" || requirement == "tradfi_any")
+            && !self.tradfi_network_allowed("tradfi", network)
+        {
             return Err(ServiceError::new("ValueError", TRADFI_MAINNET_ONLY_REASON));
         }
         let exchange = self.exchange(network).await?;
@@ -374,6 +420,15 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
                 ));
             }
             let market_value = Value::Object(market.clone());
+            if requirement == "tradfi_any" {
+                if !coinselect::market_is_tradifi_perpetual(symbol, Some(&market_value)) {
+                    return Err(ServiceError::new(
+                        "ValueError",
+                        format!("NOT_TRADFI:{market_id}"),
+                    ));
+                }
+                return Ok((symbol.clone(), market_id.clone()));
+            }
             if requirement == "tradfi" {
                 if !tradfi::market_in_tradfi_scope(symbol, Some(&market_value)) {
                     return Err(ServiceError::new(
@@ -1638,10 +1693,12 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         if let Some(late) = self.late_cross_signal(cfg, state, result) {
             return Some(late);
         }
-        if cfg
-            .get("exit_ma_enabled")
-            .map(value_truthy)
-            .unwrap_or(false)
+        let align_mode = cfg.get("signal_mode").and_then(|v| v.as_str()) == Some("align");
+        if !align_mode
+            && cfg
+                .get("exit_ma_enabled")
+                .map(value_truthy)
+                .unwrap_or(false)
         {
             // Only the original SMA(fast)/SMA(slow) cross may open a position.
             let has_trend = result
