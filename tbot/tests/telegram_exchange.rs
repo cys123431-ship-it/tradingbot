@@ -251,3 +251,56 @@ async fn an_open_position_blocks_the_switch() {
     assert!(refused.contains("보유 포지션"), "{refused}");
     assert_eq!(ctx.api()["exchange_mode"], json!("binance_testnet"));
 }
+
+/// Every reply of a plain-text message (no leading `/`).
+async fn send_all(ctx: &Ctx, text: &str) -> Vec<(String, Value)> {
+    let msg = json!({"update_id": 3, "message": {"chat": {"id": 1}, "text": text}});
+    ctx.bot
+        .handle_update(&msg)
+        .await
+        .into_iter()
+        .filter_map(|o| match o {
+            tbot::app::telegram_bot::Outgoing::Send { text, markup, .. } => {
+                Some((text, markup.unwrap_or(Value::Null)))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn old_python_testnet_key_is_answered_not_dropped() {
+    // The Python /setup reply keyboard sent "1. 바이낸스 테스트넷" as plain text;
+    // tbot used to answer nothing, which looked like a dead bot.
+    let tmp = common::temp_dir("exch_legacy_key");
+    let ctx = controller(
+        &tmp,
+        json!({
+            "exchange_mode": "binance_mainnet",
+            "testnet": {"api_key": "tk", "secret_key": "ts"},
+            "mainnet": {"api_key": "mk", "secret_key": "ms"},
+        }),
+    )
+    .await;
+    let replies = send_all(&ctx, "1. 바이낸스 테스트넷").await;
+    assert_eq!(replies.len(), 2, "{replies:?}");
+    assert_eq!(replies[0].1, json!({"remove_keyboard": true}));
+    // The same switch screen as the inline button: nothing is written yet.
+    assert!(
+        buttons(&replies[1].1).contains(&"bm:exch:confirm:binance_testnet".to_string()),
+        "{replies:?}"
+    );
+    assert_eq!(ctx.api()["exchange_mode"], json!("binance_mainnet"));
+}
+
+#[tokio::test]
+async fn unknown_plain_text_gets_an_answer() {
+    let tmp = common::temp_dir("exch_plain_text");
+    let ctx = controller(&tmp, testnet_api()).await;
+    let replies = send_all(&ctx, "안녕").await;
+    assert_eq!(replies.len(), 2, "{replies:?}");
+    assert!(replies[1].0.contains("/help"), "{replies:?}");
+    let replies = send_all(&ctx, "나가기").await;
+    assert_eq!(replies.len(), 1, "{replies:?}");
+    assert_eq!(replies[0].1, json!({"remove_keyboard": true}));
+}

@@ -685,13 +685,21 @@ async fn unknown_command_without_note_still_answers() {
     assert!(text.contains("/help"), "{text}");
 }
 
-/// Plain chat text (no slash) stays silent so the bot never echoes.
+/// Plain chat text (no slash) is answered: silence looked like a dead bot
+/// when an old Python reply-keyboard button was pressed. Nothing is changed.
 #[tokio::test]
-async fn plain_text_is_ignored() {
+async fn plain_text_is_answered_without_acting() {
     let tmp = common::temp_dir("tg_plain_text");
     let ctx = controller(&tmp);
+    let before = std::fs::read_to_string(&ctx.cfg_path).unwrap();
     let msg = json!({"update_id": 1, "message": {"chat": {"id": 1}, "text": "setup"}});
-    assert!(ctx.bot.handle_update(&msg).await.is_empty());
+    let out = ctx.bot.handle_update(&msg).await;
+    assert_eq!(out.len(), 2, "{out:?}");
+    let tbot::app::telegram_bot::Outgoing::Send { text, .. } = &out[1] else {
+        panic!("expected a Send reply");
+    };
+    assert!(text.contains("/help"), "{text}");
+    assert_eq!(std::fs::read_to_string(&ctx.cfg_path).unwrap(), before);
 }
 
 #[tokio::test]

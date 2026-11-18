@@ -1169,6 +1169,9 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             .unwrap_or(self.owner_chat_id);
         let text = message.get("text").and_then(|v| v.as_str()).unwrap_or("");
         let (command, args) = parse_command(text);
+        if command.is_empty() && !text.trim().is_empty() {
+            return self.handle_plain_text(chat_id, text).await;
+        }
         match command.as_str() {
             "btcmacross" => {
                 let (status, markup) = self.status_screen().await;
@@ -1245,6 +1248,48 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// Text without a leading `/`. The Python bot left reply keyboards in the
+    /// chat (`1. 바이낸스 테스트넷`, `🚨 STOP`, ...); their buttons send plain
+    /// text. tbot used to drop it silently, so a press looked like a dead bot.
+    /// Answer every one, act on the ones that still mean something, and remove
+    /// the stale keyboard.
+    async fn handle_plain_text(&self, chat_id: i64, text: &str) -> Vec<Outgoing> {
+        let mut out = vec![Outgoing::Send {
+            chat_id,
+            text: "ℹ️ 예전 파이썬 봇의 아래쪽 키보드를 지웠습니다. 이 봇은 /명령과 메시지 안의 버튼으로 움직입니다 (/help)."
+                .to_string(),
+            markup: Some(json!({ "remove_keyboard": true })),
+        }];
+        let (reply, markup) = match legacy_keyboard_action(text) {
+            Some(LegacyKey::Exchange(net)) => {
+                let (t, m) = self.exchange_action(net).await;
+                (t, Some(m))
+            }
+            Some(LegacyKey::ExchangeMenu) => {
+                let (t, m) = self.exchange_menu().await;
+                (t, Some(m))
+            }
+            Some(LegacyKey::Stop) => {
+                out.extend(self.handle_stop(chat_id).await);
+                return out;
+            }
+            Some(LegacyKey::Closed) => return out,
+            None => (
+                format!(
+                    "⚠️ 명령으로 알아듣지 못했습니다: {}\n명령은 / 로 시작합니다. 사용 가능한 명령은 /help 에 있습니다.",
+                    text.trim().chars().take(40).collect::<String>()
+                ),
+                None,
+            ),
+        };
+        out.push(Outgoing::Send {
+            chat_id,
+            text: reply,
+            markup,
+        });
+        out
     }
 
     async fn handle_help(&self, chat_id: i64) -> Vec<Outgoing> {
@@ -3810,6 +3855,39 @@ fn value_display(v: &Value) -> String {
 }
 
 /// Parse `text` into (command, args) the way `CommandHandler` would.
+/// What a Python-era reply-keyboard button still means in tbot.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LegacyKey {
+    /// `1. 바이낸스 테스트넷` / `2. 바이낸스 메인넷` / `3. 업비트 KRW 현물`
+    Exchange(&'static str),
+    /// `거래소/네트워크 전환`
+    ExchangeMenu,
+    /// `🚨 STOP`: the same full stop as /stop.
+    Stop,
+    /// `나가기`: only the keyboard goes away.
+    Closed,
+}
+
+pub(crate) fn legacy_keyboard_action(text: &str) -> Option<LegacyKey> {
+    let t = text.trim();
+    let lower = t.to_lowercase();
+    if t.contains("테스트넷") || t == "1" {
+        Some(LegacyKey::Exchange("testnet"))
+    } else if t.contains("메인넷") || t == "2" {
+        Some(LegacyKey::Exchange("mainnet"))
+    } else if t.contains("업비트") || t == "3" {
+        Some(LegacyKey::Exchange("upbit"))
+    } else if t.contains("거래소/네트워크") {
+        Some(LegacyKey::ExchangeMenu)
+    } else if lower.trim_start_matches(|c: char| !c.is_ascii_alphabetic()) == "stop" {
+        Some(LegacyKey::Stop)
+    } else if t == "나가기" || t == "0" {
+        Some(LegacyKey::Closed)
+    } else {
+        None
+    }
+}
+
 pub(crate) fn parse_command(text: &str) -> (String, Vec<String>) {
     let trimmed = text.trim();
     if !trimmed.starts_with('/') {
@@ -3906,4 +3984,28 @@ fn _unused_default_period_check(cfg: &Value) -> bool {
         3,
         200,
     )
+}
+
+#[cfg(test)]
+mod legacy_key_tests {
+    use super::{legacy_keyboard_action as k, LegacyKey};
+
+    #[test]
+    fn python_keyboard_labels_map() {
+        assert_eq!(
+            k("1. 바이낸스 테스트넷"),
+            Some(LegacyKey::Exchange("testnet"))
+        );
+        assert_eq!(
+            k("2. 바이낸스 메인넷"),
+            Some(LegacyKey::Exchange("mainnet"))
+        );
+        assert_eq!(k("3. 업비트 KRW 현물"), Some(LegacyKey::Exchange("upbit")));
+        assert_eq!(k("1"), Some(LegacyKey::Exchange("testnet")));
+        assert_eq!(k("거래소/네트워크 전환"), Some(LegacyKey::ExchangeMenu));
+        assert_eq!(k("🚨 STOP"), Some(LegacyKey::Stop));
+        assert_eq!(k("나가기"), Some(LegacyKey::Closed));
+        assert_eq!(k("⏸ PAUSE"), None);
+        assert_eq!(k("stopped?"), None);
+    }
 }
