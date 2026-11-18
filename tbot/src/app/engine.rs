@@ -14,14 +14,25 @@ use crate::app::ipc::{self, BoxFut, EngineApi, Handler, Request};
 use crate::app::telegram_api::TelegramApi;
 use crate::exchange::binance::{BinanceClient, Credentials, Network};
 use crate::exchange::binance_futures::BinanceFutures;
+use crate::exchange::binance_options::{BinanceOptionsClient, CredentialsGetter};
 use crate::exchange::FuturesExchange;
 use crate::store::clock::{Clock, SystemClock};
+use crate::strategy::options_config::normalize_options_config;
+use crate::strategy::options_service::{ConfigGetter, Notifier, OptionsService, Sleeper};
 use crate::strategy::service::base::{BINANCE_MAINNET, BINANCE_TESTNET, UPBIT_MODE};
 use crate::strategy::service::{ServiceDeps, SmaCrossService, Variant};
 use crate::strategy::tradfi::market_in_tradfi_scope;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HEARTBEAT_FILE: &str = "tbot_engine_heartbeat.json";
+
+/// config.json section and runtime state file of the options sleeve (shared with Python).
+const OPTIONS_SECTION: &str = "options_trading";
+const OPTIONS_STATE_FILE: &str = "options_trading_state.json";
+/// Marker written once when tbot first runs the options sleeve. Until it is set the
+/// sleeve is forced OFF, so a stale `enabled: true` left by the retired Python bot can
+/// never start real option orders right after a deploy.
+const OPTIONS_PORT_ACK: &str = "tbot_port_ack";
 
 /// Coin list size requested by the Telegram "pick a coin" keyboard.
 const PICK_LIST_SIZE: usize = 12;
@@ -33,6 +44,8 @@ pub struct Engine<E: FuturesExchange + 'static> {
     cfg: Arc<ConfigFile>,
     btc_ma: Arc<SmaCrossService<E>>,
     ma_plus: Arc<SmaCrossService<E>>,
+    /// Binance European Options sleeve (None in tests that build the engine by hand).
+    options: Option<Arc<OptionsService<BinanceOptionsClient>>>,
     #[allow(dead_code)] // notices go through the service notifier
     telegram: Option<TelegramApi>,
     started_at: i64,
@@ -76,6 +89,7 @@ impl Engine<BinanceFutures> {
         };
 
         let btc_ma = build_service(&cfg, runtime_dir.clone(), Variant::BtcMa, notifier.clone())?;
+        let options = Some(build_options_service(&cfg, &runtime_dir, notifier.clone()));
         let ma_plus = build_service(&cfg, runtime_dir.clone(), Variant::MaPlus, notifier)?;
 
         let started_at = now_secs();
@@ -83,6 +97,7 @@ impl Engine<BinanceFutures> {
             cfg,
             btc_ma,
             ma_plus,
+            options,
             telegram,
             started_at,
             runtime_dir,
@@ -103,6 +118,7 @@ impl<E: FuturesExchange + 'static> Engine<E> {
             cfg,
             btc_ma,
             ma_plus,
+            options: None,
             telegram: None,
             started_at: now_secs(),
             runtime_dir,
@@ -143,6 +159,10 @@ impl<E: FuturesExchange + 'static> Engine<E> {
             let engine = Arc::clone(&self);
             tokio::spawn(async move { engine.heartbeat_loop().await })
         };
+        let options_loop = self.options.clone().map(|service| {
+            let engine = Arc::clone(&self);
+            tokio::spawn(async move { engine.options_loop(service).await })
+        });
 
         let ctrl_c = tokio::signal::ctrl_c();
         #[cfg(unix)]
@@ -165,6 +185,9 @@ impl<E: FuturesExchange + 'static> Engine<E> {
         btc_loop.abort();
         ma_loop.abort();
         heartbeat.abort();
+        if let Some(task) = options_loop {
+            task.abort();
+        }
         self.write_heartbeat().await;
         Ok(())
     }
@@ -191,6 +214,44 @@ impl<E: FuturesExchange + 'static> Engine<E> {
             let sleep_secs = interval.max(5) as u64;
             tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
         }
+    }
+
+    /// Python `_options_trading_loop`: one cycle, then sleep max(5, manage_interval).
+    async fn options_loop(&self, service: Arc<OptionsService<BinanceOptionsClient>>) {
+        self.options_port_gate().await;
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+        loop {
+            let result = service.run_cycle(false, false).await;
+            let action = result.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            if action == "blocked" {
+                let reason = result.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                log_line(&format!("engine: options cycle blocked: {reason}"));
+            }
+            let interval = cfg_field_i64(&service.config(), "manage_interval_seconds", 10);
+            tokio::time::sleep(std::time::Duration::from_secs(interval.max(5) as u64)).await;
+        }
+    }
+
+    /// Force the options sleeve OFF once, the first time tbot runs it (see OPTIONS_PORT_ACK).
+    async fn options_port_gate(&self) {
+        let section = self.cfg.section(OPTIONS_SECTION);
+        if section.get(OPTIONS_PORT_ACK).and_then(|v| v.as_bool()) == Some(true) {
+            return;
+        }
+        let was_on = section
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mut changes = Map::new();
+        changes.insert("enabled".to_string(), Value::Bool(false));
+        changes.insert(OPTIONS_PORT_ACK.to_string(), Value::Bool(true));
+        if let Err(e) = self.cfg.update_values(OPTIONS_SECTION, changes).await {
+            log_line(&format!("engine: options port gate write failed: {e}"));
+            return;
+        }
+        log_line(&format!(
+            "engine: options sleeve forced OFF on first tbot start (was_on={was_on})"
+        ));
     }
 
     async fn heartbeat_loop(&self) {
@@ -523,6 +584,35 @@ impl<E: FuturesExchange + 'static> Engine<E> {
                 Ok(Value::Array(events))
             }
             "emergency_stop" => self.emergency_stop().await,
+            "options_status" => {
+                let service = self.options_service()?;
+                let refresh = req.arg("refresh").and_then(|v| v.as_bool()).unwrap_or(true);
+                Ok(service.status_snapshot(refresh).await)
+            }
+            "options_config" => Ok(self.options_service()?.config()),
+            "options_state" => Ok(Value::Object(self.options_service()?.state())),
+            "options_set" => {
+                self.options_service()?;
+                let mut changes = req.arg_map("changes");
+                if changes.contains_key("enabled") {
+                    // An explicit ON/OFF from the user settles the first-start gate.
+                    changes.insert(OPTIONS_PORT_ACK.to_string(), Value::Bool(true));
+                }
+                self.cfg.update_values(OPTIONS_SECTION, changes).await
+            }
+            "options_preflight" => Ok(self.options_service()?.preflight().await),
+            "options_run_cycle" => {
+                let service = self.options_service()?;
+                let force_scan = req
+                    .arg("force_scan")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let force_exit = req
+                    .arg("force_exit")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                Ok(service.run_cycle(force_scan, force_exit).await)
+            }
             "turn_off_others" => {
                 let except = req.arg_str("except").unwrap_or_default();
                 self.turn_off_others(&except).await
@@ -1027,7 +1117,59 @@ impl<E: FuturesExchange + 'static> Engine<E> {
                 }
             }
         }
+        lines.extend(self.stop_options().await);
         Ok(json!({"lines": lines}))
+    }
+
+    fn options_service(&self) -> Result<&Arc<OptionsService<BinanceOptionsClient>>, String> {
+        self.options
+            .as_ref()
+            .ok_or_else(|| "ValueError: options sleeve is not configured".to_string())
+    }
+
+    /// Python `_stop_all_auxiliary_trading` (options part): entries OFF, close bot options.
+    async fn stop_options(&self) -> Vec<String> {
+        let Some(service) = self.options.as_ref() else {
+            return Vec::new();
+        };
+        let was_on = self
+            .cfg
+            .section(OPTIONS_SECTION)
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mut changes = Map::new();
+        changes.insert("enabled".to_string(), Value::Bool(false));
+        if let Err(e) = self.cfg.update_values(OPTIONS_SECTION, changes).await {
+            return vec![format!("⚠️ 옵션 정지 처리 오류: {e}")];
+        }
+        let state = service.state();
+        let symbol = state
+            .get("active_position")
+            .and_then(|p| p.get("symbol"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if symbol.is_empty() {
+            return vec![format!(
+                "옵션: 신규진입 OFF{}",
+                if was_on {
+                    ""
+                } else {
+                    " (이미 꺼져 있었음)"
+                }
+            )];
+        }
+        let result = service.run_cycle(false, true).await;
+        let reason = result
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| result.get("action").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        vec![format!(
+            "옵션: 신규진입 OFF · 봇 옵션 {symbol} 청산 요청 — {reason}"
+        )]
     }
 }
 
@@ -1189,6 +1331,55 @@ fn build_service(
     };
 
     Ok(Arc::new(SmaCrossService::new(variant, deps)))
+}
+
+fn build_options_service(
+    cfg: &Arc<ConfigFile>,
+    runtime_dir: &std::path::Path,
+    notifier: Notifier,
+) -> Arc<OptionsService<BinanceOptionsClient>> {
+    let section_cfg = Arc::clone(cfg);
+    let cfg_getter: ConfigGetter = Arc::new(move || section_cfg.section(OPTIONS_SECTION));
+    // Python used the futures mainnet key pair (`api.mainnet`) for EAPI as well.
+    let creds_cfg = Arc::clone(cfg);
+    let creds: CredentialsGetter = Arc::new(move || {
+        let pair = credentials(
+            &creds_cfg.load(),
+            crate::strategy::config_base::NETWORK_MAINNET,
+        );
+        let field = |key: &str| {
+            pair.get(key)
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default()
+        };
+        let (api_key, secret) = (field("api_key"), field("secret_key"));
+        if api_key.is_empty() || secret.is_empty() {
+            None
+        } else {
+            Some(Credentials { api_key, secret })
+        }
+    });
+    let timeout = normalize_options_config(&cfg.section(OPTIONS_SECTION))
+        .get("request_timeout_seconds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10);
+    let client = Arc::new(BinanceOptionsClient::new(creds, timeout));
+    let sleeper: Sleeper = Arc::new(|secs: f64| -> BoxFut<()> {
+        Box::pin(async move {
+            if secs.is_finite() && secs > 0.0 {
+                tokio::time::sleep(std::time::Duration::from_secs_f64(secs)).await;
+            }
+        })
+    });
+    Arc::new(OptionsService::new(
+        cfg_getter,
+        client,
+        runtime_dir.join(OPTIONS_STATE_FILE),
+        Some(notifier),
+        Arc::new(SystemClock),
+        sleeper,
+    ))
 }
 
 fn env_map() -> HashMap<String, String> {

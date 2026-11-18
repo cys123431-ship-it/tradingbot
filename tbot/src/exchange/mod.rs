@@ -1,5 +1,6 @@
 pub mod binance;
 pub mod binance_futures;
+pub mod binance_options;
 pub mod ccxt_shape;
 pub mod errors;
 pub mod facade;

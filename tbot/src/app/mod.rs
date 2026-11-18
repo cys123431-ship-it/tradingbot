@@ -5,3 +5,4 @@ pub mod ipc;
 pub mod telegram_api;
 pub mod telegram_bot;
 pub mod telegram_ma_cross;
+pub mod telegram_options;

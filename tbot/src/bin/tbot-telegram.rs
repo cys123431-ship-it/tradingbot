@@ -62,9 +62,20 @@ async fn main() -> Result<(), String> {
             "maperiod".to_string(),
             "/macross SMA 기간 도움말".to_string(),
         ),
+        (
+            "btcoptions".to_string(),
+            "BTC 옵션 자동매매 메뉴".to_string(),
+        ),
+        (
+            "options".to_string(),
+            "옵션 자동매매 메뉴 (멀티코인)".to_string(),
+        ),
         ("start".to_string(), "도움말".to_string()),
         ("help".to_string(), "도움말".to_string()),
-        ("stop".to_string(), "모든 선물 전략 비상 정지".to_string()),
+        (
+            "stop".to_string(),
+            "모든 선물 전략·옵션 비상 정지".to_string(),
+        ),
     ];
     for name in BTC_MA_PERIOD_COMMANDS {
         if *name == "btcma" || *name == "btcmaperiod" {

@@ -13,6 +13,17 @@ use tokio::time::{timeout, Duration};
 const MAX_LINE: usize = 1024 * 1024;
 const DEFAULT_PORT: u16 = 47321;
 const DEFAULT_TIMEOUT_SECS: u64 = 15;
+/// Commands that may place / verify exchange orders or scan many option contracts.
+const LONG_TIMEOUT_SECS: u64 = 120;
+
+fn request_timeout_secs(cmd: &str) -> u64 {
+    match cmd {
+        "emergency_stop" | "options_run_cycle" | "options_status" | "options_preflight" => {
+            LONG_TIMEOUT_SECS
+        }
+        _ => DEFAULT_TIMEOUT_SECS,
+    }
+}
 pub const TOKEN_FILE: &str = "tbot_ipc.token";
 
 pub type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -162,7 +173,7 @@ impl IpcClient {
         .map_err(|_| format!("ENGINE_UNREACHABLE: connect to {} timed out", self.addr))?
         .map_err(|e| format!("ENGINE_UNREACHABLE: {e}"))?;
         let (read_half, mut write_half) = stream.into_split();
-        timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS), async {
+        timeout(Duration::from_secs(request_timeout_secs(cmd)), async {
             write_half
                 .write_all(line.as_bytes())
                 .await

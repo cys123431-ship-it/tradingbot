@@ -1133,6 +1133,10 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             self.handle_btc_ma_cross_action(rest).await
         } else if let Some(rest) = data.strip_prefix("mc:") {
             self.handle_ma_cross_action(rest).await
+        } else if let Some(rest) = data.strip_prefix("bo:") {
+            self.handle_btc_options_action(rest).await
+        } else if let Some(rest) = data.strip_prefix("op:") {
+            self.handle_options_action(rest).await
         } else {
             return out;
         };
@@ -1181,6 +1185,22 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                     markup: Some(markup),
                 }]
             }
+            "btcoptions" => {
+                let (text, markup) = self.btc_options_screen().await;
+                vec![Outgoing::Send {
+                    chat_id,
+                    text,
+                    markup: Some(markup),
+                }]
+            }
+            "options" => {
+                let (text, markup) = self.options_screen().await;
+                vec![Outgoing::Send {
+                    chat_id,
+                    text,
+                    markup: Some(markup),
+                }]
+            }
             other if EXCHANGE_COMMANDS.contains(&other) => {
                 let (text, markup) = self.exchange_menu().await;
                 vec![Outgoing::Send {
@@ -1226,10 +1246,12 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
              /macoin <코인> — /btcmacross 거래 코인 1개 지정 (예: /macoin SOL)\n\
              /btcma <패스트> <슬로우> — /btcmacross SMA 기간 변경 (예: /btcma 1 200)\n\
              /btcma exit <기간> — /btcmacross 청산 MA 변경, 끄기는 /btcma exit off (예: /btcma exit 69)\n\
-             /btcmaperiod — SMA 기간 도움말\
+             /btcmaperiod — SMA 기간 도움말\n\
+             /btcoptions — BTC 옵션 자동매매 메뉴 (바이낸스 유럽식 옵션, 매수 전용)\n\
+             /options — 옵션 자동매매 메뉴 (멀티코인)\n\
              /exchange — 거래소/네트워크 전환 (바이낸스 테스트넷 · 메인넷, 구 /setup)\n\
              /map <패스트> <슬로우> — /macross SMA 기간 변경 (예: /map 1 200)\n\
-             /stop — 두 전략 모두 신규 진입 OFF + 보유 포지션 청산\n\
+             /stop — 두 전략 모두 신규 진입 OFF + 보유 포지션 청산 (옵션도 신규진입 OFF + 봇 옵션 청산)\n\
              /help — 이 목록 (없는 명령은 이 봇이 모른다고 답합니다)",
             strategy_name(&cfg),
             strategy_name(&ma_cfg),
