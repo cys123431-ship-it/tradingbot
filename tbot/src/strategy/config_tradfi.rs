@@ -56,7 +56,8 @@ pub fn default_tradfi_config() -> Value {
 
 /// Normalize the raw `tradfi_ma` section: shared SMA-cross normalization, then pin
 /// every setting that defines this strategy. Only `enabled`, `trading_mode`,
-/// `network`, `single_symbol`, `timeframe`, `entry_mode` and `exit_ma_period` are
+/// `network`, `single_symbol`, `timeframe`, `entry_mode`, `exit_ma_period` and
+/// `profit_lock_enabled` (default off; lock steps are the shared 5/5/1) are
 /// user-controlled.
 pub fn normalize_tradfi_config(raw: Option<&Value>) -> Value {
     let supplied = raw.and_then(|v| v.as_object()).cloned().unwrap_or_default();
@@ -86,9 +87,16 @@ pub fn normalize_tradfi_config(raw: Option<&Value>) -> Value {
         .map(|s| s.trim().to_lowercase())
         .filter(|s| TIMEFRAMES.contains(&s.as_str()))
         .unwrap_or_else(|| DEFAULT_TIMEFRAME.to_string());
+    let profit_lock = match supplied.get("profit_lock_enabled") {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => matches!(s.trim().to_lowercase().as_str(), "true" | "1" | "on"),
+        Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0) != 0.0,
+        _ => false,
+    };
     let mut cfg = normalize_btc_ma_cross_config(Some(&Value::Object(supplied)));
     if let Some(map) = cfg.as_object_mut() {
         apply_fixed(map, exit_ma, &entry_mode, &symbol, &timeframe);
+        map.insert("profit_lock_enabled".into(), Value::Bool(profit_lock));
     }
     cfg
 }
@@ -137,6 +145,9 @@ fn apply_fixed(
         "margin_fraction": MARGIN_FRACTION,
         "emergency_stop_roi_percent": EMERGENCY_STOP_ROI,
         "stop_ma_period": 0,
+        "lock_start_roi_percent": "5",
+        "lock_step_percent": "5",
+        "lock_gap_percent": "1",
         "profit_lock_enabled": false,
         "profit_lock_switch_count": 0,
         "scale_in_enabled": false,
@@ -178,7 +189,9 @@ mod tests {
         assert_eq!(cfg["timeframe"], json!("4h"));
         assert_eq!(cfg["exit_ma_period"], json!(50));
         assert_eq!(cfg["entry_mode"], json!("trend"));
-        assert_eq!(cfg["profit_lock_enabled"], json!(false));
+        assert_eq!(cfg["profit_lock_enabled"], json!(true)); // user toggle
+        assert_eq!(cfg["lock_start_roi_percent"], json!("5"));
+        assert_eq!(cfg["profit_lock_switch_count"], json!(0));
         assert_eq!(cfg["signal_mode"], json!("align"));
     }
 
@@ -214,5 +227,8 @@ mod tests {
         let d = default_tradfi_config();
         assert_eq!(d["enabled"], json!(false));
         assert_eq!(d["trading_mode"], json!("DRY_RUN"));
+        assert_eq!(d["profit_lock_enabled"], json!(false));
+        let cfg = normalize_tradfi_config(Some(&json!({"exit_ma_period": 20})));
+        assert_eq!(cfg["profit_lock_enabled"], json!(false));
     }
 }

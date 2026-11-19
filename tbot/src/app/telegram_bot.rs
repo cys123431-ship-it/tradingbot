@@ -946,7 +946,7 @@ fn scale_in_text(cfg: &Value) -> String {
     )
 }
 
-fn lock_table(cfg: &Value) -> String {
+pub(crate) fn lock_table(cfg: &Value) -> String {
     let start = py_n(cfg_get(cfg, "lock_start_roi_percent"));
     let step = py_n(cfg_get(cfg, "lock_step_percent"));
     let gap = py_n(cfg_get(cfg, "lock_gap_percent"));

@@ -6,7 +6,9 @@
 use serde_json::{json, Map, Value};
 
 use crate::app::ipc::EngineApi;
-use crate::app::telegram_bot::{cfg_get, format_g, markup_button, py_n, Outgoing, TelegramBot};
+use crate::app::telegram_bot::{
+    cfg_get, format_g, lock_table, markup_button, py_n, Outgoing, TelegramBot,
+};
 
 const CONFIG_KEY: &str = "tradfi_ma";
 const STRATEGY: &str = "tradfi";
@@ -104,6 +106,18 @@ fn exit_ma_of(cfg: &Value) -> i64 {
     match cfg_int_of(cfg, "exit_ma_period") {
         0 => 30,
         n => n,
+    }
+}
+
+fn lock_on(cfg: &Value) -> bool {
+    py_truthy(cfg_get(cfg, "profit_lock_enabled"))
+}
+
+fn lock_text(cfg: &Value) -> String {
+    if lock_on(cfg) {
+        format!("켬 (증거금 수익 {})", lock_table(cfg))
+    } else {
+        "끔".to_string()
     }
 }
 
@@ -240,6 +254,7 @@ pub fn tradfi_status_text(status: &Value) -> String {
             entry_mode_label(entry)
         ),
         format!("청산: 종가가 {exit_ma}MA 반대편으로 마감하면 청산"),
+        format!("수익잠금: {}", lock_text(&cfg)),
         format!(
             "레버리지 {leverage}x ISOLATED 고정 · 증거금: 가용 잔고의 {:.0}% 고정 · 비상손절: {stop_text}",
             margin_pct
@@ -369,6 +384,11 @@ pub fn tradfi_keyboard(cfg: &Value, confirm: Option<(&str, &str)>) -> Value {
                 .collect(),
         );
     }
+    let plock = lock_on(cfg);
+    rows.push(vec![
+        markup_button(mark(plock, "🔒 수익잠금 켬"), "tf:plock:on"),
+        markup_button(mark(!plock, "수익잠금 끔"), "tf:plock:off"),
+    ]);
     rows.push(vec![
         markup_button("🪙 종목 변경", "tf:coin"),
         markup_button("📊 새로고침", "tf:status"),
@@ -706,6 +726,28 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             }
             return (self.tf_status_text().await, self.tf_keyboard().await);
         }
+        if action == "plock:on" || action == "plock:off" {
+            let on = action == "plock:on";
+            if let Err(e) = self.tf_set("profit_lock_enabled", json!(on)).await {
+                return (engine_error_text(&e), tradfi_keyboard(&cfg, None));
+            }
+            let status_text = self.tf_status_text().await;
+            let head = if on {
+                "🔒 수익잠금: 켬
+보유 중인 포지션에도 바로 적용됩니다."
+            } else {
+                "🔒 수익잠금: 끔
+새 잠금 주문을 걸지 않습니다. 이미 걸린 잠금 주문은 그대로 둡니다."
+            };
+            return (
+                format!(
+                    "{head}
+
+{status_text}"
+                ),
+                self.tf_keyboard().await,
+            );
+        }
         if let Some(rest) = action.strip_prefix("bar:") {
             let tf = rest.split_once(':').map(|x| x.0).unwrap_or(rest).trim();
             if TIMEFRAMES.contains(&tf) {
@@ -827,11 +869,12 @@ fn tradfi_rules_text(cfg: &Value) -> String {
         String::new(),
         "청산".to_string(),
         format!("· 종가가 {exit_ma}MA 반대편으로 마감하면 청산"),
+        format!("· 수익잠금: {} (켜면 증거금 수익이 단계에 닿을 때마다 그 아래에 거래소 손절을 올림)", lock_text(cfg)),
         String::new(),
         "고정 설정".to_string(),
         format!("· 레버리지 5x ISOLATED · 증거금 가용 잔고의 {margin_text}%"),
         "· 비상손절: 증거금 -50% (Mark 기준, 거래소 주문)".to_string(),
-        "· 수익잠금·SMA25 손절·물타기·일일손실/연패 가드 없음".to_string(),
+        "· SMA25 손절·물타기·일일손실/연패 가드 없음".to_string(),
         String::new(),
         "참고: 이 전략은 다른 선물 전략과 동시에 켜지지 않습니다. 켜면 /btcmacross·/macross 신규 진입이 OFF 되고 옵션 신규 진입도 멈춥니다.".to_string(),
     ]
@@ -1045,12 +1088,14 @@ mod tests {
         b.handle_tradfi_action("entry:bogus").await;
         b.handle_tradfi_action("bar:1h").await;
         b.handle_tradfi_action("bar:7h").await;
+        b.handle_tradfi_action("plock:on").await;
         assert_eq!(
             fake.sets(),
             vec![
                 json!({"exit_ma_period": 50}),
                 json!({"entry_mode": "trend"}),
-                json!({"timeframe": "1h"})
+                json!({"timeframe": "1h"}),
+                json!({"profit_lock_enabled": true})
             ]
         );
         let kb = tradfi_keyboard(&fake.config.lock().unwrap().clone(), None);
@@ -1068,6 +1113,9 @@ mod tests {
             .any(|(t, d)| t.starts_with("✅") && d == "tf:mode:dry"));
         assert!(cbs.iter().any(|(t, d)| t == "3분봉" && d == "tf:bar:3m"));
         assert!(cbs.iter().any(|(t, d)| t == "1일봉" && d == "tf:bar:1d"));
+        assert!(cbs
+            .iter()
+            .any(|(t, d)| t.starts_with("✅") && d == "tf:plock:on"));
     }
 
     #[test]
