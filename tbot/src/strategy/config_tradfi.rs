@@ -4,7 +4,7 @@
 //! oil, US equities/ETFs); crypto symbols are refused by the service and the
 //! menu. Default XAUUSDT.
 //!
-//! Rules (4h closed candles, SMA 1 = the close):
+//! Rules (closed candles of the chosen timeframe, 3m..1d, default 4h; SMA 1 = the close):
 //! - Long entry: bullish alignment close > SMA5 > SMA120 with the close above
 //!   the exit line. Entry mode "cross" = only on the bar where the alignment
 //!   newly forms; "trend" = whenever it holds (after one bar of re-entry wait).
@@ -24,7 +24,11 @@ pub const STRATEGY_VERSION: &str = "1.0.0";
 pub const CLIENT_ID_STRATEGY: &str = "tfma";
 pub const CONFIG_KEY: &str = "tradfi_ma";
 pub const DEFAULT_SYMBOL: &str = "XAUUSDT";
-pub const TIMEFRAME: &str = "4h";
+/// Entry/exit candle; one is chosen in the menu.
+pub const TIMEFRAMES: &[&str] = &[
+    "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d",
+];
+pub const DEFAULT_TIMEFRAME: &str = "4h";
 pub const MID_PERIOD: i64 = 5;
 pub const SLOW_PERIOD: i64 = 120;
 pub const EXIT_MA_CHOICES: &[i64] = &[20, 30, 50];
@@ -39,14 +43,20 @@ pub const EMERGENCY_STOP_ROI: i64 = 50;
 pub fn default_tradfi_config() -> Value {
     let mut cfg = normalize_btc_ma_cross_config(None);
     if let Some(map) = cfg.as_object_mut() {
-        apply_fixed(map, DEFAULT_EXIT_MA, "cross", DEFAULT_SYMBOL);
+        apply_fixed(
+            map,
+            DEFAULT_EXIT_MA,
+            "cross",
+            DEFAULT_SYMBOL,
+            DEFAULT_TIMEFRAME,
+        );
     }
     cfg
 }
 
 /// Normalize the raw `tradfi_ma` section: shared SMA-cross normalization, then pin
 /// every setting that defines this strategy. Only `enabled`, `trading_mode`,
-/// `network`, `single_symbol`, `entry_mode` and `exit_ma_period` are
+/// `network`, `single_symbol`, `timeframe`, `entry_mode` and `exit_ma_period` are
 /// user-controlled.
 pub fn normalize_tradfi_config(raw: Option<&Value>) -> Value {
     let supplied = raw.and_then(|v| v.as_object()).cloned().unwrap_or_default();
@@ -70,9 +80,15 @@ pub fn normalize_tradfi_config(raw: Option<&Value>) -> Value {
         .map(clean_symbol)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_SYMBOL.to_string());
+    let timeframe = supplied
+        .get("timeframe")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| TIMEFRAMES.contains(&s.as_str()))
+        .unwrap_or_else(|| DEFAULT_TIMEFRAME.to_string());
     let mut cfg = normalize_btc_ma_cross_config(Some(&Value::Object(supplied)));
     if let Some(map) = cfg.as_object_mut() {
-        apply_fixed(map, exit_ma, &entry_mode, &symbol);
+        apply_fixed(map, exit_ma, &entry_mode, &symbol, &timeframe);
     }
     cfg
 }
@@ -96,13 +112,19 @@ pub fn clean_symbol(text: &str) -> String {
     }
 }
 
-fn apply_fixed(map: &mut Map<String, Value>, exit_ma: i64, entry_mode: &str, symbol: &str) {
+fn apply_fixed(
+    map: &mut Map<String, Value>,
+    exit_ma: i64,
+    entry_mode: &str,
+    symbol: &str,
+    timeframe: &str,
+) {
     let fixed = json!({
         "strategy_name": STRATEGY_NAME,
         "symbol": symbol,
         "scan_scope": "single",
         "single_symbol": symbol,
-        "timeframe": TIMEFRAME,
+        "timeframe": timeframe,
         "signal_mode": "align",
         "fast_period": 1,
         "align_mid_period": MID_PERIOD,
@@ -161,6 +183,17 @@ mod tests {
     }
 
     #[test]
+    fn timeframe_is_user_choice_from_3m_to_1d() {
+        for tf in TIMEFRAMES {
+            let cfg = normalize_tradfi_config(Some(&json!({ "timeframe": tf })));
+            assert_eq!(cfg["timeframe"], json!(tf));
+            assert!(crate::core::candles::timeframe_ms(tf).is_some(), "{tf}");
+        }
+        let cfg = normalize_tradfi_config(Some(&json!({"timeframe": " 1D "})));
+        assert_eq!(cfg["timeframe"], json!("1d"));
+    }
+
+    #[test]
     fn symbols_are_cleaned() {
         assert_eq!(clean_symbol("xau"), "XAUUSDT");
         assert_eq!(clean_symbol("CL/USDT:USDT"), "CLUSDT");
@@ -172,8 +205,11 @@ mod tests {
 
     #[test]
     fn bad_choices_fall_back() {
-        let cfg = normalize_tradfi_config(Some(&json!({"exit_ma_period": 25, "entry_mode": "x"})));
+        let cfg = normalize_tradfi_config(Some(
+            &json!({"exit_ma_period": 25, "entry_mode": "x", "timeframe": "7h"}),
+        ));
         assert_eq!(cfg["exit_ma_period"], json!(30));
+        assert_eq!(cfg["timeframe"], json!("4h"));
         assert_eq!(cfg["entry_mode"], json!("cross"));
         let d = default_tradfi_config();
         assert_eq!(d["enabled"], json!(false));

@@ -11,6 +11,27 @@ use crate::app::telegram_bot::{cfg_get, format_g, markup_button, py_n, Outgoing,
 const CONFIG_KEY: &str = "tradfi_ma";
 const STRATEGY: &str = "tradfi";
 pub const EXIT_MA_CHOICES: &[i64] = &[20, 30, 50];
+pub use crate::strategy::config_tradfi::TIMEFRAMES;
+
+/// "3m" -> "3분봉", "1h" -> "1시간봉", "1d" -> "1일봉".
+pub fn timeframe_label(tf: &str) -> String {
+    let (num, unit) = tf.split_at(tf.len().saturating_sub(1));
+    match unit {
+        "m" => format!("{num}분봉"),
+        "h" => format!("{num}시간봉"),
+        "d" => format!("{num}일봉"),
+        _ => tf.to_string(),
+    }
+}
+
+fn timeframe_of(cfg: &Value) -> String {
+    let tf = cfg_str(cfg, "timeframe", "4h");
+    if TIMEFRAMES.contains(&tf) {
+        tf.to_string()
+    } else {
+        "4h".to_string()
+    }
+}
 
 const MAINNET_LINE: &str =
     "⚠️ TradFi 종목은 바이낸스 메인넷에서만 거래됩니다. /exchange 에서 메인넷으로 바꾸세요.";
@@ -190,6 +211,7 @@ pub fn tradfi_status_text(status: &Value) -> String {
     let coin = current_coin(&cfg);
     let entry = cfg_str(&cfg, "entry_mode", "cross");
     let exit_ma = exit_ma_of(&cfg);
+    let bar = timeframe_label(&timeframe_of(&cfg));
     let leverage = match cfg_int_of(&cfg, "leverage") {
         0 => 5,
         n => n,
@@ -212,7 +234,7 @@ pub fn tradfi_status_text(status: &Value) -> String {
             "거래소: {network_label} · API 키: {}",
             if has_credentials { "있음" } else { "없음" }
         ),
-        format!("종목: {coin} (TradFi 전용 · 순수 코인 불가) · 4시간봉 마감 기준"),
+        format!("종목: {coin} (TradFi 전용 · 순수 코인 불가) · {bar} 마감 기준"),
         format!(
             "진입: SMA 1·5·120 정배열 롱 / 역배열 숏 — {}",
             entry_mode_label(entry)
@@ -333,6 +355,20 @@ pub fn tradfi_keyboard(cfg: &Value, confirm: Option<(&str, &str)>) -> Value {
         })
         .collect();
     rows.push(exit_buttons);
+    let current_tf = timeframe_of(cfg);
+    for chunk in TIMEFRAMES.chunks(4) {
+        rows.push(
+            chunk
+                .iter()
+                .map(|tf| {
+                    markup_button(
+                        mark(current_tf == *tf, &timeframe_label(tf)),
+                        format!("tf:bar:{tf}"),
+                    )
+                })
+                .collect(),
+        );
+    }
     rows.push(vec![
         markup_button("🪙 종목 변경", "tf:coin"),
         markup_button("📊 새로고침", "tf:status"),
@@ -533,9 +569,10 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             let coin = current_coin(&cfg);
             let mode = cfg_str(&cfg, "trading_mode", "DRY_RUN").to_string();
             let entry = entry_mode_label(cfg_str(&cfg, "entry_mode", "cross"));
+            let bar = timeframe_label(&timeframe_of(&cfg));
             let exit_ma = exit_ma_of(&cfg);
             let body = format!(
-                "⚠️ TradFi 정배열 전략을 켤까요?\n종목: {coin} · 모드: {mode} · 진입: {entry} · 청산 {exit_ma}MA\n켜면 /btcmacross·/macross 신규 진입이 OFF 되고 옵션 신규 진입도 멈춥니다 (보유 포지션 관리는 계속)."
+                "⚠️ TradFi 정배열 전략을 켤까요?\n종목: {coin} · {bar} · 모드: {mode} · 진입: {entry} · 청산 {exit_ma}MA\n켜면 /btcmacross·/macross 신규 진입이 OFF 되고 옵션 신규 진입도 멈춥니다 (보유 포지션 관리는 계속)."
             );
             return (
                 body,
@@ -669,6 +706,29 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             }
             return (self.tf_status_text().await, self.tf_keyboard().await);
         }
+        if let Some(rest) = action.strip_prefix("bar:") {
+            let tf = rest.split_once(':').map(|x| x.0).unwrap_or(rest).trim();
+            if TIMEFRAMES.contains(&tf) {
+                let status = fetch_status(self).await;
+                if holding(&status) {
+                    return (HOLDING_BLOCK.to_string(), tradfi_keyboard(&cfg, None));
+                }
+                if let Err(e) = self.tf_set("timeframe", json!(tf)).await {
+                    return (engine_error_text(&e), tradfi_keyboard(&cfg, None));
+                }
+                let status_text = self.tf_status_text().await;
+                return (
+                    format!(
+                        "🕯 진입 봉: {}
+
+{status_text}",
+                        timeframe_label(tf)
+                    ),
+                    self.tf_keyboard().await,
+                );
+            }
+            return (self.tf_status_text().await, self.tf_keyboard().await);
+        }
         if action == "coin" {
             let status = fetch_status(self).await;
             if holding(&status) {
@@ -747,6 +807,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
 fn tradfi_rules_text(cfg: &Value) -> String {
     let coin = current_coin(cfg);
     let exit_ma = exit_ma_of(cfg);
+    let bar = timeframe_label(&timeframe_of(cfg));
     let margin_pct = py_n(cfg_get(cfg, "margin_fraction")) * 100.0;
     let margin_text = if margin_pct == 0.0 {
         "50".to_string()
@@ -757,7 +818,7 @@ fn tradfi_rules_text(cfg: &Value) -> String {
         "📘 /tradfi 규칙 (TradFi 정배열)".to_string(),
         format!("· 종목: {coin} 외 바이낸스 TradFi 무기한 (금·원유·미국주식 등) · 순수 코인은 입력해도 거부됩니다"),
         "· 거래소: 바이낸스 메인넷 전용 (테스트넷·업비트 불가)".to_string(),
-        "· 봉: 4시간봉 마감 기준".to_string(),
+        format!("· 봉: {bar} 마감 기준 (메뉴에서 3분봉~1일봉 중 하나 선택)"),
         String::new(),
         "진입".to_string(),
         "· 롱: 종가(=SMA1) > SMA5 > SMA120 정배열이고 종가가 청산선 위".to_string(),
@@ -982,11 +1043,14 @@ mod tests {
         b.handle_tradfi_action("exit:25").await;
         b.handle_tradfi_action("entry:trend").await;
         b.handle_tradfi_action("entry:bogus").await;
+        b.handle_tradfi_action("bar:1h").await;
+        b.handle_tradfi_action("bar:7h").await;
         assert_eq!(
             fake.sets(),
             vec![
                 json!({"exit_ma_period": 50}),
-                json!({"entry_mode": "trend"})
+                json!({"entry_mode": "trend"}),
+                json!({"timeframe": "1h"})
             ]
         );
         let kb = tradfi_keyboard(&fake.config.lock().unwrap().clone(), None);
@@ -1002,6 +1066,15 @@ mod tests {
         assert!(cbs
             .iter()
             .any(|(t, d)| t.starts_with("✅") && d == "tf:mode:dry"));
+        assert!(cbs.iter().any(|(t, d)| t == "3분봉" && d == "tf:bar:3m"));
+        assert!(cbs.iter().any(|(t, d)| t == "1일봉" && d == "tf:bar:1d"));
+    }
+
+    #[test]
+    fn timeframe_labels() {
+        assert_eq!(timeframe_label("3m"), "3분봉");
+        assert_eq!(timeframe_label("12h"), "12시간봉");
+        assert_eq!(timeframe_label("1d"), "1일봉");
     }
 
     #[tokio::test]
@@ -1017,6 +1090,7 @@ mod tests {
             "confirm_live",
             "coin",
             "pick:CLUSDT",
+            "bar:1d",
         ] {
             let (text, _) = b.handle_tradfi_action(action).await;
             assert!(text.contains("포지션 보유 중"), "{action}: {text}");
