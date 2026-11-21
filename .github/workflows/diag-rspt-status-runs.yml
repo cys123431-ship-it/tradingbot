@@ -1,0 +1,29 @@
+name: Diagnose RSPT status correction runs
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download correction job log
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_ID: 86658186338
+        run: |
+          set -euo pipefail
+          gh api -H 'Accept: application/vnd.github+json' "repos/${GITHUB_REPOSITORY}/actions/jobs/${JOB_ID}/logs" > job-log.txt
+          tail -n 160 job-log.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rspt-correction-job-log
+          path: job-log.txt
+          retention-days: 1
