@@ -121,7 +121,7 @@ pub fn default_tradfi_config() -> Value {
 /// Normalize the raw `tradfi_ma` section: shared SMA-cross normalization, then pin
 /// every setting that defines this strategy. Only `enabled`, `trading_mode`,
 /// `network`, `single_symbol`, `timeframe`, `entry_mode`, `exit_ma_period` and
-/// `profit_lock_enabled` (default off; lock steps are the shared 5/5/1) are
+/// `profit_lock_enabled` (default off; lock starts at +5%, then every +1%, 1% gap) are
 /// user-controlled.
 pub fn normalize_tradfi_config(raw: Option<&Value>) -> Value {
     let supplied = raw.and_then(|v| v.as_object()).cloned().unwrap_or_default();
@@ -210,7 +210,8 @@ fn apply_fixed(
         "emergency_stop_roi_percent": EMERGENCY_STOP_ROI,
         "stop_ma_period": 0,
         "lock_start_roi_percent": "5",
-        "lock_step_percent": "5",
+        // 1% steps: the lock trails 1% under every new whole-percent peak.
+        "lock_step_percent": "1",
         "lock_gap_percent": "1",
         "profit_lock_enabled": false,
         "profit_lock_switch_count": 0,
@@ -255,6 +256,8 @@ mod tests {
         assert_eq!(cfg["entry_mode"], json!("trend"));
         assert_eq!(cfg["profit_lock_enabled"], json!(true)); // user toggle
         assert_eq!(cfg["lock_start_roi_percent"], json!("5"));
+        assert_eq!(cfg["lock_step_percent"], json!("1"));
+        assert_eq!(cfg["lock_gap_percent"], json!("1"));
         assert_eq!(cfg["profit_lock_switch_count"], json!(0));
         assert_eq!(cfg["signal_mode"], json!("align"));
     }
