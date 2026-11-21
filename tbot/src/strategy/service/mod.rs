@@ -259,14 +259,16 @@ impl Variant {
         match self {
             Variant::BtcMa => &["sl", "lock"],
             Variant::MaPlus => &["lock"],
-            Variant::TradFi => &["sl"],
+            Variant::TradFi => &["sl", "lock"],
         }
     }
 
     pub fn exit_reason_for_kind(self, kind: &str) -> Option<&'static str> {
         match (self, kind) {
             (Variant::BtcMa, "sl") | (Variant::TradFi, "sl") => Some("EMERGENCY_STOP"),
-            (Variant::BtcMa, "lock") | (Variant::MaPlus, "lock") => Some("PROFIT_LOCK"),
+            (Variant::BtcMa, "lock") | (Variant::MaPlus, "lock") | (Variant::TradFi, "lock") => {
+                Some("PROFIT_LOCK")
+            }
             _ => None,
         }
     }

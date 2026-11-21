@@ -301,6 +301,20 @@ mod tests {
     }
 
     #[test]
+    fn profit_lock_order_is_cleaned_up_and_labelled() {
+        use crate::strategy::service::Variant;
+        assert!(Variant::TradFi.protection_kinds().contains(&"lock"));
+        assert_eq!(
+            Variant::TradFi.exit_reason_for_kind("lock"),
+            Some("PROFIT_LOCK")
+        );
+        assert_eq!(
+            Variant::TradFi.exit_reason_for_kind("sl"),
+            Some("EMERGENCY_STOP")
+        );
+    }
+
+    #[test]
     fn symbols_are_cleaned() {
         assert_eq!(clean_symbol("xau"), "XAUUSDT");
         assert_eq!(clean_symbol("CL/USDT:USDT"), "CLUSDT");
