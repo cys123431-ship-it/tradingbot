@@ -526,13 +526,14 @@ async fn tradfi_only_strategy_takes_any_tradfi_and_refuses_crypto() {
 }
 
 #[tokio::test]
-async fn tradfi_only_strategy_never_scans_a_crypto_pin() {
+async fn tradfi_strategy_also_trades_a_crypto_pin() {
     let root = temp_dir("tradfi_only_crypto");
-    // config.json edited by hand to a crypto coin: the universe is refused.
+    // User rule 2026-11-21: /tfcoin accepts plain crypto perpetuals too.
     let h = tradfi_only(&root, "mainnet", "ETHUSDT");
     let cfg = h.service.config();
-    let err = h.service.scan_universe("mainnet", &cfg).await.unwrap_err();
-    assert!(err.message.starts_with("NOT_TRADFI"), "{}", err.message);
+    let universe = h.service.scan_universe("mainnet", &cfg).await.unwrap();
+    assert_eq!(universe.len(), 1);
+    assert_eq!(universe[0].1, "ETHUSDT");
 }
 
 #[tokio::test]

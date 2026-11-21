@@ -249,9 +249,10 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             return self.tradfi_universe(network, cfg).await;
         }
         if scope == "single" && self.variant == Variant::TradFi {
-            // TradFi-only strategy: a crypto symbol is refused, never traded.
+            // /tradfi: any TradFi perpetual or a plain crypto perpetual.
             let text = cfg.get("single_symbol").cloned().unwrap_or(Value::Null);
-            let (ccxt_symbol, market_id) = self.resolve_any_tradfi_coin(network, &text).await?;
+            let (ccxt_symbol, market_id) =
+                self.resolve_tradfi_strategy_coin(network, &text).await?;
             return Ok(vec![(ccxt_symbol, market_id, None)]);
         }
         if scope == "single" {
@@ -295,6 +296,21 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         text: &Value,
     ) -> Result<(String, String), ServiceError> {
         self.resolve_market(network, text, "tradfi").await
+    }
+
+    /// Coin for the `/tradfi` strategy: a crypto USDT perpetual first, else any
+    /// TradFi perpetual (gold, oil, equities...; mainnet only).
+    pub async fn resolve_tradfi_strategy_coin(
+        &self,
+        network: &str,
+        text: &Value,
+    ) -> Result<(String, String), ServiceError> {
+        match self.resolve_coin(network, text).await {
+            Err(err) if err.message.starts_with("TRADFI:") => {
+                self.resolve_any_tradfi_coin(network, text).await
+            }
+            other => other,
+        }
     }
 
     /// Any Binance TradFi perpetual (gold, oil, equities...), never crypto.

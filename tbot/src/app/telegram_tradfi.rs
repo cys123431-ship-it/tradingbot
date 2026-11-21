@@ -9,6 +9,7 @@ use crate::app::ipc::EngineApi;
 use crate::app::telegram_bot::{
     cfg_get, format_g, lock_table, markup_button, py_n, Outgoing, TelegramBot,
 };
+use crate::strategy::config_tradfi;
 
 const CONFIG_KEY: &str = "tradfi_ma";
 const STRATEGY: &str = "tradfi";
@@ -106,6 +107,53 @@ fn exit_ma_of(cfg: &Value) -> i64 {
     match cfg_int_of(cfg, "exit_ma_period") {
         0 => 30,
         n => n,
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn kst(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|t| {
+            t.with_timezone(&chrono::FixedOffset::east_opt(9 * 3600).unwrap())
+                .format("%m-%d %H:%M KST")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// Halt notice while the 30-day loss halt is active, else None.
+fn halt_text(cfg: &Value, now: i64) -> Option<String> {
+    if !config_tradfi::is_halted(cfg, now) {
+        return None;
+    }
+    Some(format!(
+        "⛔ 총자본 -{}% 손실 한도에 닿아 {}까지 /tradfi 매매가 정지돼 있습니다.",
+        format_g(config_tradfi::DRAWDOWN_HALT_PCT),
+        kst(config_tradfi::halt_until_ms(cfg))
+    ))
+}
+
+fn guard_line(cfg: &Value, now: i64) -> String {
+    if let Some(text) = halt_text(cfg, now) {
+        return text;
+    }
+    let base = config_tradfi::base_equity(cfg);
+    let pct = format_g(config_tradfi::DRAWDOWN_HALT_PCT);
+    let days = config_tradfi::DRAWDOWN_HALT_DAYS;
+    if base > 0.0 {
+        format!(
+            "손실 차단: 총자본 {:.2} USDT 이하(켤 때 {:.2}의 -{pct}%)면 즉시 청산 + {days}일 정지",
+            config_tradfi::halt_equity(base),
+            base
+        )
+    } else {
+        format!("손실 차단: 켤 때 총자본 기준 -{pct}%면 즉시 청산 + {days}일 정지")
     }
 }
 
@@ -248,13 +296,14 @@ pub fn tradfi_status_text(status: &Value) -> String {
             "거래소: {network_label} · API 키: {}",
             if has_credentials { "있음" } else { "없음" }
         ),
-        format!("종목: {coin} (TradFi 전용 · 순수 코인 불가) · {bar} 마감 기준"),
+        format!("종목: {coin} (TradFi·코인 모두 가능) · {bar} 마감 기준"),
         format!(
             "진입: SMA 1·5·120 정배열 롱 / 역배열 숏 — {}",
             entry_mode_label(entry)
         ),
         format!("청산: 종가가 {exit_ma}MA 반대편으로 마감하면 청산"),
         format!("수익잠금: {}", lock_text(&cfg)),
+        guard_line(&cfg, now_ms()),
         format!(
             "레버리지 {leverage}x ISOLATED 고정 · 증거금: 가용 잔고의 {:.0}% 고정 · 비상손절: {stop_text}",
             margin_pct
@@ -411,16 +460,14 @@ pub fn tradfi_keyboard(cfg: &Value, confirm: Option<(&str, &str)>) -> Value {
 
 /// Korean error text for a failed `resolve_tradfi_any` call.
 pub fn tradfi_coin_error_text(error: &str, text: &str) -> String {
-    if error.contains("NOT_TRADFI") {
-        return format!(
-            "❌ {text}은(는) TradFi 종목이 아닙니다. 이 전략은 TradFi(금·원유·미국주식 등)만 거래합니다."
-        );
+    if error.contains("STABLECOIN") {
+        return format!("❌ {text}은(는) 스테이블코인이라 거래할 수 없습니다.");
     }
     if error.contains("NOT_TRADING") {
         return format!("❌ {text}은(는) 지금 거래 중인 종목이 아닙니다.");
     }
     if error.contains("SYMBOL_EMPTY") {
-        return "❌ 종목을 입력하세요. 예: /tfcoin XAU".to_string();
+        return "❌ 종목을 입력하세요. 예: /tfcoin XAU 또는 /tfcoin BTC".to_string();
     }
     if error.contains("메인넷") || error.contains("MAINNET") {
         return "❌ TradFi 종목은 바이낸스 메인넷에서만 지정할 수 있습니다. /exchange 에서 메인넷으로 바꾸세요.".to_string();
@@ -504,7 +551,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         let cfg = fetch_config(self).await;
         let coin = current_coin(&cfg);
         let head = format!(
-            "🪙 TradFi 종목 선택 (순수 코인은 불가)\n지금: {coin}\n아래 버튼을 누르거나 /tfcoin <종목> 으로 지정하세요. 예: /tfcoin CL"
+            "🪙 종목 선택 (TradFi·코인 모두 가능)\n지금: {coin}\n아래 TradFi 버튼을 누르거나 /tfcoin <종목> 으로 지정하세요. 예: /tfcoin CL, /tfcoin BTC"
         );
         match self.tf_call("tradfi_symbols", json!({})).await {
             Ok(Value::Array(items)) => {
@@ -582,6 +629,11 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
     pub async fn handle_tradfi_action(&self, action: &str) -> (String, Value) {
         let cfg = fetch_config(self).await;
 
+        if action == "on" || action == "confirm_on" {
+            if let Some(text) = halt_text(&cfg, now_ms()) {
+                return (text, tradfi_keyboard(&cfg, None));
+            }
+        }
         if action == "on" {
             if !self.tf_mainnet_check().await {
                 return (MAINNET_LINE.to_string(), tradfi_keyboard(&cfg, None));
@@ -592,7 +644,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             let bar = timeframe_label(&timeframe_of(&cfg));
             let exit_ma = exit_ma_of(&cfg);
             let body = format!(
-                "⚠️ TradFi 정배열 전략을 켤까요?\n종목: {coin} · {bar} · 모드: {mode} · 진입: {entry} · 청산 {exit_ma}MA\n켜면 /btcmacross·/macross 신규 진입이 OFF 되고 옵션 신규 진입도 멈춥니다 (보유 포지션 관리는 계속)."
+                "⚠️ TradFi 정배열 전략을 켤까요?\n종목: {coin} · {bar} · 모드: {mode} · 진입: {entry} · 청산 {exit_ma}MA\n켜면 /btcmacross·/macross 신규 진입이 OFF 되고 옵션 신규 진입도 멈춥니다 (보유 포지션 관리는 계속).\n손실 차단: 켜는 순간의 총자본에서 -50%가 되면 즉시 청산하고 30일간 정지합니다."
             );
             return (
                 body,
@@ -603,7 +655,16 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             if !self.tf_mainnet_check().await {
                 return (MAINNET_LINE.to_string(), tradfi_keyboard(&cfg, None));
             }
-            if let Err(e) = self.tf_set("enabled", json!(true)).await {
+            // Turn-on resets the loss-guard reference: the engine records the
+            // current total equity on its next loop.
+            let changes = json!({
+                "enabled": true,
+                config_tradfi::BASE_EQUITY_KEY: Value::Null,
+            });
+            if let Err(e) = self
+                .tf_call("config_set", json!({ "changes": changes }))
+                .await
+            {
                 return (engine_error_text(&e), tradfi_keyboard(&cfg, None));
             }
             if let Err(e) = self
@@ -858,7 +919,7 @@ fn tradfi_rules_text(cfg: &Value) -> String {
     };
     [
         "📘 /tradfi 규칙 (TradFi 정배열)".to_string(),
-        format!("· 종목: {coin} 외 바이낸스 TradFi 무기한 (금·원유·미국주식 등) · 순수 코인은 입력해도 거부됩니다"),
+        format!("· 종목: {coin} · 바이낸스 TradFi 무기한(금·원유·미국주식 등)과 일반 코인 무기한 모두 가능 (/tfcoin BTC)"),
         "· 거래소: 바이낸스 메인넷 전용 (테스트넷·업비트 불가)".to_string(),
         format!("· 봉: {bar} 마감 기준 (메뉴에서 3분봉~1일봉 중 하나 선택)"),
         String::new(),
@@ -874,6 +935,11 @@ fn tradfi_rules_text(cfg: &Value) -> String {
         "고정 설정".to_string(),
         format!("· 레버리지 5x ISOLATED · 증거금 가용 잔고의 {margin_text}%"),
         "· 비상손절: 증거금 -50% (Mark 기준, 거래소 주문)".to_string(),
+        format!(
+            "· 손실 차단: 켜는 순간의 총자본에서 -{}%가 되면 즉시 시장가 청산, 전략 OFF, {}일간 다시 켤 수 없음",
+            format_g(config_tradfi::DRAWDOWN_HALT_PCT),
+            config_tradfi::DRAWDOWN_HALT_DAYS
+        ),
         "· SMA25 손절·물타기·일일손실/연패 가드 없음".to_string(),
         String::new(),
         "참고: 이 전략은 다른 선물 전략과 동시에 켜지지 않습니다. 켜면 /btcmacross·/macross 신규 진입이 OFF 되고 옵션 신규 진입도 멈춥니다.".to_string(),
@@ -1017,7 +1083,10 @@ mod tests {
         assert!(fake.sets().is_empty());
         let (text, _) = b.handle_tradfi_action("confirm_on").await;
         assert!(text.starts_with("✅ /tradfi ON"), "{text}");
-        assert_eq!(fake.sets(), vec![json!({"enabled": true})]);
+        assert_eq!(
+            fake.sets(),
+            vec![json!({"enabled": true, "drawdown_base_equity": null})]
+        );
         let others: Vec<Value> = fake
             .calls
             .lock()
@@ -1042,20 +1111,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crypto_coin_is_refused() {
+    async fn crypto_coin_is_accepted() {
         let fake = Fake::new();
-        *fake.resolve.lock().unwrap() = Err("ValueError: NOT_TRADFI:BTCUSDT".to_string());
+        *fake.resolve.lock().unwrap() =
+            Ok(json!({"market_id": "BTCUSDT", "ccxt_symbol": "BTC/USDT:USDT"}));
         let b = bot(&fake);
-        let (text, _) = b.handle_tradfi_action("pick:BTCUSDT").await;
-        assert!(text.contains("TradFi 종목이 아닙니다"), "{text}");
         let out = b.handle_tfcoin(1, &["BTC".to_string()]).await;
         match &out[0] {
-            Outgoing::Send { text, .. } => {
-                assert!(text.contains("TradFi 종목이 아닙니다"), "{text}")
-            }
+            Outgoing::Send { text, .. } => assert!(text.contains("BTCUSDT"), "{text}"),
             other => panic!("{other:?}"),
         }
+        assert_eq!(fake.sets(), vec![json!({"single_symbol": "BTCUSDT"})]);
+    }
+
+    #[tokio::test]
+    async fn loss_halt_blocks_turning_on() {
+        let fake = Fake::new();
+        let far = now_ms() + 86_400_000;
+        fake.config.lock().unwrap()["drawdown_halt_until_ms"] = json!(far);
+        let b = bot(&fake);
+        for action in ["on", "confirm_on"] {
+            let (text, kb) = b.handle_tradfi_action(action).await;
+            assert!(text.contains("매매가 정지"), "{action}: {text}");
+            assert!(!callbacks(&kb).iter().any(|(_, d)| d == "tf:confirm_on"));
+        }
         assert!(fake.sets().is_empty());
+        let cfg = fake.config.lock().unwrap().clone();
+        assert!(guard_line(&cfg, now_ms()).contains("정지"));
+        let mut open = cfg.clone();
+        open["drawdown_halt_until_ms"] = json!(0);
+        open["drawdown_base_equity"] = json!(40.0);
+        assert!(guard_line(&open, now_ms()).contains("20.00 USDT"));
     }
 
     #[tokio::test]
@@ -1065,7 +1151,7 @@ mod tests {
             Ok(json!({"market_id": "CLUSDT", "ccxt_symbol": "CL/USDT:USDT"}));
         let b = bot(&fake);
         let (text, kb) = b.handle_tradfi_action("coin").await;
-        assert!(text.contains("순수 코인은 불가"), "{text}");
+        assert!(text.contains("코인 모두 가능"), "{text}");
         let cbs = callbacks(&kb);
         assert!(
             cbs.iter()
@@ -1161,9 +1247,7 @@ mod tests {
 
     #[test]
     fn coin_error_texts() {
-        assert!(
-            tradfi_coin_error_text("NOT_TRADFI:ETHUSDT", "ETH").contains("TradFi 종목이 아닙니다")
-        );
+        assert!(tradfi_coin_error_text("STABLECOIN:USDCUSDT", "USDC").contains("스테이블"));
         assert!(tradfi_coin_error_text("SYMBOL_EMPTY", "").contains("종목을 입력하세요"));
         assert!(
             tradfi_coin_error_text("NOT_TRADING:XUSDT", "X").contains("거래 중인 종목이 아닙니다")

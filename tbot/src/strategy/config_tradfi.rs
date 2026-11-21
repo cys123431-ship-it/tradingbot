@@ -40,6 +40,70 @@ pub const MARGIN_FRACTION: &str = "0.5";
 /// Exchange-side catastrophe stop in % of margin (-10% price at 5x).
 pub const EMERGENCY_STOP_ROI: i64 = 50;
 
+/// Account guard: when total equity falls to this % below the equity recorded
+/// at turn-on, the position is closed and the strategy is halted.
+pub const DRAWDOWN_HALT_PCT: f64 = 50.0;
+pub const DRAWDOWN_HALT_DAYS: i64 = 30;
+/// Runtime keys kept in the `tradfi_ma` section (not normalized away).
+pub const BASE_EQUITY_KEY: &str = "drawdown_base_equity";
+pub const HALT_UNTIL_KEY: &str = "drawdown_halt_until_ms";
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DrawdownAction {
+    None,
+    /// No reference equity yet: record this one.
+    SetBase(f64),
+    /// Loss limit reached: close, disable, halt until `until_ms`.
+    Halt {
+        base: f64,
+        equity: f64,
+        until_ms: i64,
+    },
+}
+
+fn num_of(v: Option<&Value>) -> f64 {
+    match v {
+        Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0),
+        Some(Value::String(s)) => s.trim().parse::<f64>().unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+pub fn base_equity(cfg: &Value) -> f64 {
+    num_of(cfg.get(BASE_EQUITY_KEY))
+}
+
+pub fn halt_until_ms(cfg: &Value) -> i64 {
+    num_of(cfg.get(HALT_UNTIL_KEY)) as i64
+}
+
+pub fn is_halted(cfg: &Value, now_ms: i64) -> bool {
+    halt_until_ms(cfg) > now_ms
+}
+
+/// Equity at which the halt fires for a given reference equity.
+pub fn halt_equity(base: f64) -> f64 {
+    base * (1.0 - DRAWDOWN_HALT_PCT / 100.0)
+}
+
+pub fn drawdown_decision(cfg: &Value, equity: f64, now_ms: i64) -> DrawdownAction {
+    if !equity.is_finite() || equity <= 0.0 || is_halted(cfg, now_ms) {
+        return DrawdownAction::None;
+    }
+    let base = base_equity(cfg);
+    if !base.is_finite() || base <= 0.0 {
+        return DrawdownAction::SetBase(equity);
+    }
+    if equity <= halt_equity(base) {
+        return DrawdownAction::Halt {
+            base,
+            equity,
+            until_ms: now_ms + DRAWDOWN_HALT_DAYS * 86_400_000,
+        };
+    }
+    DrawdownAction::None
+}
+
 pub fn default_tradfi_config() -> Value {
     let mut cfg = normalize_btc_ma_cross_config(None);
     if let Some(map) = cfg.as_object_mut() {
@@ -204,6 +268,36 @@ mod tests {
         }
         let cfg = normalize_tradfi_config(Some(&json!({"timeframe": " 1D "})));
         assert_eq!(cfg["timeframe"], json!("1d"));
+    }
+
+    #[test]
+    fn drawdown_guard_decisions() {
+        let now = 1_000_000;
+        let none = json!({});
+        assert_eq!(
+            drawdown_decision(&none, 100.0, now),
+            DrawdownAction::SetBase(100.0)
+        );
+        assert_eq!(drawdown_decision(&none, 0.0, now), DrawdownAction::None);
+        let cfg = json!({ BASE_EQUITY_KEY: 100.0 });
+        assert_eq!(drawdown_decision(&cfg, 50.01, now), DrawdownAction::None);
+        assert_eq!(
+            drawdown_decision(&cfg, 50.0, now),
+            DrawdownAction::Halt {
+                base: 100.0,
+                equity: 50.0,
+                until_ms: now + 30 * 86_400_000
+            }
+        );
+        let halted = json!({ BASE_EQUITY_KEY: 100.0, HALT_UNTIL_KEY: now + 1 });
+        assert!(is_halted(&halted, now));
+        assert_eq!(drawdown_decision(&halted, 10.0, now), DrawdownAction::None);
+        assert!(!is_halted(&halted, now + 1));
+        // runtime keys survive normalization
+        let n =
+            normalize_tradfi_config(Some(&json!({ BASE_EQUITY_KEY: "80.5", HALT_UNTIL_KEY: 7 })));
+        assert_eq!(base_equity(&n), 80.5);
+        assert_eq!(halt_until_ms(&n), 7);
     }
 
     #[test]
