@@ -1319,6 +1319,25 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             .cross_signal(&network, &cfg, &ccxt_symbol, &market)
             .await;
         let bar = match &current {
+            Ok(sig) if self.variant == Variant::TradFi => {
+                // /tradfi exits only on a close beyond its exit line.
+                if let (Some(close), Some(line)) =
+                    (as_f64(sig.get("close")), as_f64(sig.get("sma_exit")))
+                {
+                    let wrong_side = if side == "LONG" {
+                        close < line
+                    } else {
+                        close > line
+                    };
+                    if wrong_side {
+                        warnings.push(format!(
+                            "종가 {close}가 청산선 SMA{} {line:.6} 반대편이라 다음 봉 마감에 청산될 수 있습니다",
+                            int_or_zero(cfg.get("exit_ma_period"))
+                        ));
+                    }
+                }
+                int_or_zero(sig.get("bar_open_ms"))
+            }
             Ok(sig) => {
                 let trend = sig.get("trend_side").and_then(|v| v.as_str()).unwrap_or("");
                 if !trend.is_empty() && trend != side {

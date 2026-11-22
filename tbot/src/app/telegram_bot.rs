@@ -720,7 +720,7 @@ fn has_reentry_wait(state: Option<&Value>) -> bool {
 }
 
 /// Telegram text for an `adopt_position` refusal.
-fn adopt_error_text(result: &Value) -> String {
+pub(crate) fn adopt_error_text(result: &Value) -> String {
     let detail = result.get("detail").and_then(|v| v.as_str()).unwrap_or("");
     match result.get("reason").and_then(|v| v.as_str()).unwrap_or("") {
         "NOT_LIVE" => "LIVE 모드에서만 맡길 수 있습니다.".to_string(),
@@ -737,7 +737,7 @@ fn adopt_error_text(result: &Value) -> String {
 }
 
 /// Position summary + warnings shown before and after adoption.
-fn adopt_summary(result: &Value) -> String {
+pub(crate) fn adopt_summary(result: &Value) -> String {
     let side = result.get("side").and_then(|v| v.as_str()).unwrap_or("");
     let side_text = if side == "LONG" { "롱" } else { "숏" };
     let mut text = format!(

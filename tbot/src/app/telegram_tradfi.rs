@@ -7,7 +7,8 @@ use serde_json::{json, Map, Value};
 
 use crate::app::ipc::EngineApi;
 use crate::app::telegram_bot::{
-    cfg_get, format_g, lock_table, markup_button, py_n, Outgoing, TelegramBot,
+    adopt_error_text, adopt_summary, cfg_get, format_g, lock_table, markup_button, py_n, Outgoing,
+    TelegramBot,
 };
 use crate::strategy::config_tradfi;
 
@@ -416,6 +417,7 @@ pub fn tradfi_keyboard(cfg: &Value, confirm: Option<(&str, &str)>) -> Value {
         markup_button(mark(plock, "🔒 수익잠금 켬"), "tf:plock:on"),
         markup_button(mark(!plock, "수익잠금 끔"), "tf:plock:off"),
     ]);
+    rows.push(vec![markup_button("🤝 수동 포지션 맡기기", "tf:adopt")]);
     rows.push(vec![
         markup_button("🪙 종목 변경", "tf:coin"),
         markup_button("📊 새로고침", "tf:status"),
@@ -866,6 +868,64 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             let text = tradfi_rules_text(&cfg);
             return (text, tradfi_keyboard(&cfg, None));
         }
+        if action == "adopt" {
+            let preview = match self
+                .tf_call("adopt_position", json!({ "apply": false }))
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => return (engine_error_text(&e), tradfi_keyboard(&cfg, None)),
+            };
+            if preview.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                return (
+                    format!("🤝 {}", adopt_error_text(&preview)),
+                    tradfi_keyboard(&cfg, None),
+                );
+            }
+            let stop = py_n(cfg_get(&cfg, "emergency_stop_roi_percent"));
+            let stop_line = if stop > 0.0 {
+                format!(
+                    "· 비상손절: 증거금 -{}% 주문을 거래소에 걸기\n",
+                    format_g(stop)
+                )
+            } else {
+                String::new()
+            };
+            let text = format!(
+                "🤝 이 포지션을 /tradfi에 맡길까요?\n{}\n\n\
+                 맡기면 /tradfi 규칙대로 관리합니다:\n\
+                 · {} 종가가 청산선 SMA{} 반대편으로 마감하면 청산 (반대 진입 없음)\n\
+                 · 수익잠금: {}\n\
+                 {stop_line}\
+                 직접 걸어 둔 TP/SL 주문은 그대로 남습니다.\n\
+                 청산 뒤 새 진입은 /tradfi 지정 종목({})으로 합니다.",
+                adopt_summary(&preview),
+                timeframe_label(&timeframe_of(&cfg)),
+                exit_ma_of(&cfg),
+                lock_text(&cfg),
+                current_coin(&cfg),
+            );
+            return (
+                text,
+                tradfi_keyboard(&cfg, Some(("✅ 관리 맡기기", "tf:confirm_adopt"))),
+            );
+        }
+        if action == "confirm_adopt" {
+            let result = match self
+                .tf_call("adopt_position", json!({ "apply": true }))
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => return (engine_error_text(&e), tradfi_keyboard(&cfg, None)),
+            };
+            let head = if result.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                format!("🤝 /tradfi 관리 시작: {}", adopt_summary(&result))
+            } else {
+                format!("🤝 {}", adopt_error_text(&result))
+            };
+            let status = self.tf_status_text().await;
+            return (format!("{head}\n\n{status}"), self.tf_keyboard().await);
+        }
         (self.tf_status_text().await, self.tf_keyboard().await)
     }
 
@@ -1086,6 +1146,12 @@ mod tests {
                 })),
                 "resolve_tradfi_any" => f.resolve.lock().unwrap().clone(),
                 "tradfi_symbols" => Ok(json!(["CLUSDT", "QQQUSDT", "XAUUSDT"])),
+                "adopt_position" => Ok(json!({
+                    "ok": true, "market_id": "SKHYUSDT", "side": "SHORT",
+                    "quantity": 0.8, "entry_price": 105.76, "leverage": 5, "margin": 16.92,
+                    "warnings": ["종가가 청산선 반대편"],
+                    "applied": args["apply"].clone(),
+                })),
                 _ => Ok(Value::Null),
             };
             Box::pin(async move { result })
@@ -1401,6 +1467,32 @@ mod tests {
         b.handle_tradfi_action("confirm_live").await;
         assert_eq!(fake.sets(), vec![json!({"trading_mode": "LIVE"})]);
         assert_eq!(fake.count("reset_reconciliation"), 1);
+    }
+
+    #[tokio::test]
+    async fn manual_position_is_adopted_after_confirmation() {
+        let fake = Fake::new();
+        let b = bot(&fake);
+        let (text, kb) = b.handle_tradfi_action("adopt").await;
+        assert!(text.contains("/tradfi에 맡길까요"), "{text}");
+        assert!(text.contains("SKHYUSDT 숏"), "{text}");
+        assert!(text.contains("청산선 SMA30"), "{text}");
+        assert!(text.contains("⚠️ 종가가 청산선 반대편"), "{text}");
+        assert!(callbacks(&kb).iter().any(|(_, d)| d == "tf:confirm_adopt"));
+        let applied = |fake: &Fake| -> Vec<Value> {
+            fake.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(c, _)| c == "adopt_position")
+                .map(|(_, a)| a["apply"].clone())
+                .collect()
+        };
+        assert_eq!(applied(&fake), vec![json!(false)]);
+        let (text, _) = b.handle_tradfi_action("confirm_adopt").await;
+        assert!(text.starts_with("🤝 /tradfi 관리 시작"), "{text}");
+        assert_eq!(applied(&fake), vec![json!(false), json!(true)]);
+        assert!(fake.sets().is_empty());
     }
 
     #[test]
