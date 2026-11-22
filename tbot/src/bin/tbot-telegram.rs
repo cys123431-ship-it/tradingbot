@@ -68,6 +68,10 @@ async fn main() -> Result<(), String> {
             "/tradfi 종목 지정 (TradFi만)".to_string(),
         ),
         (
+            "tfexit".to_string(),
+            "/tradfi 청산 MA 지정 (2~120)".to_string(),
+        ),
+        (
             "btcoptions".to_string(),
             "BTC 옵션 자동매매 메뉴".to_string(),
         ),

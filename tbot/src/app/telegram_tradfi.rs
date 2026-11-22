@@ -13,7 +13,10 @@ use crate::strategy::config_tradfi;
 
 const CONFIG_KEY: &str = "tradfi_ma";
 const STRATEGY: &str = "tradfi";
-pub const EXIT_MA_CHOICES: &[i64] = &[20, 30, 50];
+pub use crate::strategy::config_tradfi::EXIT_MA_CHOICES;
+use crate::strategy::config_tradfi::{exit_ma_allowed, EXIT_MA_MAX, EXIT_MA_MIN};
+/// `pending_input` marker: the next plain text is the exit MA period.
+pub const PENDING_EXIT_MA: &str = "tf_exit_ma";
 pub use crate::strategy::config_tradfi::TIMEFRAMES;
 
 /// "3m" -> "3분봉", "1h" -> "1시간봉", "1d" -> "1일봉".
@@ -409,7 +412,7 @@ pub fn tradfi_keyboard(cfg: &Value, confirm: Option<(&str, &str)>) -> Value {
             "tf:entry:trend",
         ),
     ]);
-    let exit_buttons: Vec<Value> = EXIT_MA_CHOICES
+    let mut exit_buttons: Vec<Value> = EXIT_MA_CHOICES
         .iter()
         .map(|n| {
             markup_button(
@@ -418,6 +421,13 @@ pub fn tradfi_keyboard(cfg: &Value, confirm: Option<(&str, &str)>) -> Value {
             )
         })
         .collect();
+    let custom = !EXIT_MA_CHOICES.contains(&exit_ma);
+    let custom_label = if custom {
+        format!("✏️ 직접 {exit_ma}MA")
+    } else {
+        "✏️ 직접 입력".to_string()
+    };
+    exit_buttons.push(markup_button(mark(custom, &custom_label), "tf:exit:custom"));
     rows.push(exit_buttons);
     let current_tf = timeframe_of(cfg);
     for chunk in TIMEFRAMES.chunks(4) {
@@ -609,6 +619,57 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         }
     }
 
+    /// Store a validated exit MA period (refused while a position is open).
+    async fn tf_apply_exit_ma(&self, period: i64) -> (String, Value) {
+        let cfg = fetch_config(self).await;
+        if !exit_ma_allowed(period) {
+            return (
+                exit_ma_range_error(&period.to_string()),
+                tradfi_keyboard(&cfg, None),
+            );
+        }
+        if holding(&fetch_status(self).await) {
+            return (HOLDING_BLOCK.to_string(), tradfi_keyboard(&cfg, None));
+        }
+        if let Err(e) = self.tf_set("exit_ma_period", json!(period)).await {
+            return (engine_error_text(&e), tradfi_keyboard(&cfg, None));
+        }
+        let status_text = self.tf_status_text().await;
+        (
+            format!("🚪 청산선: {period}MA\n\n{status_text}"),
+            self.tf_keyboard().await,
+        )
+    }
+
+    /// Exit MA typed as text (`/tfexit 45` or a reply to the ✏️ prompt).
+    pub async fn tf_exit_ma_from_text(&self, text: &str) -> (String, Value) {
+        match parse_exit_ma(text) {
+            Some(period) => self.tf_apply_exit_ma(period).await,
+            None => {
+                let cfg = fetch_config(self).await;
+                (
+                    exit_ma_range_error(text.trim()),
+                    tradfi_keyboard(&cfg, None),
+                )
+            }
+        }
+    }
+
+    /// `/tfexit [기간]` command; without a number it shows how to set one.
+    pub async fn handle_tfexit(&self, chat_id: i64, args: &[String]) -> Vec<Outgoing> {
+        let (text, markup) = if args.is_empty() {
+            let cfg = fetch_config(self).await;
+            (exit_ma_prompt_text(&cfg), tradfi_keyboard(&cfg, None))
+        } else {
+            self.tf_exit_ma_from_text(&args.join(" ")).await
+        };
+        vec![Outgoing::Send {
+            chat_id,
+            text,
+            markup: Some(markup),
+        }]
+    }
+
     /// `/tradfi` command: (status text, keyboard)
     pub async fn tradfi_screen(&self) -> (String, Value) {
         let status = fetch_status(self).await;
@@ -763,6 +824,12 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             }
             return (self.tf_status_text().await, self.tf_keyboard().await);
         }
+        if action == "exit:custom" {
+            if holding(&fetch_status(self).await) {
+                return (HOLDING_BLOCK.to_string(), tradfi_keyboard(&cfg, None));
+            }
+            return (exit_ma_prompt_text(&cfg), tradfi_keyboard(&cfg, None));
+        }
         if let Some(rest) = action.strip_prefix("exit:") {
             let period: i64 = rest
                 .split_once(':')
@@ -771,19 +838,8 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 .trim()
                 .parse::<i64>()
                 .unwrap_or(-1);
-            if EXIT_MA_CHOICES.contains(&period) {
-                let status = fetch_status(self).await;
-                if holding(&status) {
-                    return (HOLDING_BLOCK.to_string(), tradfi_keyboard(&cfg, None));
-                }
-                if let Err(e) = self.tf_set("exit_ma_period", json!(period)).await {
-                    return (engine_error_text(&e), tradfi_keyboard(&cfg, None));
-                }
-                let status_text = self.tf_status_text().await;
-                return (
-                    format!("🚪 청산선: {period}MA\n\n{status_text}"),
-                    self.tf_keyboard().await,
-                );
+            if exit_ma_allowed(period) {
+                return self.tf_apply_exit_ma(period).await;
             }
             return (self.tf_status_text().await, self.tf_keyboard().await);
         }
@@ -907,6 +963,34 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
     }
 }
 
+/// "45" / "45ma" / "SMA45" / " 45 MA " -> 45; anything else (or out of range) -> None.
+pub fn parse_exit_ma(text: &str) -> Option<i64> {
+    let t = text.trim().to_lowercase();
+    let t = t.strip_prefix("sma").unwrap_or(&t).trim();
+    let t = t.strip_suffix("ma").unwrap_or(t).trim();
+    if t.is_empty() || !t.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    t.parse::<i64>().ok().filter(|p| exit_ma_allowed(*p))
+}
+
+/// First line of the ✏️ prompt; the bot waits for a number after sending it.
+pub const EXIT_MA_PROMPT_HEAD: &str = "✏️ 청산 MA 직접 입력";
+
+fn exit_ma_prompt_text(cfg: &Value) -> String {
+    format!(
+        "{EXIT_MA_PROMPT_HEAD}\n지금: {}MA\n{EXIT_MA_MIN}~{EXIT_MA_MAX} 사이 숫자를 이 채팅에 보내세요. 예: 45 (그만두려면 취소)\n(/tfexit 45 로도 바꿀 수 있습니다. 진입선 SMA120보다 길게는 설정할 수 없습니다.)",
+        exit_ma_of(cfg)
+    )
+}
+
+fn exit_ma_range_error(text: &str) -> String {
+    let shown: String = text.chars().take(20).collect();
+    format!(
+        "❌ 청산 MA는 {EXIT_MA_MIN}~{EXIT_MA_MAX} 사이 정수로 입력하세요 (입력: {shown}). 예: /tfexit 45"
+    )
+}
+
 fn tradfi_rules_text(cfg: &Value) -> String {
     let coin = current_coin(cfg);
     let exit_ma = exit_ma_of(cfg);
@@ -929,7 +1013,7 @@ fn tradfi_rules_text(cfg: &Value) -> String {
         "· 진입 방식: 새 배열만(배열이 새로 만들어진 봉에서만) 또는 배열 유지 중(배열이 유지되는 동안 언제든, 청산 후 1봉 대기)".to_string(),
         String::new(),
         "청산".to_string(),
-        format!("· 종가가 {exit_ma}MA 반대편으로 마감하면 청산"),
+        format!("· 종가가 {exit_ma}MA 반대편으로 마감하면 청산 (청산 MA는 {EXIT_MA_MIN}~{EXIT_MA_MAX} 중 자유 지정: ✏️ 직접 입력 또는 /tfexit 45)"),
         format!("· 수익잠금: {} (켜면 증거금 수익이 단계에 닿을 때마다 그 아래에 거래소 손절을 올림)", lock_text(cfg)),
         String::new(),
         "고정 설정".to_string(),
@@ -1169,7 +1253,8 @@ mod tests {
         let fake = Fake::new();
         let b = bot(&fake);
         b.handle_tradfi_action("exit:50").await;
-        b.handle_tradfi_action("exit:25").await;
+        b.handle_tradfi_action("exit:121").await;
+        b.handle_tradfi_action("exit:1").await;
         b.handle_tradfi_action("entry:trend").await;
         b.handle_tradfi_action("entry:bogus").await;
         b.handle_tradfi_action("bar:1h").await;
@@ -1220,6 +1305,8 @@ mod tests {
         for action in [
             "entry:trend",
             "exit:50",
+            "exit:45",
+            "exit:custom",
             "mode:live",
             "confirm_live",
             "coin",
@@ -1230,6 +1317,123 @@ mod tests {
             assert!(text.contains("포지션 보유 중"), "{action}: {text}");
         }
         assert!(fake.sets().is_empty());
+        let out = b.handle_tfexit(1, &["45".to_string()]).await;
+        match &out[0] {
+            Outgoing::Send { text, .. } => assert!(text.contains("포지션 보유 중"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(fake.sets().is_empty());
+    }
+
+    #[tokio::test]
+    async fn typed_number_after_pencil_button_sets_exit_ma() {
+        let fake = Fake::new();
+        let b = bot(&fake);
+        let press = json!({"callback_query": {
+            "id": "q", "data": "tf:exit:custom",
+            "message": {"chat": {"id": 1}, "message_id": 5}
+        }});
+        let say = |t: &str| json!({"message": {"chat": {"id": 1}, "text": t}});
+        let last_text = |out: &Vec<Outgoing>| match out.last() {
+            Some(Outgoing::Send { text, .. }) | Some(Outgoing::Edit { text, .. }) => text.clone(),
+            other => panic!("{other:?}"),
+        };
+        // without the prompt, a bare number is not an exit MA
+        b.handle_update(&say("45")).await;
+        assert!(fake.sets().is_empty());
+        // prompt -> bad text keeps waiting -> valid number is stored
+        b.handle_update(&press).await;
+        let out = b.handle_update(&say("300")).await;
+        assert!(last_text(&out).contains("2~120"));
+        let out = b.handle_update(&say("45")).await;
+        assert!(
+            last_text(&out).contains("청산선: 45MA"),
+            "{}",
+            last_text(&out)
+        );
+        assert_eq!(fake.sets(), vec![json!({"exit_ma_period": 45})]);
+        // the prompt is over: the next number is ordinary text again
+        b.handle_update(&say("60")).await;
+        assert_eq!(fake.sets().len(), 1);
+        // 취소 ends the prompt
+        b.handle_update(&press).await;
+        let out = b.handle_update(&say("취소")).await;
+        assert!(last_text(&out).contains("취소"));
+        b.handle_update(&say("60")).await;
+        assert_eq!(fake.sets().len(), 1);
+        // a command or another button ends it as well
+        b.handle_update(&press).await;
+        b.handle_update(&say("/tradfi")).await;
+        b.handle_update(&say("60")).await;
+        b.handle_update(&press).await;
+        b.handle_update(&json!({"callback_query": {
+            "id": "q2", "data": "tf:status",
+            "message": {"chat": {"id": 1}, "message_id": 5}
+        }}))
+        .await;
+        b.handle_update(&say("60")).await;
+        assert_eq!(fake.sets().len(), 1);
+        // bare /tfexit also waits for the number
+        b.handle_update(&say("/tfexit")).await;
+        b.handle_update(&say("88")).await;
+        assert_eq!(fake.sets().last(), Some(&json!({"exit_ma_period": 88})));
+    }
+
+    #[test]
+    fn exit_ma_text_parsing() {
+        assert_eq!(parse_exit_ma("45"), Some(45));
+        assert_eq!(parse_exit_ma(" 45ma "), Some(45));
+        assert_eq!(parse_exit_ma("SMA 99"), Some(99));
+        assert_eq!(parse_exit_ma("45 MA"), Some(45));
+        assert_eq!(parse_exit_ma("2"), Some(2));
+        assert_eq!(parse_exit_ma("120"), Some(120));
+        for bad in ["", "1", "121", "500", "-5", "4.5", "abc", "45일"] {
+            assert_eq!(parse_exit_ma(bad), None, "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_exit_ma_button_and_command() {
+        let fake = Fake::new();
+        let b = bot(&fake);
+        let cfg = fake.config.lock().unwrap().clone();
+        let cbs = callbacks(&tradfi_keyboard(&cfg, None));
+        assert!(
+            cbs.iter()
+                .any(|(t, d)| t == "✏️ 직접 입력" && d == "tf:exit:custom"),
+            "{cbs:?}"
+        );
+        // ✏️ only shows the prompt; nothing is stored yet
+        let (text, _) = b.handle_tradfi_action("exit:custom").await;
+        assert!(text.starts_with(EXIT_MA_PROMPT_HEAD), "{text}");
+        assert!(fake.sets().is_empty());
+        // any in-range period via the button path or the command
+        b.handle_tradfi_action("exit:45").await;
+        let out = b.handle_tfexit(1, &["77".to_string()]).await;
+        match &out[0] {
+            Outgoing::Send { text, .. } => assert!(text.contains("청산선: 77MA"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        let out = b.handle_tfexit(1, &["300".to_string()]).await;
+        match &out[0] {
+            Outgoing::Send { text, .. } => assert!(text.contains("2~120"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            fake.sets(),
+            vec![json!({"exit_ma_period": 45}), json!({"exit_ma_period": 77})]
+        );
+        // a custom period is marked on the ✏️ button, not on a preset
+        let cfg = fake.config.lock().unwrap().clone();
+        let cbs = callbacks(&tradfi_keyboard(&cfg, None));
+        assert!(
+            cbs.iter()
+                .any(|(t, d)| t == "✅ ✏️ 직접 77MA" && d == "tf:exit:custom"),
+            "{cbs:?}"
+        );
+        assert!(!cbs.iter().any(|(t, d)| t.starts_with("✅")
+            && d.starts_with("tf:exit:")
+            && d != "tf:exit:custom"));
     }
 
     #[tokio::test]

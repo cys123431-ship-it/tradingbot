@@ -8,7 +8,10 @@
 //! - Long entry: bullish alignment close > SMA5 > SMA120 with the close above
 //!   the exit line. Entry mode "cross" = only on the bar where the alignment
 //!   newly forms; "trend" = whenever it holds (after one bar of re-entry wait).
-//! - Long exit: the close below the exit line SMA(20/30/50, default 30).
+//! - Long exit: the close below the exit line SMA(n), n = 2..=120 chosen by the
+//!   user (default 30). The cap is the SMA120 entry line: any market with
+//!   enough candles to enter also has enough to draw the exit line, so a
+//!   position can never be opened without its exit rule.
 //! - Short is the mirror image.
 //! - Leverage 5x and 50% of the available balance as margin are fixed.
 //!
@@ -31,8 +34,17 @@ pub const TIMEFRAMES: &[&str] = &[
 pub const DEFAULT_TIMEFRAME: &str = "4h";
 pub const MID_PERIOD: i64 = 5;
 pub const SLOW_PERIOD: i64 = 120;
+/// Preset buttons in the menu; any period in EXIT_MA_MIN..=EXIT_MA_MAX is allowed.
 pub const EXIT_MA_CHOICES: &[i64] = &[20, 30, 50];
+pub const EXIT_MA_MIN: i64 = 2;
+/// Never above the SMA120 entry line (see the module doc).
+pub const EXIT_MA_MAX: i64 = SLOW_PERIOD;
 pub const DEFAULT_EXIT_MA: i64 = 30;
+
+/// True when `period` is a usable exit line period for this strategy.
+pub fn exit_ma_allowed(period: i64) -> bool {
+    (EXIT_MA_MIN..=EXIT_MA_MAX).contains(&period)
+}
 /// "cross" = new alignment only, "trend" = while the alignment holds.
 pub const ENTRY_MODES: &[&str] = &["cross", "trend"];
 pub const LEVERAGE: i64 = 5;
@@ -131,7 +143,7 @@ pub fn normalize_tradfi_config(raw: Option<&Value>) -> Value {
             v.as_i64()
                 .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
         })
-        .filter(|p| EXIT_MA_CHOICES.contains(p))
+        .filter(|p| exit_ma_allowed(*p))
         .unwrap_or(DEFAULT_EXIT_MA);
     let entry_mode = supplied
         .get("entry_mode")
@@ -328,9 +340,58 @@ mod tests {
     }
 
     #[test]
+    fn exit_ma_is_any_period_from_2_to_120() {
+        for p in [2, 7, 25, 45, 99, 120] {
+            let cfg = normalize_tradfi_config(Some(&json!({ "exit_ma_period": p })));
+            assert_eq!(cfg["exit_ma_period"], json!(p));
+            assert_eq!(cfg["exit_ma_enabled"], json!(true));
+        }
+        let cfg = normalize_tradfi_config(Some(&json!({ "exit_ma_period": " 45 " })));
+        assert_eq!(cfg["exit_ma_period"], json!(45));
+        for bad in [
+            json!(0),
+            json!(1),
+            json!(121),
+            json!(500),
+            json!(-5),
+            json!("x"),
+        ] {
+            let cfg = normalize_tradfi_config(Some(&json!({ "exit_ma_period": bad })));
+            assert_eq!(cfg["exit_ma_period"], json!(DEFAULT_EXIT_MA), "{bad}");
+        }
+        assert!(exit_ma_allowed(EXIT_MA_MIN) && exit_ma_allowed(EXIT_MA_MAX));
+        assert!(!exit_ma_allowed(EXIT_MA_MAX + 1));
+    }
+
+    /// The exit line must be computable on every bar that can open a position:
+    /// entry needs SLOW_PERIOD + 1 closed candles, which also covers the
+    /// longest allowed exit period.
+    #[test]
+    fn longest_exit_line_exists_whenever_entry_is_possible() {
+        use crate::core::sma_cross::{evaluate_cross, CrossConfig};
+        let cfg = normalize_tradfi_config(Some(&json!({
+            "exit_ma_period": EXIT_MA_MAX, "timeframe": "1h"
+        })));
+        let cross: CrossConfig = serde_json::from_value(cfg.clone()).unwrap();
+        let hour = 3_600_000i64;
+        // SLOW_PERIOD + 1 closed candles plus the forming one.
+        let n = SLOW_PERIOD as usize + 2;
+        let rows: Vec<[f64; 6]> = (0..n)
+            .map(|i| {
+                let c = 100.0 + i as f64 + if i % 2 == 0 { 0.5 } else { 0.0 };
+                [(i as i64 * hour) as f64, c, c + 1.0, c - 1.0, c, 10.0]
+            })
+            .collect();
+        let now = n as i64 * hour - hour + 1_000;
+        let r = evaluate_cross(&rows, &cross, now, "XAUUSDT", Some("XAU/USDT:USDT"));
+        assert_eq!(r.exit_ma_period, Some(EXIT_MA_MAX), "{:?}", r.skip_reason);
+        assert!(r.sma_exit.is_some());
+    }
+
+    #[test]
     fn bad_choices_fall_back() {
         let cfg = normalize_tradfi_config(Some(
-            &json!({"exit_ma_period": 25, "entry_mode": "x", "timeframe": "7h"}),
+            &json!({"exit_ma_period": 121, "entry_mode": "x", "timeframe": "7h"}),
         ));
         assert_eq!(cfg["exit_ma_period"], json!(30));
         assert_eq!(cfg["timeframe"], json!("4h"));

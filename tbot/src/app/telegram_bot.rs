@@ -984,7 +984,7 @@ pub struct TelegramBot<A: EngineApi> {
     pub(crate) engine: Arc<A>,
     owner_chat_id: i64,
     offset: i64,
-    #[allow(dead_code)] // reserved for text-input prompts
+    /// chat id -> what the next plain text answers (e.g. the /tradfi exit MA).
     pending_input: Mutex<HashMap<i64, String>>,
 }
 
@@ -1152,6 +1152,21 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             ),
             None => (self.owner_chat_id, 0),
         };
+        // Any button press ends a pending text prompt; the ✏️ exit-MA prompt
+        // starts a new one (only when it was actually shown, not refused).
+        {
+            let mut pending = self.pending_input.lock().unwrap_or_else(|e| e.into_inner());
+            if data == "tf:exit:custom"
+                && text.starts_with(crate::app::telegram_tradfi::EXIT_MA_PROMPT_HEAD)
+            {
+                pending.insert(
+                    chat_id,
+                    crate::app::telegram_tradfi::PENDING_EXIT_MA.to_string(),
+                );
+            } else {
+                pending.remove(&chat_id);
+            }
+        }
         out.push(Outgoing::Edit {
             chat_id,
             message_id,
@@ -1169,6 +1184,21 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             .unwrap_or(self.owner_chat_id);
         let text = message.get("text").and_then(|v| v.as_str()).unwrap_or("");
         let (command, args) = parse_command(text);
+        let pending = {
+            let mut map = self.pending_input.lock().unwrap_or_else(|e| e.into_inner());
+            if command.is_empty() && !text.trim().is_empty() {
+                map.get(&chat_id).cloned()
+            } else {
+                // a command (or an empty message) cancels the prompt
+                if !command.is_empty() {
+                    map.remove(&chat_id);
+                }
+                None
+            }
+        };
+        if pending.as_deref() == Some(crate::app::telegram_tradfi::PENDING_EXIT_MA) {
+            return self.handle_pending_exit_ma(chat_id, text).await;
+        }
         if command.is_empty() && !text.trim().is_empty() {
             return self.handle_plain_text(chat_id, text).await;
         }
@@ -1199,6 +1229,18 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 }]
             }
             "tfcoin" => self.handle_tfcoin(chat_id, &args).await,
+            "tfexit" => {
+                if args.is_empty() {
+                    self.pending_input
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(
+                            chat_id,
+                            crate::app::telegram_tradfi::PENDING_EXIT_MA.to_string(),
+                        );
+                }
+                self.handle_tfexit(chat_id, &args).await
+            }
             "btcoptions" => {
                 let (text, markup) = self.btc_options_screen().await;
                 vec![Outgoing::Send {
@@ -1248,6 +1290,36 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// Plain text answering the ✏️ exit-MA prompt. A valid number (or 취소)
+    /// ends the prompt; anything else explains the range and keeps waiting.
+    async fn handle_pending_exit_ma(&self, chat_id: i64, text: &str) -> Vec<Outgoing> {
+        let trimmed = text.trim();
+        let clear = |bot: &Self| {
+            bot.pending_input
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&chat_id);
+        };
+        if matches!(trimmed, "취소" | "cancel" | "Cancel") {
+            clear(self);
+            let (text, markup) = self.tradfi_screen().await;
+            return vec![Outgoing::Send {
+                chat_id,
+                text: format!("↩️ 청산 MA 입력을 취소했습니다.\n\n{text}"),
+                markup: Some(markup),
+            }];
+        }
+        if crate::app::telegram_tradfi::parse_exit_ma(trimmed).is_some() {
+            clear(self);
+        }
+        let (text, markup) = self.tf_exit_ma_from_text(trimmed).await;
+        vec![Outgoing::Send {
+            chat_id,
+            text,
+            markup: Some(markup),
+        }]
     }
 
     /// Text without a leading `/`. The Python bot left reply keyboards in the
@@ -1305,6 +1377,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
              /btcmaperiod — SMA 기간 도움말\n\
              /tradfi — TradFi 정배열 전략 메뉴 (금·원유·미국주식, SMA 1·5·120, 3분봉~1일봉 선택)
              /tfcoin <종목> — /tradfi 종목 지정, TradFi·코인 모두 가능 (예: /tfcoin CL, /tfcoin BTC)
+             /tfexit <기간> — /tradfi 청산 MA 지정, 2~120 자유 입력 (예: /tfexit 45)
              /btcoptions — BTC 옵션 자동매매 메뉴 (바이낸스 유럽식 옵션, 매수 전용)\n\
              /options — 옵션 자동매매 메뉴 (멀티코인)\n\
              /exchange — 거래소/네트워크 전환 (바이낸스 테스트넷 · 메인넷, 구 /setup)\n\
