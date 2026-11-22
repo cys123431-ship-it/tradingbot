@@ -113,6 +113,7 @@ fn exit_ma_of(cfg: &Value) -> i64 {
     }
 }
 
+#[cfg(test)]
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -120,44 +121,11 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn kst(ms: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(ms)
-        .map(|t| {
-            t.with_timezone(&chrono::FixedOffset::east_opt(9 * 3600).unwrap())
-                .format("%m-%d %H:%M KST")
-                .to_string()
-        })
-        .unwrap_or_default()
-}
-
-/// Halt notice while the 30-day loss halt is active, else None.
-fn halt_text(cfg: &Value, now: i64) -> Option<String> {
-    if !config_tradfi::is_halted(cfg, now) {
-        return None;
-    }
-    Some(format!(
-        "⛔ 총자본 -{}% 손실 한도에 닿아 {}까지 /tradfi 매매가 정지돼 있습니다.",
-        format_g(config_tradfi::DRAWDOWN_HALT_PCT),
-        kst(config_tradfi::halt_until_ms(cfg))
-    ))
-}
-
-fn guard_line(cfg: &Value, now: i64) -> String {
-    if let Some(text) = halt_text(cfg, now) {
-        return text;
-    }
-    let base = config_tradfi::base_equity(cfg);
-    let pct = format_g(config_tradfi::DRAWDOWN_HALT_PCT);
-    let days = config_tradfi::DRAWDOWN_HALT_DAYS;
-    if base > 0.0 {
-        format!(
-            "손실 차단: 총자본 {:.2} USDT 이하(켤 때 {:.2}의 -{pct}%)면 즉시 청산 + {days}일 정지",
-            config_tradfi::halt_equity(base),
-            base
-        )
-    } else {
-        format!("손실 차단: 켤 때 총자본 기준 -{pct}%면 즉시 청산 + {days}일 정지")
-    }
+fn guard_line() -> String {
+    format!(
+        "거래정지: 선물계좌 총자본(평가손익 포함)이 {} USDT 미만이면 신규 진입 안 함 · 보유 포지션은 그대로 관리",
+        config_tradfi::MIN_EQUITY_USDT
+    )
 }
 
 fn lock_on(cfg: &Value) -> bool {
@@ -306,7 +274,7 @@ pub fn tradfi_status_text(status: &Value) -> String {
         ),
         format!("청산: 종가가 {exit_ma}MA 반대편으로 마감하면 청산"),
         format!("수익잠금: {}", lock_text(&cfg)),
-        guard_line(&cfg, now_ms()),
+        guard_line(),
         format!(
             "레버리지 {leverage}x ISOLATED 고정 · 증거금: 가용 잔고의 {:.0}% 고정 · 비상손절: {stop_text}",
             margin_pct
@@ -690,11 +658,6 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
     pub async fn handle_tradfi_action(&self, action: &str) -> (String, Value) {
         let cfg = fetch_config(self).await;
 
-        if action == "on" || action == "confirm_on" {
-            if let Some(text) = halt_text(&cfg, now_ms()) {
-                return (text, tradfi_keyboard(&cfg, None));
-            }
-        }
         if action == "on" {
             if !self.tf_mainnet_check().await {
                 return (MAINNET_LINE.to_string(), tradfi_keyboard(&cfg, None));
@@ -705,7 +668,8 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             let bar = timeframe_label(&timeframe_of(&cfg));
             let exit_ma = exit_ma_of(&cfg);
             let body = format!(
-                "⚠️ TradFi 정배열 전략을 켤까요?\n종목: {coin} · {bar} · 모드: {mode} · 진입: {entry} · 청산 {exit_ma}MA\n켜면 /btcmacross·/macross 신규 진입이 OFF 되고 옵션 신규 진입도 멈춥니다 (보유 포지션 관리는 계속).\n손실 차단: 켜는 순간의 총자본에서 -50%가 되면 즉시 청산하고 30일간 정지합니다."
+                "⚠️ TradFi 정배열 전략을 켤까요?\n종목: {coin} · {bar} · 모드: {mode} · 진입: {entry} · 청산 {exit_ma}MA\n켜면 /btcmacross·/macross 신규 진입이 OFF 되고 옵션 신규 진입도 멈춥니다 (보유 포지션 관리는 계속).\n거래정지: 선물계좌 총자본(평가손익 포함)이 {min} USDT 미만이면 신규 진입을 하지 않습니다 (보유 포지션은 그대로 관리, {min} 이상이 되면 자동 재개).",
+                min = config_tradfi::MIN_EQUITY_USDT
             );
             return (
                 body,
@@ -716,12 +680,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             if !self.tf_mainnet_check().await {
                 return (MAINNET_LINE.to_string(), tradfi_keyboard(&cfg, None));
             }
-            // Turn-on resets the loss-guard reference: the engine records the
-            // current total equity on its next loop.
-            let changes = json!({
-                "enabled": true,
-                config_tradfi::BASE_EQUITY_KEY: Value::Null,
-            });
+            let changes = json!({ "enabled": true });
             if let Err(e) = self
                 .tf_call("config_set", json!({ "changes": changes }))
                 .await
@@ -1020,9 +979,8 @@ fn tradfi_rules_text(cfg: &Value) -> String {
         format!("· 레버리지 5x ISOLATED · 증거금 가용 잔고의 {margin_text}%"),
         "· 비상손절: 증거금 -50% (Mark 기준, 거래소 주문)".to_string(),
         format!(
-            "· 손실 차단: 켜는 순간의 총자본에서 -{}%가 되면 즉시 시장가 청산, 전략 OFF, {}일간 다시 켤 수 없음",
-            format_g(config_tradfi::DRAWDOWN_HALT_PCT),
-            config_tradfi::DRAWDOWN_HALT_DAYS
+            "· 거래정지: 선물계좌 총자본(지갑 + 평가손익)이 {min} USDT 미만이면 신규 진입 정지. 보유 포지션은 청산선·비상손절대로 계속 관리하고, 전략은 ON 유지, {min} USDT 이상으로 돌아오면 자동 재개 (LIVE 모드)",
+            min = config_tradfi::MIN_EQUITY_USDT
         ),
         "· SMA25 손절·물타기·일일손실/연패 가드 없음".to_string(),
         String::new(),
@@ -1167,10 +1125,7 @@ mod tests {
         assert!(fake.sets().is_empty());
         let (text, _) = b.handle_tradfi_action("confirm_on").await;
         assert!(text.starts_with("✅ /tradfi ON"), "{text}");
-        assert_eq!(
-            fake.sets(),
-            vec![json!({"enabled": true, "drawdown_base_equity": null})]
-        );
+        assert_eq!(fake.sets(), vec![json!({"enabled": true})]);
         let others: Vec<Value> = fake
             .calls
             .lock()
@@ -1209,23 +1164,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loss_halt_blocks_turning_on() {
+    async fn screens_describe_the_18_usdt_entry_stop() {
         let fake = Fake::new();
-        let far = now_ms() + 86_400_000;
-        fake.config.lock().unwrap()["drawdown_halt_until_ms"] = json!(far);
         let b = bot(&fake);
-        for action in ["on", "confirm_on"] {
-            let (text, kb) = b.handle_tradfi_action(action).await;
-            assert!(text.contains("매매가 정지"), "{action}: {text}");
-            assert!(!callbacks(&kb).iter().any(|(_, d)| d == "tf:confirm_on"));
-        }
-        assert!(fake.sets().is_empty());
+        let (text, _) = b.handle_tradfi_action("on").await;
+        assert!(text.contains("18 USDT 미만이면 신규 진입"), "{text}");
+        assert!(!text.contains("-50%가 되면"), "{text}");
+        assert!(guard_line().contains("18 USDT 미만"));
         let cfg = fake.config.lock().unwrap().clone();
-        assert!(guard_line(&cfg, now_ms()).contains("정지"));
-        let mut open = cfg.clone();
-        open["drawdown_halt_until_ms"] = json!(0);
-        open["drawdown_base_equity"] = json!(40.0);
-        assert!(guard_line(&open, now_ms()).contains("20.00 USDT"));
+        let rules = tradfi_rules_text(&cfg);
+        assert!(rules.contains("18 USDT 미만이면 신규 진입 정지"), "{rules}");
+        assert!(!rules.contains("30일"), "{rules}");
+        // an old 30-day halt left in the stored config no longer blocks ON
+        fake.config.lock().unwrap()["drawdown_halt_until_ms"] = json!(now_ms() + 86_400_000);
+        let (text, kb) = b.handle_tradfi_action("on").await;
+        assert!(text.contains("켤까요"), "{text}");
+        assert!(callbacks(&kb).iter().any(|(_, d)| d == "tf:confirm_on"));
     }
 
     #[tokio::test]

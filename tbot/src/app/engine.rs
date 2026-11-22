@@ -219,9 +219,6 @@ impl<E: FuturesExchange + 'static> Engine<E> {
             let result: Result<(), String> = async {
                 let cfg = service.config();
                 interval = cfg_field_i64(&cfg, "loop_interval_seconds", 10);
-                if service.variant == Variant::TradFi {
-                    self.tradfi_drawdown_guard(&service).await;
-                }
                 if service.needs_cycle() {
                     service.run_cycle().await.map_err(|e| e.to_string())?;
                 }
@@ -236,114 +233,6 @@ impl<E: FuturesExchange + 'static> Engine<E> {
             }
             let sleep_secs = interval.max(5) as u64;
             tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
-        }
-    }
-
-    /// /tradfi account guard (user rule 2026-11-21): when total equity drops 50%
-    /// below the equity recorded at turn-on, close the position at market,
-    /// switch the strategy off and refuse to run it for 30 days. While halted
-    /// a still-open position is closed again on every loop.
-    async fn tradfi_drawdown_guard(&self, service: &SmaCrossService<E>) {
-        use crate::strategy::config_tradfi::{
-            drawdown_decision, halt_equity, is_halted, DrawdownAction, BASE_EQUITY_KEY,
-            DRAWDOWN_HALT_DAYS, DRAWDOWN_HALT_PCT, HALT_UNTIL_KEY,
-        };
-        let cfg = service.config();
-        let now = service.now_ms();
-        let enabled = cfg
-            .get("enabled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let mode = service.mode(Some(&cfg));
-        let Some(network) = service.current_network(Some(&cfg)) else {
-            return;
-        };
-        let holding = service
-            .load_state(&network, &mode)
-            .map(|s| s.get("trade").map(|v| !v.is_null()).unwrap_or(false))
-            .unwrap_or(false);
-        if is_halted(&cfg, now) {
-            if enabled {
-                let mut changes = Map::new();
-                changes.insert("enabled".to_string(), Value::Bool(false));
-                if let Err(e) = self.cfg.update_values(TRADFI_SECTION, changes).await {
-                    log_line(&format!("engine: tradfi halt disable failed: {e}"));
-                }
-            }
-            if holding {
-                match service.close_position("drawdown_halt").await {
-                    Ok(v) => log_line(&format!("engine: tradfi halt close retry: {v}")),
-                    Err(e) => log_line(&format!("engine: tradfi halt close retry failed: {e}")),
-                }
-            }
-            return;
-        }
-        if !enabled && !holding {
-            return;
-        }
-        let equity = match service.balances(&network, &cfg, &mode).await {
-            Ok((_, _, equity, _)) => equity,
-            Err(e) => {
-                log_line(&format!("engine: tradfi drawdown balance failed: {e}"));
-                return;
-            }
-        };
-        match drawdown_decision(&cfg, equity, now) {
-            DrawdownAction::None => {}
-            DrawdownAction::SetBase(base) => {
-                let mut changes = Map::new();
-                changes.insert(BASE_EQUITY_KEY.to_string(), json!(base));
-                if let Err(e) = self.cfg.update_values(TRADFI_SECTION, changes).await {
-                    log_line(&format!("engine: tradfi base equity write failed: {e}"));
-                } else {
-                    log_line(&format!("engine: tradfi base equity set to {base:.4} USDT"));
-                }
-            }
-            DrawdownAction::Halt {
-                base,
-                equity,
-                until_ms,
-            } => {
-                let mut changes = Map::new();
-                changes.insert("enabled".to_string(), Value::Bool(false));
-                changes.insert(HALT_UNTIL_KEY.to_string(), json!(until_ms));
-                if let Err(e) = self.cfg.update_values(TRADFI_SECTION, changes).await {
-                    log_line(&format!("engine: tradfi halt write failed: {e}"));
-                }
-                let close = if holding {
-                    match service.close_position("drawdown_halt").await {
-                        Ok(v) => {
-                            let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("");
-                            let reason = v.get("reason").and_then(|a| a.as_str()).unwrap_or("");
-                            format!("청산 요청: {action} {reason}").trim().to_string()
-                        }
-                        Err(e) => format!("⚠️ 청산 실패 (다음 주기에 다시 시도): {e}"),
-                    }
-                } else {
-                    "보유 포지션 없음".to_string()
-                };
-                log_line(&format!(
-                    "engine: tradfi drawdown halt equity={equity:.4} base={base:.4} until={until_ms} close={close}"
-                ));
-                let until = chrono::DateTime::from_timestamp_millis(until_ms)
-                    .map(|t| {
-                        t.with_timezone(&chrono::FixedOffset::east_opt(9 * 3600).unwrap())
-                            .format("%Y-%m-%d %H:%M KST")
-                            .to_string()
-                    })
-                    .unwrap_or_default();
-                service
-                    .notify(
-                        format!(
-                            "⛔ /tradfi 손실 한도 도달 — 매매 정지\n총자본 {equity:.2} USDT (기준 {base:.2} USDT의 -{pct}% 선 {line:.2} USDT 이하)\n· {close}\n· 전략 OFF, {days}일간 다시 켤 수 없음 ({until}까지)",
-                            pct = DRAWDOWN_HALT_PCT,
-                            line = halt_equity(base),
-                            days = DRAWDOWN_HALT_DAYS,
-                        ),
-                        Some("tradfi_drawdown_halt"),
-                    )
-                    .await;
-            }
         }
     }
 

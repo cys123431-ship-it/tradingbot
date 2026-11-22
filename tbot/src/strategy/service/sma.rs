@@ -55,6 +55,8 @@ pub(crate) const CUSTOM_MA_EXIT: &str = "CUSTOM_MA_EXIT";
 pub(crate) const CROSS_EXIT: &str = "CROSS_EXIT";
 const STOP_MA_SIDE_MISMATCH: &str = "STOP_MA_SIDE_MISMATCH";
 const MIN_BALANCE_BLOCK: &str = "MIN_BALANCE";
+const MIN_EQUITY_BLOCK: &str = "MIN_EQUITY";
+const MIN_EQUITY_NOTICE_KEY: &str = "min_equity";
 const DAILY_LOSS_BLOCK: &str = "DAILY_LOSS_LIMIT";
 const LOSS_STREAK_BLOCK: &str = "LOSS_STREAK_LIMIT";
 const STOP_MA_UNAVAILABLE: &str = "STOP_MA_UNAVAILABLE";
@@ -222,6 +224,19 @@ fn min_balance_reason(cfg: &Value, mode: &str, wallet: f64) -> String {
         return String::new();
     }
     format!("{MIN_BALANCE_BLOCK}: 잔고 {wallet:.2} USDT ≤ 최소 {min} USDT")
+}
+
+/// LIVE only: non-empty when total equity (wallet + unrealized PnL) is below
+/// `min_equity_usdt`. Only blocks new entries; nothing is closed or disabled.
+fn min_equity_reason(cfg: &Value, mode: &str, equity: f64) -> String {
+    if mode != crate::strategy::config_base::TRADING_MODE_LIVE {
+        return String::new();
+    }
+    let min = as_f64(cfg.get("min_equity_usdt")).unwrap_or(0.0);
+    if min <= 0.0 || !equity.is_finite() || equity >= min {
+        return String::new();
+    }
+    format!("{MIN_EQUITY_BLOCK}: 총자본 {equity:.2} USDT < {min} USDT (신규 진입 정지)")
 }
 
 fn py_dec(value: Option<&Value>) -> Result<Decimal, ServiceError> {
@@ -2404,6 +2419,18 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
                 self.stop_for_min_balance(&reason).await;
                 return Ok(json!({"action": "blocked", "reason": reason}));
             }
+            if reason.starts_with(MIN_EQUITY_BLOCK) {
+                let min = as_f64(cfg.get("min_equity_usdt")).unwrap_or(0.0);
+                self.notify(
+                    format!(
+                        "⛔ {}: 거래정지 — 선물계좌 총자본이 {min} USDT 미만이라 신규 진입을 하지 않습니다.\n보유 포지션은 그대로 관리하고, {min} USDT 이상이 되면 자동으로 다시 진입합니다.",
+                        self.label()
+                    ),
+                    Some(MIN_EQUITY_NOTICE_KEY),
+                )
+                .await;
+                return Ok(json!({"action": "blocked", "reason": reason}));
+            }
             if starts_with_any(&reason, &[DAILY_LOSS_BLOCK, LOSS_STREAK_BLOCK]) {
                 self.notify_loss_guard(&reason).await;
                 return Ok(json!({"action": "blocked", "reason": reason}));
@@ -2464,6 +2491,15 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         if !low.is_empty() {
             return Ok((None, low, context));
         }
+        let low = min_equity_reason(cfg, mode, equity);
+        if !low.is_empty() {
+            return Ok((None, low, context));
+        }
+        // back above the line: the next drop gets a fresh notice
+        self.last_notice
+            .lock()
+            .unwrap()
+            .remove(MIN_EQUITY_NOTICE_KEY);
         let guard = self.loss_guard(network, cfg, mode, wallet)?;
         if !guard.is_empty() {
             return Ok((None, guard, context));

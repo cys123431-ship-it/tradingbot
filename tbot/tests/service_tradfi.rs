@@ -548,3 +548,41 @@ async fn tradfi_only_strategy_is_mainnet_only() {
         err.message
     );
 }
+
+/// User rule 2026-11-22: below 18 USDT total equity (wallet + unrealized PnL)
+/// /tradfi opens nothing in LIVE; it is not switched off and resumes at 18.
+#[tokio::test]
+async fn tradfi_blocks_new_entries_below_18_usdt_equity() {
+    let root = temp_dir("tradfi_min_equity");
+    let h = tradfi_only(&root, "mainnet", "XAG");
+    let cfg = h.service.config();
+    assert_eq!(cfg["min_equity_usdt"], json!(18));
+    let signal = json!({
+        "market_id": "XAGUSDT", "ccxt_symbol": "XAG/USDT:USDT",
+        "side": "LONG", "close": 30.0,
+    });
+    let reason_at = |wallet: f64, mode: &'static str| {
+        h.fake.inner.state.lock().unwrap().wallet = wallet;
+        let svc = &h.service;
+        let cfg = cfg.clone();
+        let signal = signal.clone();
+        async move {
+            svc.pre_trade_validation("mainnet", &cfg, mode, &signal)
+                .await
+                .unwrap()
+        }
+    };
+    let (decision, reason, _) = reason_at(17.99, "LIVE").await;
+    assert!(decision.is_none());
+    assert!(reason.starts_with("MIN_EQUITY"), "{reason}");
+    assert!(reason.contains("17.99"), "{reason}");
+    // exactly 18 is allowed
+    let (_, reason, _) = reason_at(18.0, "LIVE").await;
+    assert!(!reason.starts_with("MIN_EQUITY"), "{reason}");
+    // paper trading is not gated by the real account
+    let (_, reason, _) = reason_at(5.0, "DRY_RUN").await;
+    assert!(!reason.starts_with("MIN_EQUITY"), "{reason}");
+    // other strategies do not carry the rule
+    let btc = build_variant(&h, "mainnet", Variant::BtcMa);
+    assert!(btc.config().get("min_equity_usdt").is_none());
+}
