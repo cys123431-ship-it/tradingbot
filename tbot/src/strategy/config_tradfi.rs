@@ -108,6 +108,15 @@ pub fn normalize_tradfi_config(raw: Option<&Value>) -> Value {
         .map(|s| s.trim().to_lowercase())
         .filter(|s| TIMEFRAMES.contains(&s.as_str()))
         .unwrap_or_else(|| DEFAULT_TIMEFRAME.to_string());
+    // SMA120 in the entry alignment (default on); exits never use it.
+    let align_slow = match supplied.get("align_slow_enabled") {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => {
+            !matches!(s.trim().to_lowercase().as_str(), "false" | "0" | "off")
+        }
+        Some(Value::Number(n)) => n.as_f64().unwrap_or(1.0) != 0.0,
+        _ => true,
+    };
     let profit_lock = match supplied.get("profit_lock_enabled") {
         Some(Value::Bool(b)) => *b,
         Some(Value::String(s)) => matches!(s.trim().to_lowercase().as_str(), "true" | "1" | "on"),
@@ -121,6 +130,7 @@ pub fn normalize_tradfi_config(raw: Option<&Value>) -> Value {
         }
         apply_fixed(map, exit_ma, &entry_mode, &symbol, &timeframe);
         map.insert("profit_lock_enabled".into(), Value::Bool(profit_lock));
+        map.insert("align_slow_enabled".into(), Value::Bool(align_slow));
     }
     cfg
 }
@@ -259,6 +269,17 @@ mod tests {
             Variant::TradFi.exit_reason_for_kind("sl"),
             Some("EMERGENCY_STOP")
         );
+    }
+
+    #[test]
+    fn sma120_alignment_toggle() {
+        assert_eq!(
+            normalize_tradfi_config(None)["align_slow_enabled"],
+            json!(true)
+        );
+        let off = normalize_tradfi_config(Some(&json!({"align_slow_enabled": false})));
+        assert_eq!(off["align_slow_enabled"], json!(false));
+        assert_eq!(off["slow_period"], json!(SLOW_PERIOD));
     }
 
     #[test]

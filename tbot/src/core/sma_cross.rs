@@ -36,6 +36,9 @@ pub struct CrossConfig {
     pub signal_mode: Option<String>,
     #[serde(default, deserialize_with = "de_lenient_opt_i64")]
     pub align_mid_period: Option<i64>,
+    /// false = alignment ignores SMA(slow): close > SMA(mid) only (/tradfi toggle).
+    #[serde(default)]
+    pub align_slow_enabled: Option<bool>,
 }
 
 /// Result of `evaluate_cross`.
@@ -367,8 +370,9 @@ fn finish_align(
         return result;
     };
     result.sma_mid = Some(m_now);
-    let bull = |f: f64, m: f64, s: f64| f > m && m > s;
-    let bear = |f: f64, m: f64, s: f64| f < m && m < s;
+    let use_slow = cfg.align_slow_enabled.unwrap_or(true);
+    let bull = |f: f64, m: f64, s: f64| f > m && (!use_slow || m > s);
+    let bear = |f: f64, m: f64, s: f64| f < m && (!use_slow || m < s);
     let beyond_long = result.sma_exit.map(|x| f_now > x).unwrap_or(true);
     let beyond_short = result.sma_exit.map(|x| f_now < x).unwrap_or(true);
     let bull_now = bull(f_now, m_now, s_now);
@@ -405,9 +409,10 @@ fn finish_align(
     }
     result.side = Some(side.to_string());
     result.skip_reason = Some(String::new());
+    let slow_tag = if use_slow { cfg.slow_period } else { 0 };
     result.signal_id = Some(format!(
         "{}:ALIGN{}/{}/{}:{}:{}:{}",
-        symbol, cfg.fast_period, mid_p, cfg.slow_period, cfg.timeframe, side, bar[0] as i64
+        symbol, cfg.fast_period, mid_p, slow_tag, cfg.timeframe, side, bar[0] as i64
     ));
     result
 }
@@ -621,6 +626,49 @@ mod align_tests {
         assert!(
             fresh_seen >= 6 && held_seen >= 100,
             "fresh {fresh_seen} held {held_seen}"
+        );
+    }
+
+    #[test]
+    fn alignment_without_slow_uses_close_and_mid_only() {
+        let all = rows(600);
+        let c: Vec<f64> = all.iter().map(|r| r[4]).collect();
+        let mut cfg_off = cfg(30);
+        cfg_off.align_slow_enabled = Some(false);
+        let state = |j: usize| -> Option<&'static str> {
+            let m = sma_at(&c, 5, j)?;
+            if c[j] > m {
+                Some("LONG")
+            } else if c[j] < m {
+                Some("SHORT")
+            } else {
+                None
+            }
+        };
+        let (mut extra, mut fresh_seen) = (0, 0);
+        for i in 130..all.len() {
+            let now_ms = i as i64 * SPAN + SPAN + 1_000;
+            let r = evaluate_cross(&all[..=i], &cfg_off, now_ms, "XAUUSDT", None);
+            let x = sma_at(&c, 30, i).unwrap();
+            let now = state(i).filter(|side| if *side == "LONG" { c[i] > x } else { c[i] < x });
+            let fresh = now.filter(|side| state(i - 1) != Some(*side));
+            assert_eq!(r.trend_side.as_deref(), now, "trend bar {i}");
+            assert_eq!(r.side.as_deref(), fresh, "side bar {i}");
+            if fresh.is_some() {
+                fresh_seen += 1;
+                assert!(r
+                    .signal_id
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains(":ALIGN1/5/0:4h:"));
+            }
+            if now.is_some() && reference(&c, i, 30).0.is_none() {
+                extra += 1;
+            }
+        }
+        assert!(
+            fresh_seen >= 6 && extra >= 10,
+            "fresh {fresh_seen} extra {extra}"
         );
     }
 

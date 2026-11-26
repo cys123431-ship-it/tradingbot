@@ -129,6 +129,21 @@ fn guard_line() -> String {
     )
 }
 
+/// SMA120 in the entry alignment (default on).
+fn slow_on(cfg: &Value) -> bool {
+    cfg_get(cfg, "align_slow_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
+fn align_text(cfg: &Value) -> &'static str {
+    if slow_on(cfg) {
+        "SMA 1·5·120 정배열 롱 / 역배열 숏"
+    } else {
+        "SMA 1·5 정배열 롱 / 역배열 숏 (120MA 제외)"
+    }
+}
+
 fn lock_on(cfg: &Value) -> bool {
     py_truthy(cfg_get(cfg, "profit_lock_enabled"))
 }
@@ -269,10 +284,7 @@ pub fn tradfi_status_text(status: &Value) -> String {
             if has_credentials { "있음" } else { "없음" }
         ),
         format!("종목: {coin} (TradFi·코인 모두 가능) · {bar} 마감 기준"),
-        format!(
-            "진입: SMA 1·5·120 정배열 롱 / 역배열 숏 — {}",
-            entry_mode_label(entry)
-        ),
+        format!("진입: {} — {}", align_text(&cfg), entry_mode_label(entry)),
         format!("청산: 종가가 {exit_ma}MA 반대편으로 마감하면 청산"),
         format!("수익잠금: {}", lock_text(&cfg)),
         guard_line(),
@@ -380,6 +392,11 @@ pub fn tradfi_keyboard(cfg: &Value, confirm: Option<(&str, &str)>) -> Value {
             mark(entry_mode == "trend", "배열 유지 중"),
             "tf:entry:trend",
         ),
+    ]);
+    let slow = slow_on(cfg);
+    rows.push(vec![
+        markup_button(mark(slow, "120MA 포함"), "tf:slow:on"),
+        markup_button(mark(!slow, "120MA 빼기"), "tf:slow:off"),
     ]);
     let mut exit_buttons: Vec<Value> = EXIT_MA_CHOICES
         .iter()
@@ -804,6 +821,22 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             }
             return (self.tf_status_text().await, self.tf_keyboard().await);
         }
+        if action == "slow:on" || action == "slow:off" {
+            let on = action == "slow:on";
+            if let Err(e) = self.tf_set("align_slow_enabled", json!(on)).await {
+                return (engine_error_text(&e), tradfi_keyboard(&cfg, None));
+            }
+            let head = if on {
+                "📐 진입 기준: SMA 1·5·120 정배열 (종가 > SMA5 > SMA120)"
+            } else {
+                "📐 진입 기준: SMA 1·5 정배열 (종가 > SMA5, 120MA 제외)"
+            };
+            let status_text = self.tf_status_text().await;
+            return (
+                format!("{head}\n다음 봉 마감부터 적용됩니다. 청산 규칙은 그대로입니다.\n\n{status_text}"),
+                self.tf_keyboard().await,
+            );
+        }
         if action == "plock:on" || action == "plock:off" {
             let on = action == "plock:on";
             if let Err(e) = self.tf_set("profit_lock_enabled", json!(on)).await {
@@ -1027,8 +1060,17 @@ fn tradfi_rules_text(cfg: &Value) -> String {
         format!("· 봉: {bar} 마감 기준 (메뉴에서 3분봉~1일봉 중 하나 선택)"),
         String::new(),
         "진입".to_string(),
-        "· 롱: 종가(=SMA1) > SMA5 > SMA120 정배열이고 종가가 청산선 위".to_string(),
-        "· 숏: 종가(=SMA1) < SMA5 < SMA120 역배열이고 종가가 청산선 아래".to_string(),
+        if slow_on(cfg) {
+            "· 롱: 종가(=SMA1) > SMA5 > SMA120 정배열이고 종가가 청산선 위".to_string()
+        } else {
+            "· 롱: 종가(=SMA1) > SMA5이고 종가가 청산선 위 (120MA 제외 중)".to_string()
+        },
+        if slow_on(cfg) {
+            "· 숏: 종가(=SMA1) < SMA5 < SMA120 역배열이고 종가가 청산선 아래".to_string()
+        } else {
+            "· 숏: 종가(=SMA1) < SMA5이고 종가가 청산선 아래 (120MA 제외 중)".to_string()
+        },
+        "· 120MA 포함/빼기 버튼으로 진입 기준에서 SMA120을 넣거나 뺄 수 있음".to_string(),
         "· 진입 방식: 새 배열만(배열이 새로 만들어진 봉에서만) 또는 배열 유지 중(배열이 유지되는 동안 언제든, 청산 후 1봉 대기)".to_string(),
         String::new(),
         "청산".to_string(),
@@ -1301,6 +1343,9 @@ mod tests {
             .any(|(t, d)| t.starts_with("✅") && d == "tf:entry:trend"));
         assert!(cbs
             .iter()
+            .any(|(t, d)| t.starts_with("✅") && d == "tf:slow:on"));
+        assert!(cbs
+            .iter()
             .any(|(t, d)| t.starts_with("✅") && d == "tf:mode:dry"));
         assert!(cbs.iter().any(|(t, d)| t == "3분봉" && d == "tf:bar:3m"));
         assert!(cbs.iter().any(|(t, d)| t == "1일봉" && d == "tf:bar:1d"));
@@ -1493,6 +1538,18 @@ mod tests {
         assert!(text.starts_with("🤝 /tradfi 관리 시작"), "{text}");
         assert_eq!(applied(&fake), vec![json!(false), json!(true)]);
         assert!(fake.sets().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sma120_toggle_is_saved() {
+        let fake = Fake::new();
+        let b = bot(&fake);
+        let (text, kb) = b.handle_tradfi_action("slow:off").await;
+        assert!(text.contains("120MA 제외"), "{text}");
+        assert_eq!(fake.sets(), vec![json!({"align_slow_enabled": false})]);
+        assert!(callbacks(&kb)
+            .iter()
+            .any(|(t, d)| t.starts_with("✅") && d == "tf:slow:off"));
     }
 
     #[test]
