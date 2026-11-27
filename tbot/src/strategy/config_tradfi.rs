@@ -354,6 +354,46 @@ pub fn risk_pct_of(cfg: &Value) -> Option<f64> {
         .map(|p| p as f64)
 }
 
+/// Trend screening (/tfscan, view only, never trades): how straight a coin
+/// moved over the last `bars` closed candles.
+pub const SCAN_DEFAULT_BARS: usize = 100;
+pub const SCAN_TOP: usize = 10;
+
+/// (efficiency ratio, R² of log price vs time, net return) of closes, or None.
+/// Efficiency = |last - first| / sum |close-to-close moves| (Kaufman): 1 =
+/// a straight line, 0 = all noise.
+pub fn trend_metrics(closes: &[f64]) -> Option<(f64, f64, f64)> {
+    if closes.len() < 10 || closes.iter().any(|c| *c <= 0.0) {
+        return None;
+    }
+    let path: f64 = closes.windows(2).map(|w| (w[1] - w[0]).abs()).sum();
+    let first = closes[0];
+    let last = closes[closes.len() - 1];
+    let er = if path > 0.0 {
+        (last - first).abs() / path
+    } else {
+        0.0
+    };
+    let n = closes.len() as f64;
+    let ys: Vec<f64> = closes.iter().map(|c| c.ln()).collect();
+    let mx = (n - 1.0) / 2.0;
+    let my = ys.iter().sum::<f64>() / n;
+    let (mut sxy, mut sxx, mut syy) = (0.0, 0.0, 0.0);
+    for (i, y) in ys.iter().enumerate() {
+        let dx = i as f64 - mx;
+        let dy = y - my;
+        sxy += dx * dy;
+        sxx += dx * dx;
+        syy += dy * dy;
+    }
+    let r2 = if sxx > 0.0 && syy > 0.0 {
+        (sxy * sxy) / (sxx * syy)
+    } else {
+        0.0
+    };
+    Some((er, r2, last / first - 1.0))
+}
+
 /// Keys of the retired -50% halt, dropped from stored configs.
 const RETIRED_KEYS: &[&str] = &["drawdown_base_equity", "drawdown_halt_until_ms"];
 
@@ -684,6 +724,24 @@ mod tests {
             false
         )
         .is_none());
+    }
+
+    #[test]
+    fn trend_metrics_rank_straight_moves() {
+        let line: Vec<f64> = (0..50).map(|i| 100.0 + i as f64).collect();
+        let (er, r2, ret) = trend_metrics(&line).unwrap();
+        assert!((er - 1.0).abs() < 1e-12 && r2 > 0.99 && (ret - 0.49).abs() < 1e-9);
+        let zigzag: Vec<f64> = (0..50)
+            .map(|i| if i % 2 == 0 { 100.0 } else { 102.0 })
+            .collect();
+        let (er, r2, _) = trend_metrics(&zigzag).unwrap();
+        assert!(er < 0.05 && r2 < 0.1, "{er} {r2}");
+        let down: Vec<f64> = (0..50)
+            .map(|i| 200.0 - i as f64 + if i % 2 == 0 { 0.5 } else { 0.0 })
+            .collect();
+        let (er, _, ret) = trend_metrics(&down).unwrap();
+        assert!(er > 0.6 && ret < 0.0, "{er}");
+        assert!(trend_metrics(&line[..5]).is_none());
     }
 
     #[test]

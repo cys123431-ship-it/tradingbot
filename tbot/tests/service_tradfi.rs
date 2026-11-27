@@ -757,3 +757,30 @@ async fn loss_limit_sizing_sets_quantity_and_skips_below_minimum() {
         "{reason}"
     );
 }
+
+/// /tfscan: ranks the auto-search universe by efficiency, never trades.
+#[tokio::test]
+async fn trend_scan_ranks_the_auto_universe() {
+    let root = temp_dir("tradfi_trend_scan");
+    let rows = trend_coins()["BTCUSDT"]["rows"].clone();
+    let mut coins = Map::new();
+    coins.insert(
+        "ETHUSDT".to_string(),
+        json!({"volume": 2.0e8, "rows": rows.clone(), "mark": 10.0}),
+    );
+    coins.insert(
+        "SOLUSDT".to_string(),
+        json!({"volume": 3.0e8, "rows": rows, "mark": 10.0}),
+    );
+    let cfg = vec![("single_symbol".to_string(), json!("ETHUSDT"))];
+    let mut h = ScopeHarness::new(&root, coins, true, cfg);
+    h.service = build_variant(&h, "mainnet", Variant::TradFi);
+    let res = h.service.trend_scan("mainnet", "1h", 50).await.unwrap();
+    assert_eq!(res["universe"], json!(2));
+    let list = res["rows"].as_array().unwrap();
+    assert_eq!(list.len(), 2, "{res}");
+    let e0 = list[0]["efficiency"].as_f64().unwrap();
+    let e1 = list[1]["efficiency"].as_f64().unwrap();
+    assert!(e0 >= e1 && (0.0..=1.0).contains(&e0));
+    assert!(h.fake.orders.lock().unwrap().is_empty());
+}

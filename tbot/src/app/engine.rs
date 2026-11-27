@@ -522,6 +522,23 @@ impl<E: FuturesExchange + 'static> Engine<E> {
                     .map_err(|e| e.to_string())?;
                 Ok(json!({"ccxt_symbol": symbol, "market_id": market}))
             }
+            "tradfi_trend_scan" => {
+                let service = self.service_for(&req)?;
+                let network = req
+                    .arg_str("network")
+                    .or_else(|| service.current_network(None))
+                    .ok_or_else(|| "ValueError: missing network".to_string())?;
+                let timeframe = req.arg_str("timeframe").unwrap_or_else(|| "4h".to_string());
+                let bars = req
+                    .arg("bars")
+                    .and_then(|v| v.as_u64())
+                    .map(|b| b.clamp(20, 500) as usize)
+                    .unwrap_or(crate::strategy::config_tradfi::SCAN_DEFAULT_BARS);
+                service
+                    .trend_scan(&network, &timeframe, bars)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
             "tradfi_symbols" => {
                 let service = self.service_for(&req)?;
                 let network = req

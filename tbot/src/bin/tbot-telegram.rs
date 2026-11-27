@@ -76,6 +76,10 @@ async fn main() -> Result<(), String> {
             "/tradfi 진입 MA 지정 (fast slow 긴MA)".to_string(),
         ),
         (
+            "tfscan".to_string(),
+            "추세 스크리닝 (보기만, 예: /tfscan 3m 100)".to_string(),
+        ),
+        (
             "btcoptions".to_string(),
             "BTC 옵션 자동매매 메뉴".to_string(),
         ),

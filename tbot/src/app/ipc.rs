@@ -18,9 +18,8 @@ const LONG_TIMEOUT_SECS: u64 = 120;
 
 fn request_timeout_secs(cmd: &str) -> u64 {
     match cmd {
-        "emergency_stop" | "options_run_cycle" | "options_status" | "options_preflight" => {
-            LONG_TIMEOUT_SECS
-        }
+        "emergency_stop" | "options_run_cycle" | "options_status" | "options_preflight"
+        | "tradfi_trend_scan" => LONG_TIMEOUT_SECS,
         _ => DEFAULT_TIMEOUT_SECS,
     }
 }

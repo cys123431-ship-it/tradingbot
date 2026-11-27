@@ -619,6 +619,76 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         Ok(universe)
     }
 
+    /// /tfscan: rank the auto-search universe by how straight each coin moved
+    /// over its last `bars` closed candles of `timeframe`. View only.
+    pub async fn trend_scan(
+        &self,
+        network: &str,
+        timeframe: &str,
+        bars: usize,
+    ) -> Result<Value, ServiceError> {
+        use crate::strategy::config_tradfi as tf;
+        let mut cfg = self.config();
+        if let Some(obj) = cfg.as_object_mut() {
+            obj.insert("scan_scope".to_string(), json!(tf::AUTO_SCOPE));
+        }
+        let universe = self.tradfi_auto_universe(network, &cfg).await?;
+        let span = timeframe_ms(timeframe)
+            .ok_or_else(|| ServiceError::new("ValueError", format!("bad timeframe {timeframe}")))?;
+        let exchange = self.exchange(network).await?;
+        let now = self.now_ms();
+        let limit = (bars + 2) as u32;
+        let mut results = Vec::new();
+        for chunk in universe.chunks(ALL_SCAN_CONCURRENCY) {
+            let mut handles = Vec::new();
+            for (ccxt, market, volume) in chunk.iter().cloned() {
+                let exchange = exchange.clone();
+                let tf_owned = timeframe.to_string();
+                handles.push(async move {
+                    let rows = exchange
+                        .fetch_ohlcv(&ccxt, &tf_owned, None, Some(limit))
+                        .await;
+                    (market, volume, rows)
+                });
+            }
+            results.extend(futures::future::join_all(handles).await);
+        }
+        let mut rows_out: Vec<Value> = Vec::new();
+        let mut failed = 0usize;
+        for (market, volume, rows) in results {
+            let Ok(rows) = rows else {
+                failed += 1;
+                continue;
+            };
+            let closes: Vec<f64> = rows
+                .iter()
+                .filter(|r| r[0] as i64 + span <= now)
+                .map(|r| r[4])
+                .collect();
+            let closes = if closes.len() > bars + 1 {
+                closes[closes.len() - bars - 1..].to_vec()
+            } else {
+                closes
+            };
+            if let Some((er, r2, ret)) = tf::trend_metrics(&closes) {
+                rows_out.push(json!({
+                    "market_id": market, "efficiency": er, "r2": r2, "return": ret,
+                    "quote_volume": volume, "bars": closes.len().saturating_sub(1),
+                }));
+            }
+        }
+        rows_out.sort_by(|a, b| {
+            as_f64(b.get("efficiency"))
+                .unwrap_or(0.0)
+                .partial_cmp(&as_f64(a.get("efficiency")).unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(json!({
+            "timeframe": timeframe, "bars": bars, "universe": universe.len(),
+            "failed": failed, "rows": rows_out,
+        }))
+    }
+
     pub async fn volume_universe(
         &self,
         network: &str,

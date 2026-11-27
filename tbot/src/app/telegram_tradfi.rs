@@ -106,6 +106,50 @@ fn risk_text(cfg: &Value) -> Option<String> {
     Some(format!("1회 손실 자본의 {pct}% (손절 2×ATR)"))
 }
 
+/// Screening result -> text (top SCAN_TOP by efficiency).
+fn scan_text(res: &Value) -> String {
+    let tf = res["timeframe"].as_str().unwrap_or("");
+    let bars = res["bars"].as_u64().unwrap_or(0);
+    let span_h =
+        crate::core::candles::timeframe_ms(tf).unwrap_or(0) as f64 * bars as f64 / 3_600_000.0;
+    let span = if span_h >= 48.0 {
+        format!("약 {:.0}일", span_h / 24.0)
+    } else {
+        format!("약 {:.0}시간", span_h)
+    };
+    let mut lines = vec![
+        format!(
+            "🔭 추세 스크리닝 — {} 최근 {bars}봉 ({span}) · {} 종목 중 상위 {} (보기만, 진입 안 함)",
+            timeframe_label(tf),
+            res["universe"].as_u64().unwrap_or(0),
+            config_tradfi::SCAN_TOP
+        ),
+        "효율 = 순이동 ÷ 총이동 (1에 가까울수록 출렁임 없이 한 방향) · 직선성 = 추세선 R²".to_string(),
+    ];
+    let rows = res["rows"].as_array().cloned().unwrap_or_default();
+    if rows.is_empty() {
+        lines.push("결과 없음".to_string());
+    }
+    for (i, r) in rows.iter().take(config_tradfi::SCAN_TOP).enumerate() {
+        let ret = r["return"].as_f64().unwrap_or(0.0);
+        let arrow = if ret >= 0.0 { "▲" } else { "▼" };
+        lines.push(format!(
+            "{}. {} {arrow} {:+.2}% · 효율 {:.2} · 직선성 {:.2} · 거래대금 {:.0}M",
+            i + 1,
+            r["market_id"].as_str().unwrap_or(""),
+            ret * 100.0,
+            r["efficiency"].as_f64().unwrap_or(0.0),
+            r["r2"].as_f64().unwrap_or(0.0),
+            r["quote_volume"].as_f64().unwrap_or(0.0) / 1e6
+        ));
+    }
+    if res["failed"].as_u64().unwrap_or(0) > 0 {
+        lines.push(format!("(시세를 못 받은 종목 {}개 제외)", res["failed"]));
+    }
+    lines.push("과거 움직임일 뿐 앞으로도 이어진다는 보장은 없습니다. /tfscan 3m 200 처럼 시간봉·봉 수를 바꿔 볼 수 있습니다.".to_string());
+    lines.join("\n")
+}
+
 fn auto_on(cfg: &Value) -> bool {
     py_truthy(cfg_get(cfg, "auto_scan"))
 }
@@ -725,6 +769,7 @@ pub fn tradfi_keyboard(cfg: &Value, confirm: Option<(&str, &str)>) -> Value {
     } else {
         "⏭ 다음 봉부터 변경"
     };
+    rows.push(vec![markup_button("🔭 추세 스크리닝 (보기만)", "tf:scan")]);
     rows.push(vec![
         markup_button(next_label, "tf:nx"),
         markup_button("🤝 수동 포지션 맡기기", "tf:adopt"),
@@ -1137,6 +1182,42 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         )
     }
 
+    /// Trend screening text (view only).
+    pub async fn tf_scan_text(&self, timeframe: &str, bars: usize) -> String {
+        let res = match self
+            .tf_call(
+                "tradfi_trend_scan",
+                json!({ "timeframe": timeframe, "bars": bars }),
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => return engine_error_text(&e),
+        };
+        scan_text(&res)
+    }
+
+    /// `/tfscan [시간봉] [봉 수]` -- e.g. /tfscan 3m 100.
+    pub async fn handle_tfscan(&self, chat_id: i64, args: &[String]) -> Vec<Outgoing> {
+        let cfg = fetch_config(self).await;
+        let mut tf = timeframe_of(&cfg);
+        let mut bars = config_tradfi::SCAN_DEFAULT_BARS;
+        for a in args {
+            let a = a.trim().to_lowercase();
+            if crate::core::candles::timeframe_ms(&a).is_some() {
+                tf = a;
+            } else if let Ok(n) = a.parse::<usize>() {
+                bars = n.clamp(20, 500);
+            }
+        }
+        let text = self.tf_scan_text(&tf, bars).await;
+        vec![Outgoing::Send {
+            chat_id,
+            text,
+            markup: Some(tradfi_keyboard(&cfg, None)),
+        }]
+    }
+
     /// `/tfma [fast slow [long]]`; without numbers it shows how to set them.
     pub async fn handle_tfma(&self, chat_id: i64, args: &[String]) -> Vec<Outgoing> {
         let (text, markup) = if args.is_empty() {
@@ -1363,6 +1444,13 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 format!("🚪 청산MA 없음: 반대 배열이 새로 생기면 청산합니다 (반대 진입 없음).\n\n{status_text}"),
                 self.tf_keyboard().await,
             );
+        }
+        if action == "scan" {
+            let tf = timeframe_of(&cfg);
+            let text = self
+                .tf_scan_text(&tf, config_tradfi::SCAN_DEFAULT_BARS)
+                .await;
+            return (text, tradfi_keyboard(&cfg, None));
         }
         if action == "nx" || action.starts_with("nx:") {
             return self.tf_next_action(&cfg, action).await;
@@ -1854,6 +1942,14 @@ mod tests {
                 })),
                 "resolve_tradfi_any" => f.resolve.lock().unwrap().clone(),
                 "tradfi_symbols" => Ok(json!(["CLUSDT", "QQQUSDT", "XAUUSDT"])),
+                "tradfi_trend_scan" => Ok(json!({
+                    "timeframe": args["timeframe"].clone(), "bars": args["bars"].clone(),
+                    "universe": 42, "failed": 0,
+                    "rows": [
+                        {"market_id": "PORTALUSDT", "efficiency": 0.62, "r2": 0.91, "return": 0.123, "quote_volume": 2.5e8},
+                        {"market_id": "ETHUSDT", "efficiency": 0.41, "r2": 0.70, "return": -0.021, "quote_volume": 9.0e9},
+                    ],
+                })),
                 "adopt_position" => Ok(json!({
                     "ok": true, "market_id": "SKHYUSDT", "side": "SHORT",
                     "quantity": 0.8, "entry_price": 105.76, "leverage": 5, "margin": 16.92,
@@ -2332,6 +2428,32 @@ mod tests {
         let sw = fake.config.lock().unwrap()[config_tradfi::NEXT_SWITCH_KEY].clone();
         assert_eq!(sw["ma_slow_period"], json!(120));
         assert_eq!(sw["ma_long_period"], json!(200));
+    }
+
+    #[tokio::test]
+    async fn trend_scan_is_view_only() {
+        let fake = Fake::new();
+        let b = bot(&fake);
+        let (text, _) = b.handle_tradfi_action("scan").await;
+        assert!(
+            text.starts_with("🔭 추세 스크리닝 — 4시간봉 최근 100봉"),
+            "{text}"
+        );
+        assert!(
+            text.contains("1. PORTALUSDT ▲ +12.30% · 효율 0.62"),
+            "{text}"
+        );
+        assert!(text.contains("2. ETHUSDT ▼ -2.10%"), "{text}");
+        let out = b
+            .handle_tfscan(1, &["3m".to_string(), "200".to_string()])
+            .await;
+        match &out[0] {
+            Outgoing::Send { text, .. } => {
+                assert!(text.contains("3분봉 최근 200봉 (약 10시간)"), "{text}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(fake.sets().is_empty());
     }
 
     #[tokio::test]

@@ -1256,6 +1256,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 }]
             }
             "tfcoin" => self.handle_tfcoin(chat_id, &args).await,
+            "tfscan" => self.handle_tfscan(chat_id, &args).await,
             "tfma" => {
                 if args.is_empty() {
                     self.pending_input
@@ -1467,6 +1468,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
              /tfcoin <종목> — /tradfi 종목 지정, TradFi·코인 모두 가능 (예: /tfcoin CL, /tfcoin BTC)
              /tfexit <기간> — /tradfi 청산 MA 지정, 2~120 자유 입력 (예: /tfexit 45)
              /tfma <fast> <slow> [긴MA] — /tradfi 진입 MA 지정 (예: /tfma 1 5 120)
+             /tfscan [시간봉] [봉 수] — 한 방향으로 곧게 움직인 종목 스크리닝, 보기만 (예: /tfscan 3m 100)
              /btcoptions — BTC 옵션 자동매매 메뉴 (바이낸스 유럽식 옵션, 매수 전용)\n\
              /options — 옵션 자동매매 메뉴 (멀티코인)\n\
              /exchange — 거래소/네트워크 전환 (바이낸스 테스트넷 · 메인넷, 구 /setup)\n\
