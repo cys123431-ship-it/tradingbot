@@ -580,7 +580,10 @@ pub fn tradfi_status_text(status: &Value) -> String {
             if has_credentials { "있음" } else { "없음" }
         ),
         if auto_on(&cfg) {
-            format!("종목: 🔎 자동 탐색 ({AUTO_UNIVERSE_TEXT}, 여럿이면 돌파 폭 큰 종목) · {bar} 마감 기준")
+            match config_tradfi::efficiency_threshold(&cfg) {
+                Some(th) => format!("종목: 🔎 자동 탐색 ({AUTO_UNIVERSE_TEXT}, 효율 {th} 이상만, 효율 높은 순) · {bar} 마감 기준"),
+                None => format!("종목: 🔎 자동 탐색 ({AUTO_UNIVERSE_TEXT}, 여럿이면 돌파 폭 큰 종목) · {bar} 마감 기준"),
+            }
         } else {
             format!("종목: {coin} (TradFi·코인 모두 가능) · {bar} 마감 기준")
         },
@@ -770,6 +773,19 @@ pub fn tradfi_keyboard(cfg: &Value, confirm: Option<(&str, &str)>) -> Value {
         "⏭ 다음 봉부터 변경"
     };
     rows.push(vec![markup_button("🔭 추세 스크리닝 (보기만)", "tf:scan")]);
+    let eff = config_tradfi::efficiency_threshold(cfg);
+    let mut eff_row = vec![markup_button(
+        mark(eff.is_none(), "효율필터 끔"),
+        "tf:eff:0",
+    )];
+    for c in config_tradfi::EFFICIENCY_CHOICES {
+        let selected = eff.map(|e| (e - c).abs() < 1e-9).unwrap_or(false);
+        eff_row.push(markup_button(
+            mark(selected, &format!("효율 {c}↑")),
+            format!("tf:eff:{c}"),
+        ));
+    }
+    rows.push(eff_row);
     rows.push(vec![
         markup_button(next_label, "tf:nx"),
         markup_button("🤝 수동 포지션 맡기기", "tf:adopt"),
@@ -1444,6 +1460,32 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 format!("🚪 청산MA 없음: 반대 배열이 새로 생기면 청산합니다 (반대 진입 없음).\n\n{status_text}"),
                 self.tf_keyboard().await,
             );
+        }
+        if let Some(rest) = action.strip_prefix("eff:") {
+            let v: f64 = rest.parse().unwrap_or(0.0);
+            let v = if config_tradfi::EFFICIENCY_CHOICES
+                .iter()
+                .any(|c| (c - v).abs() < 1e-9)
+            {
+                v
+            } else {
+                0.0
+            };
+            if let Err(e) = self.tf_set("auto_min_efficiency", json!(v)).await {
+                return (engine_error_text(&e), tradfi_keyboard(&cfg, None));
+            }
+            let head = if v > 0.0 {
+                format!(
+                    "📐 자동 탐색 효율 필터: {v} 이상\n진입 조건을 맞춘 후보 중 최근 {}봉 동안 진입 방향으로 곧게 움직인 정도(효율)가 {v} 이상인 종목만 남기고, 효율이 높은 순으로 진입합니다.{}",
+                    config_tradfi::SCAN_DEFAULT_BARS,
+                    if auto_on(&cfg) { "" } else { "\n(자동 탐색이 꺼져 있어 지금은 적용되지 않습니다. 🔎 자동 탐색을 켜면 적용됩니다.)" }
+                )
+            } else {
+                "📐 자동 탐색 효율 필터: 끔\n후보가 여럿이면 돌파 폭이 큰 순으로 진입합니다."
+                    .to_string()
+            };
+            let status_text = self.tf_status_text().await;
+            return (format!("{head}\n\n{status_text}"), self.tf_keyboard().await);
         }
         if action == "scan" {
             let tf = timeframe_of(&cfg);
@@ -2428,6 +2470,32 @@ mod tests {
         let sw = fake.config.lock().unwrap()[config_tradfi::NEXT_SWITCH_KEY].clone();
         assert_eq!(sw["ma_slow_period"], json!(120));
         assert_eq!(sw["ma_long_period"], json!(200));
+    }
+
+    #[tokio::test]
+    async fn efficiency_filter_buttons() {
+        let fake = Fake::new();
+        let b = bot(&fake);
+        let (text, kb) = b.handle_tradfi_action("eff:0.4").await;
+        assert!(
+            text.starts_with("📐 자동 탐색 효율 필터: 0.4 이상"),
+            "{text}"
+        );
+        assert!(text.contains("자동 탐색이 꺼져 있어"), "{text}");
+        assert!(callbacks(&kb)
+            .iter()
+            .any(|(t, d)| t.starts_with("✅") && d == "tf:eff:0.4"));
+        let (text, _) = b.handle_tradfi_action("eff:0").await;
+        assert!(text.starts_with("📐 자동 탐색 효율 필터: 끔"), "{text}");
+        b.handle_tradfi_action("eff:0.9").await;
+        assert_eq!(
+            fake.sets(),
+            vec![
+                json!({"auto_min_efficiency": 0.4}),
+                json!({"auto_min_efficiency": 0.0}),
+                json!({"auto_min_efficiency": 0.0}),
+            ]
+        );
     }
 
     #[tokio::test]

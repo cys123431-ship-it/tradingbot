@@ -1135,6 +1135,12 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             ) {
                 obj.insert("atr".to_string(), json!(atr));
             }
+            if let (Some(eff), Some(obj)) = (
+                crate::strategy::config_tradfi::signed_efficiency(&rows, self.now_ms(), span),
+                value.as_object_mut(),
+            ) {
+                obj.insert("efficiency".to_string(), json!(eff));
+            }
         }
         Ok(value)
     }
@@ -2235,15 +2241,33 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         // On-time crosses first; one-bar-late crosses keep their volume order after.
         candidates
             .sort_by_key(|s| s.get("entry_type").and_then(|v| v.as_str()) == Some("CROSS_LATE"));
+        let mut eff_skip: Option<String> = None;
         if cfg.get("scan_scope").and_then(|v| v.as_str())
             == Some(crate::strategy::config_tradfi::AUTO_SCOPE)
         {
-            // /tradfi auto search: widest breakout of the close beyond the slow MA first.
-            candidates.sort_by(|a, b| {
-                breakout_width(b)
-                    .partial_cmp(&breakout_width(a))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            if let Some(th) = crate::strategy::config_tradfi::efficiency_threshold(&cfg) {
+                // Efficiency filter: only coins that moved straight in the entry
+                // direction; the most efficient first.
+                let before = candidates.len();
+                candidates.retain(|s| crate::strategy::config_tradfi::efficiency_ok(s, th));
+                candidates.sort_by(|a, b| {
+                    let ea = as_f64(a.get("efficiency")).unwrap_or(0.0).abs();
+                    let eb = as_f64(b.get("efficiency")).unwrap_or(0.0).abs();
+                    eb.partial_cmp(&ea).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                if before > 0 && candidates.is_empty() {
+                    eff_skip = Some(format!(
+                        "EFFICIENCY_FILTER: 진입 조건 {before}종목 모두 효율 {th} 미만"
+                    ));
+                }
+            } else {
+                // /tradfi auto search: widest breakout of the close beyond the slow MA first.
+                candidates.sort_by(|a, b| {
+                    breakout_width(b)
+                        .partial_cmp(&breakout_width(a))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
         }
         let crosses: Vec<String> = results
             .iter()
@@ -2316,7 +2340,9 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             fields.insert("symbol".to_string(), mid);
             fields.insert("sma_fast".to_string(), get("sma_fast"));
             fields.insert("sma_slow".to_string(), get("sma_slow"));
-            let skip = if candidates.is_empty() {
+            let skip = if let Some(text) = eff_skip.clone() {
+                text
+            } else if candidates.is_empty() {
                 format!("NO_SIGNAL ({}종목 평가)", results.len())
             } else {
                 String::new()
@@ -2327,7 +2353,8 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         }
         self.save_state(network, mode, state)?;
         if candidates.is_empty() {
-            return Ok(json!({"action": "skip", "reason": "NO_SIGNAL"}));
+            let reason = eff_skip.unwrap_or_else(|| "NO_SIGNAL".to_string());
+            return Ok(json!({"action": "skip", "reason": reason}));
         }
         let mut last: Option<Value> = None;
         for signal in candidates {

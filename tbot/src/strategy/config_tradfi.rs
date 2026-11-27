@@ -394,6 +394,55 @@ pub fn trend_metrics(closes: &[f64]) -> Option<(f64, f64, f64)> {
     Some((er, r2, last / first - 1.0))
 }
 
+/// Auto-search efficiency filter (user choice 2026-11-27, off by default):
+/// a candidate is kept only when its signed efficiency over the last
+/// SCAN_DEFAULT_BARS closed bars reaches the threshold in the entry
+/// direction (long: >= th, short: <= -th); survivors are taken most
+/// efficient first. 0 = off.
+pub const EFFICIENCY_CHOICES: &[f64] = &[0.3, 0.4, 0.5];
+
+/// Signed efficiency (net move / path; + up, - down) of the last
+/// SCAN_DEFAULT_BARS closed candles.
+pub fn signed_efficiency(rows: &[[f64; 6]], now_ms: i64, span_ms: i64) -> Option<f64> {
+    let closes: Vec<f64> = rows
+        .iter()
+        .filter(|r| span_ms <= 0 || r[0] as i64 + span_ms <= now_ms)
+        .map(|r| r[4])
+        .collect();
+    let closes = if closes.len() > SCAN_DEFAULT_BARS + 1 {
+        &closes[closes.len() - SCAN_DEFAULT_BARS - 1..]
+    } else {
+        &closes[..]
+    };
+    let (er, _, ret) = trend_metrics(closes)?;
+    Some(if ret >= 0.0 { er } else { -er })
+}
+
+/// Threshold in use, or None when the filter is off.
+pub fn efficiency_threshold(cfg: &Value) -> Option<f64> {
+    let v = cfg
+        .get("auto_min_efficiency")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    EFFICIENCY_CHOICES
+        .iter()
+        .copied()
+        .find(|c| (c - v).abs() < 1e-9)
+}
+
+/// True when `signal` passes the efficiency filter for its side.
+pub fn efficiency_ok(signal: &Value, threshold: f64) -> bool {
+    let eff = signal
+        .get("efficiency")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    match signal.get("side").and_then(|v| v.as_str()) {
+        Some("LONG") => eff >= threshold,
+        Some("SHORT") => eff <= -threshold,
+        _ => false,
+    }
+}
+
 /// Keys of the retired -50% halt, dropped from stored configs.
 const RETIRED_KEYS: &[&str] = &["drawdown_base_equity", "drawdown_halt_until_ms"];
 
@@ -459,6 +508,14 @@ pub fn normalize_tradfi_config(raw: Option<&Value>) -> Value {
     let exit_off = bool_of(supplied.get("exit_ma_off"), false);
     let auto_scan = bool_of(supplied.get("auto_scan"), false);
     let risk_on = bool_of(supplied.get("risk_sizing_enabled"), true);
+    let min_eff = supplied
+        .get("auto_min_efficiency")
+        .and_then(|v| {
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+        })
+        .filter(|v| EFFICIENCY_CHOICES.iter().any(|c| (c - v).abs() < 1e-9))
+        .unwrap_or(0.0);
     let risk_pct = i64_of(supplied.get("risk_per_trade_pct"))
         .filter(|p| RISK_CHOICES.contains(p))
         .unwrap_or(DEFAULT_RISK_PCT);
@@ -498,6 +555,7 @@ pub fn normalize_tradfi_config(raw: Option<&Value>) -> Value {
         map.insert("exit_ma_off".into(), Value::Bool(exit_off));
         map.insert("auto_scan".into(), Value::Bool(auto_scan));
         map.insert("risk_sizing_enabled".into(), Value::Bool(risk_on));
+        map.insert("auto_min_efficiency".into(), json!(min_eff));
         map.insert("risk_per_trade_pct".into(), json!(risk_pct));
         // the size is computed per trade: never raise it to the exchange minimum
         if risk_on {
@@ -724,6 +782,36 @@ mod tests {
             false
         )
         .is_none());
+    }
+
+    #[test]
+    fn efficiency_filter_rules() {
+        assert_eq!(efficiency_threshold(&normalize_tradfi_config(None)), None);
+        let on = normalize_tradfi_config(Some(&json!({"auto_min_efficiency": 0.4})));
+        assert_eq!(efficiency_threshold(&on), Some(0.4));
+        let bad = normalize_tradfi_config(Some(&json!({"auto_min_efficiency": 0.7})));
+        assert_eq!(efficiency_threshold(&bad), None);
+        assert!(efficiency_ok(
+            &json!({"side": "LONG", "efficiency": 0.45}),
+            0.4
+        ));
+        assert!(!efficiency_ok(
+            &json!({"side": "LONG", "efficiency": -0.6}),
+            0.4
+        ));
+        assert!(efficiency_ok(
+            &json!({"side": "SHORT", "efficiency": -0.5}),
+            0.4
+        ));
+        assert!(!efficiency_ok(
+            &json!({"side": "SHORT", "efficiency": 0.5}),
+            0.4
+        ));
+        let up: Vec<[f64; 6]> = (0..150)
+            .map(|i| [i as f64 * 10.0, 0.0, 0.0, 0.0, 100.0 + i as f64, 0.0])
+            .collect();
+        let e = signed_efficiency(&up, 10_000, 10).unwrap();
+        assert!((e - 1.0).abs() < 1e-9, "{e}");
     }
 
     #[test]
