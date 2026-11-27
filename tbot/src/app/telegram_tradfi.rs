@@ -1957,7 +1957,7 @@ fn tradfi_rules_text(cfg: &Value) -> String {
         format!("· 종목: {coin} · 바이낸스 TradFi 무기한(금·원유·미국주식 등)과 일반 코인 무기한 모두 가능 (/tfcoin BTC)"),
         format!("· 🔎 자동 탐색: 켜면 지정 종목 대신 {AUTO_UNIVERSE_TEXT} 종목 전체에서 마감봉 진입 조건을 맞춘 종목에 진입 (한 번에 1개, 여럿이면 돌파 폭 큰 종목). 보유 중에 켜고 끄면 그 포지션이 청산된 뒤부터 적용"),
         "· 거래소: 바이낸스 메인넷 전용 (테스트넷·업비트 불가)".to_string(),
-        format!("· 봉: {bar} 마감 기준 (메뉴에서 3분봉~1일봉 중 하나 선택)"),
+        format!("· 봉: {bar} 마감 기준 (메뉴에서 1분봉~1일봉 중 하나 선택)"),
         String::new(),
         "진입".to_string(),
         format!("· 롱: {}이고 종가가 청산선 위", align_rule(cfg, true)),

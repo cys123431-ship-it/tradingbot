@@ -4,7 +4,7 @@
 //! oil, US equities/ETFs); crypto symbols are refused by the service and the
 //! menu. Default XAUUSDT.
 //!
-//! Rules (closed candles of the chosen timeframe, 3m..1d, default 4h; SMA 1 = the close):
+//! Rules (closed candles of the chosen timeframe, 1m..1d, default 4h; SMA 1 = the close):
 //! - Long entry: bullish alignment close > SMA5 > SMA120 with the close above
 //!   the exit line. Entry mode "cross" = only on the bar where the alignment
 //!   newly forms; "trend" = whenever it holds (after one bar of re-entry wait).
@@ -29,7 +29,7 @@ pub const CONFIG_KEY: &str = "tradfi_ma";
 pub const DEFAULT_SYMBOL: &str = "XAUUSDT";
 /// Entry/exit candle; one is chosen in the menu.
 pub const TIMEFRAMES: &[&str] = &[
-    "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d",
+    "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d",
 ];
 pub const DEFAULT_TIMEFRAME: &str = "4h";
 /// Default alignment periods: fast (1 = the close), slow ("SMA5") and long
@@ -701,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn timeframe_is_user_choice_from_3m_to_1d() {
+    fn timeframe_is_user_choice_from_1m_to_1d() {
         for tf in TIMEFRAMES {
             let cfg = normalize_tradfi_config(Some(&json!({ "timeframe": tf })));
             assert_eq!(cfg["timeframe"], json!(tf));

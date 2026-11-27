@@ -1491,7 +1491,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
              /btcma <패스트> <슬로우> — /btcmacross SMA 기간 변경 (예: /btcma 1 200)\n\
              /btcma exit <기간> — /btcmacross 청산 MA 변경, 끄기는 /btcma exit off (예: /btcma exit 69)\n\
              /btcmaperiod — SMA 기간 도움말\n\
-             /tradfi — TradFi 정배열 전략 메뉴 (금·원유·미국주식, 기본 SMA 1·5·120, 3분봉~1일봉 선택)
+             /tradfi — TradFi 정배열 전략 메뉴 (금·원유·미국주식, 기본 SMA 1·5·120, 1분봉~1일봉 선택)
              /tfcoin <종목> — /tradfi 종목 지정, TradFi·코인 모두 가능 (예: /tfcoin CL, /tfcoin BTC)
              /tfexit <기간> — /tradfi 청산 MA 지정, 2~120 자유 입력 (예: /tfexit 45)
              /tfma <fast> <slow> [긴MA] — /tradfi 진입 MA 지정 (예: /tfma 1 5 120)
