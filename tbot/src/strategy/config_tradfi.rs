@@ -32,8 +32,50 @@ pub const TIMEFRAMES: &[&str] = &[
     "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d",
 ];
 pub const DEFAULT_TIMEFRAME: &str = "4h";
+/// Default alignment periods: fast (1 = the close), slow ("SMA5") and long
+/// ("SMA120"). All three are user-chosen since 2026-11-27 (`/tfma 1 5 120`).
+pub const FAST_PERIOD: i64 = 1;
 pub const MID_PERIOD: i64 = 5;
 pub const SLOW_PERIOD: i64 = 120;
+/// Longest alignment period: candle_history 260 keeps it computable.
+pub const MA_PERIOD_MAX: i64 = 250;
+/// User keys of the alignment periods (fast / slow / long).
+pub const MA_KEYS: [&str; 3] = ["ma_fast_period", "ma_slow_period", "ma_long_period"];
+
+/// fast < slow, and slow < long while the long MA is part of the alignment.
+pub fn ma_periods_ok(fast: i64, slow: i64, long: i64, use_long: bool) -> bool {
+    let range = |p: i64| (1..=MA_PERIOD_MAX).contains(&p);
+    range(fast)
+        && range(slow)
+        && range(long)
+        && long >= 2
+        && fast < slow
+        && (!use_long || slow < long)
+}
+
+/// "1 5 120" / "1/5/120" / "1,5" (two numbers keep `long`).
+pub fn parse_ma_periods(text: &str, long: i64) -> Option<(i64, i64, i64)> {
+    let nums: Vec<i64> = text
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<i64>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    match nums.as_slice() {
+        [f, s] => Some((*f, *s, long)),
+        [f, s, l] => Some((*f, *s, *l)),
+        _ => None,
+    }
+}
+
+/// (fast, slow, long) from a config or switch, defaults when missing.
+pub fn ma_periods_of(v: &Value) -> (i64, i64, i64) {
+    let get = |k: &str, d: i64| i64_of(v.get(k)).unwrap_or(d);
+    (
+        get(MA_KEYS[0], FAST_PERIOD),
+        get(MA_KEYS[1], MID_PERIOD),
+        get(MA_KEYS[2], SLOW_PERIOD),
+    )
+}
 /// Preset buttons in the menu; any period in EXIT_MA_MIN..=EXIT_MA_MAX is allowed.
 pub const EXIT_MA_CHOICES: &[i64] = &[20, 30, 50];
 pub const EXIT_MA_MIN: i64 = 2;
@@ -113,12 +155,22 @@ pub fn clean_switch(v: &Value, booked: bool) -> Option<Value> {
         return None;
     }
     let exit = i64_of(m.get("exit_ma_period")).filter(|p| exit_ma_allowed(*p))?;
+    let use_long = bool_of(m.get("align_slow_enabled"), true);
     let mut out = json!({
         "timeframe": tf,
         "exit_ma_period": exit,
         "exit_ma_off": bool_of(m.get("exit_ma_off"), false),
-        "align_slow_enabled": bool_of(m.get("align_slow_enabled"), true),
+        "align_slow_enabled": use_long,
     });
+    if MA_KEYS.iter().any(|k| m.contains_key(*k)) {
+        let (f, s, l) = ma_periods_of(v);
+        if !ma_periods_ok(f, s, l, use_long) {
+            return None;
+        }
+        out[MA_KEYS[0]] = json!(f);
+        out[MA_KEYS[1]] = json!(s);
+        out[MA_KEYS[2]] = json!(l);
+    }
     if booked {
         let from = m.get("from_timeframe")?.as_str()?.trim().to_lowercase();
         let at = i64_of(m.get("apply_at_ms")).filter(|t| *t > 0)?;
@@ -169,7 +221,16 @@ pub fn timeframe_label(tf: &str) -> String {
     }
 }
 
-/// "4시간봉 · 청산 120MA · 120MA 포함" (with "30분봉 → " when `from` is given).
+/// "MA 1·5·120" or "MA 1·5 (120 제외)".
+pub fn ma_label(fast: i64, slow: i64, long: i64, use_long: bool) -> String {
+    if use_long {
+        format!("MA {fast}·{slow}·{long}")
+    } else {
+        format!("MA {fast}·{slow} ({long} 제외)")
+    }
+}
+
+/// "4시간봉 · MA 1·5·120 · 청산 30MA" (with "30분봉 → " when `from` is given).
 pub fn switch_summary(sw: &Value, from: Option<&str>) -> String {
     let tf = sw.get("timeframe").and_then(|v| v.as_str()).unwrap_or("");
     let exit = if bool_of(sw.get("exit_ma_off"), false) {
@@ -177,16 +238,13 @@ pub fn switch_summary(sw: &Value, from: Option<&str>) -> String {
     } else {
         format!("청산 {}MA", i64_of(sw.get("exit_ma_period")).unwrap_or(0))
     };
-    let slow = if bool_of(sw.get("align_slow_enabled"), true) {
-        "120MA 포함"
-    } else {
-        "120MA 빼기"
-    };
+    let (f, s, l) = ma_periods_of(sw);
+    let ma = ma_label(f, s, l, bool_of(sw.get("align_slow_enabled"), true));
     let head = match from.filter(|f| !f.is_empty()) {
         Some(f) => format!("{} → ", timeframe_label(f)),
         None => String::new(),
     };
-    format!("{head}{} · {exit} · {slow}", timeframe_label(tf))
+    format!("{head}{} · {ma} · {exit}", timeframe_label(tf))
 }
 
 /// Config changes that apply a booked switch (and clear it).
@@ -197,6 +255,9 @@ pub fn switch_changes(sw: &Value) -> Map<String, Value> {
         "exit_ma_period",
         "exit_ma_off",
         "align_slow_enabled",
+        MA_KEYS[0],
+        MA_KEYS[1],
+        MA_KEYS[2],
     ] {
         if let Some(v) = sw.get(key) {
             changes.insert(key.to_string(), v.clone());
@@ -269,6 +330,15 @@ pub fn normalize_tradfi_config(raw: Option<&Value>) -> Value {
     // "청산MA 없음": no exit line; a position closes on the opposite
     // alignment (close only), the profit lock or the emergency stop.
     let exit_off = bool_of(supplied.get("exit_ma_off"), false);
+    // Alignment periods; an inconsistent set falls back to 1/5/120.
+    let (ma_f, ma_s, ma_l) = {
+        let p = ma_periods_of(&Value::Object(supplied.clone()));
+        if ma_periods_ok(p.0, p.1, p.2, align_slow) {
+            p
+        } else {
+            (FAST_PERIOD, MID_PERIOD, SLOW_PERIOD)
+        }
+    };
     let switches: Vec<(&str, Value)> = [(NEXT_SWITCH_KEY, true), (NEXT_DRAFT_KEY, false)]
         .into_iter()
         .map(|(key, booked)| {
@@ -294,6 +364,12 @@ pub fn normalize_tradfi_config(raw: Option<&Value>) -> Value {
         map.insert("profit_lock_enabled".into(), Value::Bool(profit_lock));
         map.insert("align_slow_enabled".into(), Value::Bool(align_slow));
         map.insert("exit_ma_off".into(), Value::Bool(exit_off));
+        map.insert("fast_period".into(), json!(ma_f));
+        map.insert("align_mid_period".into(), json!(ma_s));
+        map.insert("slow_period".into(), json!(ma_l));
+        map.insert(MA_KEYS[0].into(), json!(ma_f));
+        map.insert(MA_KEYS[1].into(), json!(ma_s));
+        map.insert(MA_KEYS[2].into(), json!(ma_l));
         for (key, v) in switches {
             map.insert(key.into(), v);
         }
@@ -447,6 +523,61 @@ mod tests {
         let off = normalize_tradfi_config(Some(&json!({"align_slow_enabled": false})));
         assert_eq!(off["align_slow_enabled"], json!(false));
         assert_eq!(off["slow_period"], json!(SLOW_PERIOD));
+    }
+
+    #[test]
+    fn alignment_periods_are_user_choice() {
+        let d = normalize_tradfi_config(None);
+        assert_eq!(
+            (&d["fast_period"], &d["align_mid_period"], &d["slow_period"]),
+            (&json!(1), &json!(5), &json!(120))
+        );
+        // a stale shared-config slow_period does not leak in
+        let stale = normalize_tradfi_config(Some(&json!({"slow_period": 200, "fast_period": 3})));
+        assert_eq!(stale["slow_period"], json!(120));
+        assert_eq!(stale["fast_period"], json!(1));
+        let c = normalize_tradfi_config(Some(&json!({
+            "ma_fast_period": 2, "ma_slow_period": 20, "ma_long_period": 200,
+        })));
+        assert_eq!(
+            (&c["fast_period"], &c["align_mid_period"], &c["slow_period"]),
+            (&json!(2), &json!(20), &json!(200))
+        );
+        // slow >= long is fine only while the long MA is excluded
+        let bad = normalize_tradfi_config(Some(&json!({
+            "ma_fast_period": 1, "ma_slow_period": 120, "ma_long_period": 120,
+        })));
+        assert_eq!(bad["align_mid_period"], json!(5));
+        let off = normalize_tradfi_config(Some(&json!({
+            "ma_fast_period": 1, "ma_slow_period": 120, "ma_long_period": 120,
+            "align_slow_enabled": false,
+        })));
+        assert_eq!(off["align_mid_period"], json!(120));
+        assert!(!ma_periods_ok(5, 5, 120, true));
+        assert!(!ma_periods_ok(1, 5, MA_PERIOD_MAX + 1, true));
+        assert_eq!(parse_ma_periods("1 5 120", 9), Some((1, 5, 120)));
+        assert_eq!(parse_ma_periods("2/30", 200), Some((2, 30, 200)));
+        assert_eq!(parse_ma_periods("1", 200), None);
+        assert_eq!(parse_ma_periods("a b", 200), None);
+    }
+
+    #[test]
+    fn switch_carries_ma_periods() {
+        let sw = clean_switch(
+            &json!({"timeframe": "4h", "exit_ma_period": 30,
+                    "ma_fast_period": 1, "ma_slow_period": 120, "ma_long_period": 200}),
+            false,
+        )
+        .unwrap();
+        assert_eq!(sw["ma_slow_period"], json!(120));
+        assert_eq!(switch_changes(&sw)["ma_long_period"], json!(200));
+        assert!(switch_summary(&sw, None).contains("MA 1·120·200"));
+        assert!(clean_switch(
+            &json!({"timeframe": "4h", "exit_ma_period": 30,
+                    "ma_fast_period": 5, "ma_slow_period": 5}),
+            false
+        )
+        .is_none());
     }
 
     #[test]

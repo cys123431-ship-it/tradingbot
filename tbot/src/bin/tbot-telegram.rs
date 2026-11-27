@@ -72,6 +72,10 @@ async fn main() -> Result<(), String> {
             "/tradfi 청산 MA 지정 (2~120)".to_string(),
         ),
         (
+            "tfma".to_string(),
+            "/tradfi 진입 MA 지정 (fast slow 긴MA)".to_string(),
+        ),
+        (
             "btcoptions".to_string(),
             "BTC 옵션 자동매매 메뉴".to_string(),
         ),

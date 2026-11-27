@@ -157,13 +157,59 @@ fn kst_hm(ms: i64) -> String {
         .unwrap_or_default()
 }
 
+/// (fast, slow, long) alignment periods of the config.
+fn ma_of(cfg: &Value) -> (i64, i64, i64) {
+    config_tradfi::ma_periods_of(cfg)
+}
+
+/// "MA 1·5·120" / "MA 1·5 (120 제외)".
+fn ma_text(cfg: &Value) -> String {
+    let (f, s, l) = ma_of(cfg);
+    config_tradfi::ma_label(f, s, l, slow_on(cfg))
+}
+
+/// "종가" for period 1, else "SMA3".
+fn fast_name(fast: i64) -> String {
+    if fast <= 1 {
+        "종가".to_string()
+    } else {
+        format!("SMA{fast}")
+    }
+}
+
+pub const MA_PROMPT_HEAD: &str = "✏️ 진입 MA 직접 입력";
+/// `pending_input` marker: the next plain text is "fast slow [long]".
+pub const PENDING_MA: &str = "tf_ma";
+pub const NEXT_MA_PROMPT_HEAD: &str = "✏️ 예약할 진입 MA 입력";
+/// `pending_input` marker: the next plain text is the booked "fast slow [long]".
+pub const PENDING_NEXT_MA: &str = "tf_next_ma";
+
+fn ma_prompt_text(head: &str, now: &str) -> String {
+    format!(
+        "{head}\n지금: {now}\nfast slow 긴MA 순서로 숫자를 보내세요. 예: 1 5 120 (두 개만 보내면 긴MA는 그대로, 그만두려면 취소)\n규칙: fast < slow, 긴MA를 포함할 땐 slow < 긴MA, 최대 {}",
+        config_tradfi::MA_PERIOD_MAX
+    )
+}
+
+fn ma_error_text(text: &str) -> String {
+    let shown: String = text.chars().take(20).collect();
+    format!(
+        "❌ 진입 MA를 바꾸지 못했습니다 (입력: {shown}). fast < slow, 긴MA 포함 시 slow < 긴MA, 1~{} 사이로 보내세요. 예: 1 5 120",
+        config_tradfi::MA_PERIOD_MAX
+    )
+}
+
 /// Current settings in the switch shape.
 fn current_switch(cfg: &Value) -> Value {
+    let (f, s, l) = ma_of(cfg);
     json!({
         "timeframe": timeframe_of(cfg),
         "exit_ma_period": exit_ma_of(cfg),
         "exit_ma_off": exit_off(cfg),
         "align_slow_enabled": slow_on(cfg),
+        "ma_fast_period": f,
+        "ma_slow_period": s,
+        "ma_long_period": l,
     })
 }
 
@@ -174,9 +220,16 @@ fn booked_switch(cfg: &Value) -> Option<Value> {
 }
 
 fn draft_switch(cfg: &Value) -> Value {
-    cfg_get(cfg, config_tradfi::NEXT_DRAFT_KEY)
+    let mut draft = cfg_get(cfg, config_tradfi::NEXT_DRAFT_KEY)
         .and_then(|v| config_tradfi::clean_switch(v, false))
-        .unwrap_or_else(|| current_switch(cfg))
+        .unwrap_or_else(|| current_switch(cfg));
+    if draft.get("ma_fast_period").is_none() {
+        let (f, s, l) = ma_of(cfg);
+        draft["ma_fast_period"] = json!(f);
+        draft["ma_slow_period"] = json!(s);
+        draft["ma_long_period"] = json!(l);
+    }
+    draft
 }
 
 fn booked_line(sw: &Value) -> String {
@@ -232,6 +285,7 @@ fn next_keyboard(cfg: &Value) -> Value {
     let d_exit = draft["exit_ma_period"].as_i64().unwrap_or(0);
     let d_off = draft["exit_ma_off"].as_bool().unwrap_or(false);
     let d_slow = draft["align_slow_enabled"].as_bool().unwrap_or(true);
+    let (_, _, d_long) = config_tradfi::ma_periods_of(&draft);
     let mut rows: Vec<Vec<Value>> = Vec::new();
     for chunk in TIMEFRAMES.chunks(4) {
         rows.push(
@@ -269,9 +323,16 @@ fn next_keyboard(cfg: &Value) -> Value {
     rows.push(exits);
     rows.push(vec![
         markup_button(mark(d_off, "청산MA 없음"), "tf:nx:exit:none"),
-        markup_button(mark(d_slow, "120MA 포함"), "tf:nx:slow:on"),
-        markup_button(mark(!d_slow, "120MA 빼기"), "tf:nx:slow:off"),
+        markup_button(mark(d_slow, &format!("{d_long}MA 포함")), "tf:nx:slow:on"),
+        markup_button(mark(!d_slow, &format!("{d_long}MA 빼기")), "tf:nx:slow:off"),
     ]);
+    {
+        let (f, s, l) = config_tradfi::ma_periods_of(&draft);
+        rows.push(vec![markup_button(
+            format!("✏️ 진입 MA {f}·{s}·{l} 바꾸기"),
+            "tf:nx:ma",
+        )]);
+    }
     let mut last = vec![markup_button("✅ 예약하기", "tf:nx:save")];
     if booked_switch(cfg).is_some() {
         last.push(markup_button("🗑 예약 취소", "tf:nx:cancel"));
@@ -295,11 +356,23 @@ fn slow_on(cfg: &Value) -> bool {
         .unwrap_or(true)
 }
 
-fn align_text(cfg: &Value) -> &'static str {
+fn align_text(cfg: &Value) -> String {
+    let (f, s, l) = ma_of(cfg);
     if slow_on(cfg) {
-        "SMA 1·5·120 정배열 롱 / 역배열 숏"
+        format!("SMA {f}·{s}·{l} 정배열 롱 / 역배열 숏")
     } else {
-        "SMA 1·5 정배열 롱 / 역배열 숏 (120MA 제외)"
+        format!("SMA {f}·{s} 정배열 롱 / 역배열 숏 ({l}MA 제외)")
+    }
+}
+
+/// "종가 > SMA5 > SMA120" (long side of the alignment).
+fn align_rule(cfg: &Value, long_side: bool) -> String {
+    let (f, s, l) = ma_of(cfg);
+    let op = if long_side { ">" } else { "<" };
+    if slow_on(cfg) {
+        format!("{} {op} SMA{s} {op} SMA{l}", fast_name(f))
+    } else {
+        format!("{} {op} SMA{s}", fast_name(f))
     }
 }
 
@@ -556,9 +629,11 @@ pub fn tradfi_keyboard(cfg: &Value, confirm: Option<(&str, &str)>) -> Value {
         ),
     ]);
     let slow = slow_on(cfg);
+    let (ma_f, ma_s, ma_l) = ma_of(cfg);
     rows.push(vec![
-        markup_button(mark(slow, "120MA 포함"), "tf:slow:on"),
-        markup_button(mark(!slow, "120MA 빼기"), "tf:slow:off"),
+        markup_button(mark(slow, &format!("{ma_l}MA 포함")), "tf:slow:on"),
+        markup_button(mark(!slow, &format!("{ma_l}MA 빼기")), "tf:slow:off"),
+        markup_button(format!("✏️ MA {ma_f}·{ma_s}·{ma_l}"), "tf:ma"),
     ]);
     let mut exit_buttons: Vec<Value> = EXIT_MA_CHOICES
         .iter()
@@ -918,8 +993,28 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                     next_keyboard(cfg),
                 );
             }
+            "ma" => {
+                let (f, s, l) = config_tradfi::ma_periods_of(&draft);
+                let now = config_tradfi::ma_label(
+                    f,
+                    s,
+                    l,
+                    draft["align_slow_enabled"].as_bool().unwrap_or(true),
+                );
+                return (
+                    ma_prompt_text(NEXT_MA_PROMPT_HEAD, &now),
+                    next_keyboard(cfg),
+                );
+            }
             "exit:none" => draft["exit_ma_off"] = json!(true),
-            "slow:on" => draft["align_slow_enabled"] = json!(true),
+            "slow:on" => {
+                let (f, s, l) = config_tradfi::ma_periods_of(&draft);
+                if config_tradfi::ma_periods_ok(f, s, l, true) {
+                    draft["align_slow_enabled"] = json!(true);
+                } else {
+                    head = format!("❌ slow MA({s})가 긴 MA({l})보다 짧아야 {l}MA를 넣을 수 있습니다. ✏️ 진입 MA를 먼저 바꾸세요.");
+                }
+            }
             "slow:off" => draft["align_slow_enabled"] = json!(false),
             other => {
                 if let Some(tf) = other.strip_prefix("bar:") {
@@ -948,6 +1043,80 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             }
         }
         self.tf_next_screen(&head).await
+    }
+
+    /// Store "fast slow [long]" typed after ✏️ MA or `/tfma` (refused while holding).
+    pub async fn tf_ma_from_text(&self, text: &str) -> (String, Value) {
+        let cfg = fetch_config(self).await;
+        let (_, _, long) = ma_of(&cfg);
+        let Some((f, s, l)) = config_tradfi::parse_ma_periods(text, long)
+            .filter(|(f, s, l)| config_tradfi::ma_periods_ok(*f, *s, *l, slow_on(&cfg)))
+        else {
+            return (ma_error_text(text.trim()), tradfi_keyboard(&cfg, None));
+        };
+        if holding(&fetch_status(self).await) {
+            return (HOLDING_BLOCK.to_string(), tradfi_keyboard(&cfg, None));
+        }
+        let mut changes = Map::new();
+        changes.insert("ma_fast_period".to_string(), json!(f));
+        changes.insert("ma_slow_period".to_string(), json!(s));
+        changes.insert("ma_long_period".to_string(), json!(l));
+        if let Err(e) = self
+            .tf_call("config_set", json!({ "changes": changes }))
+            .await
+        {
+            return (engine_error_text(&e), tradfi_keyboard(&cfg, None));
+        }
+        let status_text = self.tf_status_text().await;
+        (
+            format!(
+                "📐 진입 MA: {}\n다음 봉 마감부터 적용됩니다.\n\n{status_text}",
+                config_tradfi::ma_label(f, s, l, slow_on(&cfg))
+            ),
+            self.tf_keyboard().await,
+        )
+    }
+
+    /// `/tfma [fast slow [long]]`; without numbers it shows how to set them.
+    pub async fn handle_tfma(&self, chat_id: i64, args: &[String]) -> Vec<Outgoing> {
+        let (text, markup) = if args.is_empty() {
+            let cfg = fetch_config(self).await;
+            (
+                ma_prompt_text(MA_PROMPT_HEAD, &ma_text(&cfg)),
+                tradfi_keyboard(&cfg, None),
+            )
+        } else {
+            self.tf_ma_from_text(&args.join(" ")).await
+        };
+        vec![Outgoing::Send {
+            chat_id,
+            text,
+            markup: Some(markup),
+        }]
+    }
+
+    /// "fast slow [long]" typed after ✏️ on the next-bar screen.
+    pub async fn tf_next_ma_from_text(&self, text: &str) -> (String, Value) {
+        let cfg = fetch_config(self).await;
+        let mut draft = draft_switch(&cfg);
+        let (_, _, long) = config_tradfi::ma_periods_of(&draft);
+        let use_long = draft["align_slow_enabled"].as_bool().unwrap_or(true);
+        let Some((f, s, l)) = config_tradfi::parse_ma_periods(text, long)
+            .filter(|(f, s, l)| config_tradfi::ma_periods_ok(*f, *s, *l, use_long))
+        else {
+            return (ma_error_text(text.trim()), next_keyboard(&cfg));
+        };
+        draft["ma_fast_period"] = json!(f);
+        draft["ma_slow_period"] = json!(s);
+        draft["ma_long_period"] = json!(l);
+        if let Err(e) = self.tf_save_draft(&draft).await {
+            return (engine_error_text(&e), next_keyboard(&cfg));
+        }
+        self.tf_next_screen(&format!(
+            "✏️ 예약할 진입 MA: {}",
+            config_tradfi::ma_label(f, s, l, use_long)
+        ))
+        .await
     }
 
     /// Exit MA typed after the "✏️ 직접" button of the next-bar screen.
@@ -1113,6 +1282,15 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             }
             return (self.tf_status_text().await, self.tf_keyboard().await);
         }
+        if action == "ma" {
+            if holding(&fetch_status(self).await) {
+                return (HOLDING_BLOCK.to_string(), tradfi_keyboard(&cfg, None));
+            }
+            return (
+                ma_prompt_text(MA_PROMPT_HEAD, &ma_text(&cfg)),
+                tradfi_keyboard(&cfg, None),
+            );
+        }
         if action == "exit:none" {
             if holding(&fetch_status(self).await) {
                 return (HOLDING_BLOCK.to_string(), tradfi_keyboard(&cfg, None));
@@ -1150,14 +1328,25 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         }
         if action == "slow:on" || action == "slow:off" {
             let on = action == "slow:on";
+            let (f, s, l) = ma_of(&cfg);
+            if !config_tradfi::ma_periods_ok(f, s, l, on) {
+                return (
+                    format!("❌ slow MA({s})가 긴 MA({l})보다 짧아야 {l}MA를 넣을 수 있습니다. ✏️ MA 버튼이나 /tfma 로 먼저 바꾸세요."),
+                    tradfi_keyboard(&cfg, None),
+                );
+            }
             if let Err(e) = self.tf_set("align_slow_enabled", json!(on)).await {
                 return (engine_error_text(&e), tradfi_keyboard(&cfg, None));
             }
-            let head = if on {
-                "📐 진입 기준: SMA 1·5·120 정배열 (종가 > SMA5 > SMA120)"
-            } else {
-                "📐 진입 기준: SMA 1·5 정배열 (종가 > SMA5, 120MA 제외)"
-            };
+            let mut after = cfg.clone();
+            if let Some(m) = after.as_object_mut() {
+                m.insert("align_slow_enabled".to_string(), json!(on));
+            }
+            let head = format!(
+                "📐 진입 기준: {} ({})",
+                ma_text(&after),
+                align_rule(&after, true)
+            );
             let status_text = self.tf_status_text().await;
             return (
                 format!("{head}\n다음 봉 마감부터 적용됩니다. 청산 규칙은 그대로입니다.\n\n{status_text}"),
@@ -1397,17 +1586,14 @@ fn tradfi_rules_text(cfg: &Value) -> String {
         format!("· 봉: {bar} 마감 기준 (메뉴에서 3분봉~1일봉 중 하나 선택)"),
         String::new(),
         "진입".to_string(),
-        if slow_on(cfg) {
-            "· 롱: 종가(=SMA1) > SMA5 > SMA120 정배열이고 종가가 청산선 위".to_string()
-        } else {
-            "· 롱: 종가(=SMA1) > SMA5이고 종가가 청산선 위 (120MA 제외 중)".to_string()
-        },
-        if slow_on(cfg) {
-            "· 숏: 종가(=SMA1) < SMA5 < SMA120 역배열이고 종가가 청산선 아래".to_string()
-        } else {
-            "· 숏: 종가(=SMA1) < SMA5이고 종가가 청산선 아래 (120MA 제외 중)".to_string()
-        },
-        "· 120MA 포함/빼기 버튼으로 진입 기준에서 SMA120을 넣거나 뺄 수 있음".to_string(),
+        format!("· 롱: {}이고 종가가 청산선 위", align_rule(cfg, true)),
+        format!("· 숏: {}이고 종가가 청산선 아래", align_rule(cfg, false)),
+        format!(
+            "· 진입 MA: 지금 {} — ✏️ MA 버튼이나 /tfma 1 5 120 으로 fast·slow·긴MA를 직접 지정 (fast < slow, 긴MA 포함 시 slow < 긴MA, 최대 {})",
+            ma_text(cfg),
+            config_tradfi::MA_PERIOD_MAX
+        ),
+        "· 긴MA 포함/빼기 버튼으로 진입 기준에서 긴MA를 넣거나 뺄 수 있음".to_string(),
         "· 진입 방식: 새 배열만(배열이 새로 만들어진 봉에서만) 또는 배열 유지 중(배열이 유지되는 동안 언제든, 청산 후 1봉 대기)".to_string(),
         String::new(),
         "청산".to_string(),
@@ -1416,7 +1602,7 @@ fn tradfi_rules_text(cfg: &Value) -> String {
         } else {
             format!("· 종가가 {exit_ma}MA 반대편으로 마감하면 청산 (청산 MA는 {EXIT_MA_MIN}~{EXIT_MA_MAX} 중 자유 지정: ✏️ 직접 입력 또는 /tfexit 45, '없음'이면 반대 배열에 청산)")
         },
-        "· ⏭ 다음 봉부터 변경: 시간봉·청산MA·120MA 포함 여부를 예약하면 지금 봉 마감 뒤 바뀌고, 보유 포지션은 새 시간봉의 다음 마감부터 새 기준으로 관리".to_string(),
+        "· ⏭ 다음 봉부터 변경: 시간봉·진입MA·청산MA·긴MA 포함 여부를 예약하면 지금 봉 마감 뒤 바뀌고, 보유 포지션은 새 시간봉의 다음 마감부터 새 기준으로 관리".to_string(),
         format!("· 수익잠금: {} (켜면 증거금 수익이 단계에 닿을 때마다 그 아래에 거래소 손절을 올림)", lock_text(cfg)),
         String::new(),
         "고정 설정".to_string(),
@@ -1888,7 +2074,7 @@ mod tests {
         let fake = Fake::new();
         let b = bot(&fake);
         let (text, kb) = b.handle_tradfi_action("slow:off").await;
-        assert!(text.contains("120MA 제외"), "{text}");
+        assert!(text.contains("120 제외"), "{text}");
         assert_eq!(fake.sets(), vec![json!({"align_slow_enabled": false})]);
         assert!(callbacks(&kb)
             .iter()
@@ -1913,7 +2099,7 @@ mod tests {
         b.handle_tradfi_action("nx:exit:120").await;
         let (text, kb) = b.handle_tradfi_action("nx:exit:none").await;
         assert!(
-            text.contains("바꿀 값: 4시간봉 · 청산MA 없음 · 120MA 포함"),
+            text.contains("바꿀 값: 4시간봉 · MA 1·5·120 · 청산MA 없음"),
             "{text}"
         );
         assert!(callbacks(&kb)
@@ -1945,6 +2131,69 @@ mod tests {
             fake.config.lock().unwrap()[config_tradfi::NEXT_SWITCH_KEY],
             Value::Null
         );
+    }
+
+    #[tokio::test]
+    async fn entry_ma_periods_are_typed() {
+        let fake = Fake::new();
+        let b = bot(&fake);
+        let (text, kb) = b.handle_tradfi_action("ma").await;
+        assert!(text.starts_with(MA_PROMPT_HEAD), "{text}");
+        assert!(callbacks(&kb)
+            .iter()
+            .any(|(t, d)| t.contains("MA 1·5·120") && d == "tf:ma"));
+        let (text, _) = b.tf_ma_from_text("5 5").await;
+        assert!(text.starts_with("❌"), "{text}");
+        let (text, _) = b.tf_ma_from_text("1 120 120").await;
+        assert!(text.starts_with("❌"), "{text}");
+        let (text, kb) = b.tf_ma_from_text("2 20 200").await;
+        assert!(text.contains("MA 2·20·200"), "{text}");
+        assert!(callbacks(&kb)
+            .iter()
+            .any(|(t, d)| t.contains("200MA 포함") && d == "tf:slow:on"));
+        // two numbers keep the long MA
+        b.tf_ma_from_text("1/10").await;
+        assert_eq!(
+            fake.sets(),
+            vec![
+                json!({"ma_fast_period": 2, "ma_slow_period": 20, "ma_long_period": 200}),
+                json!({"ma_fast_period": 1, "ma_slow_period": 10, "ma_long_period": 200}),
+            ]
+        );
+        // with the long MA excluded, slow may reach it
+        fake.config.lock().unwrap()["align_slow_enabled"] = json!(false);
+        let (text, _) = b.tf_ma_from_text("1 200").await;
+        assert!(text.contains("MA 1·200 (200 제외)"), "{text}");
+        // ...but it cannot be switched back on until slow < long
+        let (text, _) = b.handle_tradfi_action("slow:on").await;
+        assert!(text.starts_with("❌"), "{text}");
+        // locked while holding
+        *fake.trade.lock().unwrap() = json!({"side": "LONG", "entry_price": 1.0, "quantity": 1.0});
+        let (text, _) = b.tf_ma_from_text("1 5 120").await;
+        assert!(text.contains("포지션 보유 중"), "{text}");
+        let (text, _) = b.handle_tradfi_action("ma").await;
+        assert!(text.contains("포지션 보유 중"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn next_bar_switch_can_change_entry_ma() {
+        let fake = Fake::new();
+        *fake.trade.lock().unwrap() = json!({"side": "LONG", "entry_price": 1.0, "quantity": 1.0});
+        fake.config.lock().unwrap()["timeframe"] = json!("30m");
+        let b = bot(&fake);
+        let (text, _) = b.handle_tradfi_action("nx:ma").await;
+        assert!(text.starts_with(NEXT_MA_PROMPT_HEAD), "{text}");
+        let (text, _) = b.tf_next_ma_from_text("1 120 200").await;
+        assert!(text.contains("바꿀 값: 30분봉 · MA 1·120·200"), "{text}");
+        b.handle_tradfi_action("nx:bar:4h").await;
+        let (text, _) = b.handle_tradfi_action("nx:save").await;
+        assert!(
+            text.starts_with("⏭ 예약했습니다: 30분봉 → 4시간봉 · MA 1·120·200"),
+            "{text}"
+        );
+        let sw = fake.config.lock().unwrap()[config_tradfi::NEXT_SWITCH_KEY].clone();
+        assert_eq!(sw["ma_slow_period"], json!(120));
+        assert_eq!(sw["ma_long_period"], json!(200));
     }
 
     #[tokio::test]

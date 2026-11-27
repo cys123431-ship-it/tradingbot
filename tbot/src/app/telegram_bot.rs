@@ -1163,6 +1163,17 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                     chat_id,
                     crate::app::telegram_tradfi::PENDING_EXIT_MA.to_string(),
                 );
+            } else if data == "tf:ma"
+                && text.starts_with(crate::app::telegram_tradfi::MA_PROMPT_HEAD)
+            {
+                pending.insert(chat_id, crate::app::telegram_tradfi::PENDING_MA.to_string());
+            } else if data == "tf:nx:ma"
+                && text.starts_with(crate::app::telegram_tradfi::NEXT_MA_PROMPT_HEAD)
+            {
+                pending.insert(
+                    chat_id,
+                    crate::app::telegram_tradfi::PENDING_NEXT_MA.to_string(),
+                );
             } else if data == "tf:nx:exit:custom"
                 && text.starts_with(crate::app::telegram_tradfi::NEXT_EXIT_PROMPT_HEAD)
             {
@@ -1209,6 +1220,12 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         if pending.as_deref() == Some(crate::app::telegram_tradfi::PENDING_NEXT_EXIT_MA) {
             return self.handle_pending_next_exit_ma(chat_id, text).await;
         }
+        if pending.as_deref() == Some(crate::app::telegram_tradfi::PENDING_MA)
+            || pending.as_deref() == Some(crate::app::telegram_tradfi::PENDING_NEXT_MA)
+        {
+            let next = pending.as_deref() == Some(crate::app::telegram_tradfi::PENDING_NEXT_MA);
+            return self.handle_pending_ma(chat_id, text, next).await;
+        }
         if command.is_empty() && !text.trim().is_empty() {
             return self.handle_plain_text(chat_id, text).await;
         }
@@ -1239,6 +1256,15 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 }]
             }
             "tfcoin" => self.handle_tfcoin(chat_id, &args).await,
+            "tfma" => {
+                if args.is_empty() {
+                    self.pending_input
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(chat_id, crate::app::telegram_tradfi::PENDING_MA.to_string());
+                }
+                self.handle_tfma(chat_id, &args).await
+            }
             "tfexit" => {
                 if args.is_empty() {
                     self.pending_input
@@ -1304,6 +1330,35 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
 
     /// Plain text answering the ✏️ exit-MA prompt. A valid number (or 취소)
     /// ends the prompt; anything else explains the range and keeps waiting.
+    /// "fast slow [long]" after the ✏️ MA button (`next` = next-bar screen).
+    async fn handle_pending_ma(&self, chat_id: i64, text: &str, next: bool) -> Vec<Outgoing> {
+        let trimmed = text.trim();
+        let cancel = matches!(trimmed, "취소" | "cancel" | "Cancel");
+        let (text, markup) = if cancel {
+            if next {
+                self.handle_tradfi_action("nx").await
+            } else {
+                self.tradfi_screen().await
+            }
+        } else if next {
+            self.tf_next_ma_from_text(trimmed).await
+        } else {
+            self.tf_ma_from_text(trimmed).await
+        };
+        // keep waiting only after a refused number set
+        if cancel || !text.starts_with("❌") {
+            self.pending_input
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&chat_id);
+        }
+        vec![Outgoing::Send {
+            chat_id,
+            text,
+            markup: Some(markup),
+        }]
+    }
+
     /// Text after the "✏️ 직접" button of the /tradfi next-bar screen.
     async fn handle_pending_next_exit_ma(&self, chat_id: i64, text: &str) -> Vec<Outgoing> {
         let trimmed = text.trim();
@@ -1408,9 +1463,10 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
              /btcma <패스트> <슬로우> — /btcmacross SMA 기간 변경 (예: /btcma 1 200)\n\
              /btcma exit <기간> — /btcmacross 청산 MA 변경, 끄기는 /btcma exit off (예: /btcma exit 69)\n\
              /btcmaperiod — SMA 기간 도움말\n\
-             /tradfi — TradFi 정배열 전략 메뉴 (금·원유·미국주식, SMA 1·5·120, 3분봉~1일봉 선택)
+             /tradfi — TradFi 정배열 전략 메뉴 (금·원유·미국주식, 기본 SMA 1·5·120, 3분봉~1일봉 선택)
              /tfcoin <종목> — /tradfi 종목 지정, TradFi·코인 모두 가능 (예: /tfcoin CL, /tfcoin BTC)
              /tfexit <기간> — /tradfi 청산 MA 지정, 2~120 자유 입력 (예: /tfexit 45)
+             /tfma <fast> <slow> [긴MA] — /tradfi 진입 MA 지정 (예: /tfma 1 5 120)
              /btcoptions — BTC 옵션 자동매매 메뉴 (바이낸스 유럽식 옵션, 매수 전용)\n\
              /options — 옵션 자동매매 메뉴 (멀티코인)\n\
              /exchange — 거래소/네트워크 전환 (바이낸스 테스트넷 · 메인넷, 구 /setup)\n\
