@@ -623,8 +623,10 @@ pub fn normalize_options_config(raw: &Value) -> Value {
 /// Rules added 2026-11-27 after the backtest (2021-03..2026-11: buying at
 /// 70-100% of the wallet went to zero in every scenario) and a literature
 /// review (BTC implied vol sits above realized vol, so long premium bleeds):
-/// - `risk_per_trade_pct` (default 2%): premium + fee of one entry, which is
-///   the most a long option can lose, is capped at this share of the wallet.
+/// - `risk_per_trade_pct` (default 5%, user choice 2026-11-27; backtest at 5%:
+///   monthly CAGR about +8%, MDD about 27%): premium + fee of one entry, which
+///   is the most a long option can lose, is capped at this share of the wallet.
+///   One 0.01 BTC contract (15-40 USDT) therefore needs roughly 300-800 USDT.
 /// - `max_iv_to_forecast` (default 1.0): buy only while mark IV is at or below
 ///   the HAR-style realized-vol forecast (cheap volatility).
 /// - `weekly_momentum_gate` (default on): CALL only after a positive 7-day
@@ -637,7 +639,7 @@ pub fn apply_risk_rules(cfg: &mut Value) {
     let Value::Object(m) = cfg else {
         return;
     };
-    let risk = clamp_float(m.get("risk_per_trade_pct"), 0.02, 0.002, 1.0);
+    let risk = clamp_float(m.get("risk_per_trade_pct"), 0.05, 0.002, 1.0);
     m.insert("risk_per_trade_pct".to_string(), json!(risk));
     let iv = clamp_float(m.get("max_iv_to_forecast"), 1.0, 0.5, 3.0);
     m.insert("max_iv_to_forecast".to_string(), json!(iv));
@@ -769,7 +771,7 @@ mod risk_rule_tests {
     fn defaults_and_clamps() {
         let mut cfg = normalize_options_config(&json!({"maker_first_enabled": false}));
         apply_risk_rules(&mut cfg);
-        assert_eq!(cfg["risk_per_trade_pct"], json!(0.02));
+        assert_eq!(cfg["risk_per_trade_pct"], json!(0.05));
         assert_eq!(cfg["max_iv_to_forecast"], json!(1.0));
         assert_eq!(cfg["weekly_momentum_gate"], json!(true));
         assert_eq!(cfg["maker_only"], json!(true));
