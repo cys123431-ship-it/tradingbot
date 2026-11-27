@@ -519,6 +519,11 @@ pub fn btc_options_rules_text(cfg: &Value) -> String {
         "• 예산: {}. 바이낸스 옵션 지갑에 있는 USDT만 씁니다(선물 지갑과 별개). 네이키드 매도는 하지 않습니다.\n",
         budget
     ));
+    out.push_str(&format!(
+        "• 위험 규칙(11-27 백테스트 반영): IV가 예측 실현변동성의 {:.0}% 이하일 때만 매수 · 1주 수익률 방향과 같은 쪽만 · 1회 최대손실(프리미엄+수수료) 옵션 지갑의 {:.1}% · 지정가(메이커)만, 안 체결되면 취소\n",
+        safe_number(cfg.get("max_iv_to_forecast")).max(0.0) * 100.0,
+        safe_number(cfg.get("risk_per_trade_pct")).max(0.0) * 100.0
+    ));
     out.push_str("• 만기 버튼: 주간은 회전이 빠르지만 시간가치 감소가 크고, 월간은 느리지만 감소가 완만합니다.\n");
     out.push_str("• OFF는 신규 진입만 멈춥니다. 보유 중인 옵션은 손절·익절 관리를 계속합니다.");
     out

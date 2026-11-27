@@ -526,7 +526,9 @@ impl<C: OptionsApi> OptionsService<C> {
     /// Python `config()`.
     pub fn config(&self) -> Value {
         let raw = (self.cfg_getter)();
-        normalize_options_config(&raw)
+        let mut cfg = normalize_options_config(&raw);
+        crate::strategy::options_config::apply_risk_rules(&mut cfg);
+        cfg
     }
 
     /// A clone of the current state map.
@@ -970,6 +972,18 @@ impl<C: OptionsApi> OptionsService<C> {
         };
         let mut result = st::choose_underlying_signal(&fast_use, &slow_use, cfg);
         if let Value::Object(map) = &mut result {
+            // Time-series momentum gate (2026-11-27): the 7-day return must
+            // agree with the option side.
+            let gate = py_truthy(cfg.get("weekly_momentum_gate").unwrap_or(&Value::Null));
+            let accepted = py_truthy(map.get("accepted").unwrap_or(&Value::Null));
+            if gate && accepted {
+                let closes: Vec<f64> = fast_use.iter().map(|c| c[4]).collect();
+                let direction = py_str_or_empty(map.get("direction"));
+                if !crate::strategy::options_config::weekly_momentum_ok(&direction, &closes) {
+                    map.insert("accepted".to_string(), json!(false));
+                    map.insert("reason".to_string(), json!("WEEKLY_MOMENTUM_OPPOSED"));
+                }
+            }
             map.insert("underlying".to_string(), json!(underlying));
             let direction = py_str_or_empty(map.get("direction"));
             let sig_ts = st::pyf(map.get("signal_bar_ts"), 0.0) as i64;
@@ -1131,6 +1145,18 @@ impl<C: OptionsApi> OptionsService<C> {
             let category = scan_category(&reason);
             return Ok((None, Some(category.to_string()), reason));
         }
+        // Cheap-volatility gate (2026-11-27): IV at or below the forecast.
+        if crate::strategy::options_config::iv_above_forecast(
+            cfg,
+            st::pyf(scored.get("mark_iv"), 0.0),
+            st::pyf(signal.get("forecast_volatility"), 0.0),
+        ) {
+            return Ok((
+                None,
+                Some("IV".to_string()),
+                "OPTION_IV_ABOVE_FORECAST".to_string(),
+            ));
+        }
         let ask = st::pyf(scored.get("ask"), 0.0);
         let tick = st::pyf(contract.get("tick_size"), 0.0);
         let limit_price = ask + (if tick > 0.0 { tick } else { 0.0 });
@@ -1157,7 +1183,11 @@ impl<C: OptionsApi> OptionsService<C> {
         let step_size_f = st::pyf(step_size.as_ref(), 0.0);
         let entry_fraction = st::pyf(cfg.get("entry_fraction"), 1.00)
             .min(st::pyf(scored.get("entry_fraction"), 1.00));
-        let cap = st::pyf(cfg.get("capital_limit_usdt"), 0.0);
+        let cap = crate::strategy::options_config::risk_capped_limit(
+            cfg,
+            bankroll,
+            st::pyf(cfg.get("capital_limit_usdt"), 0.0),
+        );
         let _ = unit_f;
         let plan = st::build_long_option_entry_plan(
             limit_price,
@@ -1197,6 +1227,11 @@ impl<C: OptionsApi> OptionsService<C> {
         }
         candidate.insert("signal".to_string(), signal.clone());
         candidate.insert("entry_plan".to_string(), plan);
+        if py_truthy(cfg.get("maker_only").unwrap_or(&Value::Null)) {
+            // Post-only entries: an unfilled maker order is cancelled, never
+            // chased with an IOC across the spread.
+            candidate.insert("ioc_eligible".to_string(), json!(false));
+        }
         Ok((
             Some(Value::Object(candidate)),
             None,
@@ -1821,7 +1856,11 @@ impl<C: OptionsApi> OptionsService<C> {
         let step_size_f = st::pyf(step_size.as_ref(), 0.0);
         let entry_fraction = st::pyf(cfg.get("entry_fraction"), 1.00)
             .min(st::pyf(selected.get("entry_fraction"), 1.00));
-        let cap = st::pyf(cfg.get("capital_limit_usdt"), 0.0);
+        let cap = crate::strategy::options_config::risk_capped_limit(
+            &cfg,
+            planning_bankroll,
+            st::pyf(cfg.get("capital_limit_usdt"), 0.0),
+        );
         let plan = st::build_long_option_entry_plan(
             limit_price,
             st::pyf(Some(&spot_price_raw), 0.0),

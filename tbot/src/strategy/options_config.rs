@@ -620,6 +620,80 @@ pub fn normalize_options_config(raw: &Value) -> Value {
     Value::Object(cfg_all)
 }
 
+/// Rules added 2026-11-27 after the backtest (2021-03..2026-11: buying at
+/// 70-100% of the wallet went to zero in every scenario) and a literature
+/// review (BTC implied vol sits above realized vol, so long premium bleeds):
+/// - `risk_per_trade_pct` (default 2%): premium + fee of one entry, which is
+///   the most a long option can lose, is capped at this share of the wallet.
+/// - `max_iv_to_forecast` (default 1.0): buy only while mark IV is at or below
+///   the HAR-style realized-vol forecast (cheap volatility).
+/// - `weekly_momentum_gate` (default on): CALL only after a positive 7-day
+///   return, PUT only after a negative one (time-series momentum).
+/// - `maker_only` (default on): post-only entries; never cross the spread.
+///
+/// Applied on top of `normalize_options_config`, whose output stays equal to
+/// the Python original (golden tests).
+pub fn apply_risk_rules(cfg: &mut Value) {
+    let Value::Object(m) = cfg else {
+        return;
+    };
+    let risk = clamp_float(m.get("risk_per_trade_pct"), 0.02, 0.002, 1.0);
+    m.insert("risk_per_trade_pct".to_string(), json!(risk));
+    let iv = clamp_float(m.get("max_iv_to_forecast"), 1.0, 0.5, 3.0);
+    m.insert("max_iv_to_forecast".to_string(), json!(iv));
+    let gate = as_bool_field(m.get("weekly_momentum_gate"), true);
+    m.insert("weekly_momentum_gate".to_string(), Value::Bool(gate));
+    let maker_only = as_bool_field(m.get("maker_only"), true);
+    m.insert("maker_only".to_string(), Value::Bool(maker_only));
+    if maker_only {
+        m.insert("maker_first_enabled".to_string(), Value::Bool(true));
+    }
+}
+
+/// Capital limit handed to the entry plan: the configured cap (0 = none)
+/// further limited to `risk_per_trade_pct` of the spendable bankroll.
+pub fn risk_capped_limit(cfg: &Value, bankroll: f64, cap: f64) -> f64 {
+    let risk = cfg
+        .get("risk_per_trade_pct")
+        .and_then(py_float)
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0);
+    let risk_cap = bankroll.max(0.0) * risk;
+    if cap > 0.0 {
+        cap.min(risk_cap)
+    } else {
+        risk_cap
+    }
+}
+
+/// True when the option is dearer than the realized-vol forecast allows.
+pub fn iv_above_forecast(cfg: &Value, mark_iv: f64, forecast_vol: f64) -> bool {
+    let limit = cfg
+        .get("max_iv_to_forecast")
+        .and_then(py_float)
+        .unwrap_or(f64::INFINITY);
+    forecast_vol > 0.0 && mark_iv > 0.0 && mark_iv / forecast_vol > limit
+}
+
+/// 7-day (168 closed 1h bars) return agrees with the option side.
+/// Too little history counts as not agreeing.
+pub fn weekly_momentum_ok(direction: &str, closes: &[f64]) -> bool {
+    if closes.len() < 169 {
+        return false;
+    }
+    let now = closes[closes.len() - 1];
+    let then = closes[closes.len() - 169];
+    if now <= 0.0 || then <= 0.0 {
+        return false;
+    }
+    let ret = now / then - 1.0;
+    match direction {
+        "CALL" => ret > 0.0,
+        "PUT" => ret < 0.0,
+        _ => false,
+    }
+}
+
 pub fn options_spend_limit(cfg: &Value, available_usdt: f64) -> f64 {
     let available = {
         let a = if available_usdt.is_finite() && available_usdt != 0.0 {
@@ -685,6 +759,50 @@ pub fn multi_underlying_restore_values() -> Map<String, Value> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod risk_rule_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_and_clamps() {
+        let mut cfg = normalize_options_config(&json!({"maker_first_enabled": false}));
+        apply_risk_rules(&mut cfg);
+        assert_eq!(cfg["risk_per_trade_pct"], json!(0.02));
+        assert_eq!(cfg["max_iv_to_forecast"], json!(1.0));
+        assert_eq!(cfg["weekly_momentum_gate"], json!(true));
+        assert_eq!(cfg["maker_only"], json!(true));
+        assert_eq!(cfg["maker_first_enabled"], json!(true));
+        let mut wild =
+            json!({"risk_per_trade_pct": 5, "max_iv_to_forecast": 0.1, "maker_only": false});
+        apply_risk_rules(&mut wild);
+        assert_eq!(wild["risk_per_trade_pct"], json!(1.0));
+        assert_eq!(wild["max_iv_to_forecast"], json!(0.5));
+        assert_eq!(wild["maker_only"], json!(false));
+    }
+
+    #[test]
+    fn risk_cap_limits_the_plan() {
+        let cfg = json!({"risk_per_trade_pct": 0.02});
+        assert!((risk_capped_limit(&cfg, 1000.0, 0.0) - 20.0).abs() < 1e-9);
+        assert!((risk_capped_limit(&cfg, 1000.0, 10.0) - 10.0).abs() < 1e-9);
+        assert_eq!(risk_capped_limit(&cfg, 0.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn iv_and_momentum_gates() {
+        let cfg = json!({"max_iv_to_forecast": 1.0});
+        assert!(iv_above_forecast(&cfg, 0.60, 0.50));
+        assert!(!iv_above_forecast(&cfg, 0.50, 0.50));
+        assert!(!iv_above_forecast(&cfg, 0.60, 0.0));
+        let up: Vec<f64> = (0..200).map(|i| 100.0 + i as f64).collect();
+        let down: Vec<f64> = up.iter().rev().cloned().collect();
+        assert!(weekly_momentum_ok("CALL", &up));
+        assert!(!weekly_momentum_ok("PUT", &up));
+        assert!(weekly_momentum_ok("PUT", &down));
+        assert!(!weekly_momentum_ok("CALL", &up[..100]));
+    }
 }
 
 #[cfg(test)]
