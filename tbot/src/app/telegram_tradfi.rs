@@ -699,21 +699,21 @@ pub fn tradfi_keyboard(cfg: &Value, confirm: Option<(&str, &str)>) -> Value {
         .map(|v| py_truthy(Some(v)))
         .unwrap_or(true);
     let risk_pct = cfg_int_of(cfg, "risk_per_trade_pct");
-    let mut risk_row: Vec<Value> = config_tradfi::RISK_CHOICES
+    rows.push(vec![
+        markup_button(mark(risk_on, "🛡 손실한도 켬"), "tf:risk:on"),
+        markup_button(mark(!risk_on, "손실한도 끔 (고정 크기)"), "tf:risk:off"),
+    ]);
+    let risk_row: Vec<Value> = config_tradfi::RISK_CHOICES
         .iter()
         .map(|p| {
+            let selected = risk_on
+                && (risk_pct == *p || (risk_pct == 0 && *p == config_tradfi::DEFAULT_RISK_PCT));
             markup_button(
-                mark(
-                    risk_on
-                        && (risk_pct == *p
-                            || (risk_pct == 0 && *p == config_tradfi::DEFAULT_RISK_PCT)),
-                    &format!("손실한도 {p}%"),
-                ),
+                mark(selected, &format!("1회 손실 {p}%")),
                 format!("tf:risk:{p}"),
             )
         })
         .collect();
-    risk_row.push(markup_button(mark(!risk_on, "고정 크기"), "tf:risk:off"));
     rows.push(risk_row);
     let plock = lock_on(cfg);
     rows.push(vec![
@@ -1415,9 +1415,20 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         }
         if let Some(rest) = action.strip_prefix("risk:") {
             let mut changes = Map::new();
+            let rest = if rest == "on" {
+                let p = cfg_int_of(&cfg, "risk_per_trade_pct");
+                if config_tradfi::RISK_CHOICES.contains(&p) {
+                    p.to_string()
+                } else {
+                    config_tradfi::DEFAULT_RISK_PCT.to_string()
+                }
+            } else {
+                rest.to_string()
+            };
+            let rest = rest.as_str();
             let head = if rest == "off" {
                 changes.insert("risk_sizing_enabled".to_string(), json!(false));
-                "📏 크기: 고정 (가용 잔고 50% × 5배)\n손절은 비상손절(증거금 -50%)만 걸립니다."
+                "🛡 손실한도: 끔 — 크기: 고정 (가용 잔고 50% × 5배)\n손절은 비상손절(증거금 -50%)만 걸립니다."
                     .to_string()
             } else {
                 let Ok(p) = rest.parse::<i64>() else {
@@ -1429,7 +1440,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 changes.insert("risk_sizing_enabled".to_string(), json!(true));
                 changes.insert("risk_per_trade_pct".to_string(), json!(p));
                 format!(
-                    "📏 1회 손실 한도: 자본의 {p}%\n진입 때 손절을 2×ATR 거리에 걸고, 그 손절에 맞으면 가용 잔고의 {p}%만 잃도록 크기를 정합니다 (최대 가용 50% × 5배). 계산한 크기가 거래소 최소 주문보다 작으면 진입하지 않습니다."
+                    "🛡 손실한도: 켬 — 1회 손실 자본의 {p}%\n진입 때 손절을 2×ATR 거리에 걸고, 그 손절에 맞으면 가용 잔고의 {p}%만 잃도록 크기를 정합니다 (최대 가용 50% × 5배). 계산한 크기가 거래소 최소 주문보다 작으면 진입하지 않습니다."
                 )
             };
             if let Err(e) = self
@@ -2328,21 +2339,31 @@ mod tests {
         let fake = Fake::new();
         let b = bot(&fake);
         let (text, kb) = b.handle_tradfi_action("risk:3").await;
-        assert!(text.starts_with("📏 1회 손실 한도: 자본의 3%"), "{text}");
+        assert!(
+            text.starts_with("🛡 손실한도: 켬 — 1회 손실 자본의 3%"),
+            "{text}"
+        );
         assert!(callbacks(&kb)
             .iter()
             .any(|(t, d)| t.starts_with("✅") && d == "tf:risk:3"));
         let (text, kb) = b.handle_tradfi_action("risk:off").await;
-        assert!(text.starts_with("📏 크기: 고정"), "{text}");
+        assert!(text.starts_with("🛡 손실한도: 끔"), "{text}");
         assert!(callbacks(&kb)
             .iter()
             .any(|(t, d)| t.starts_with("✅") && d == "tf:risk:off"));
+        // turning it back on keeps the chosen %
+        let (text, kb) = b.handle_tradfi_action("risk:on").await;
+        assert!(text.contains("자본의 3%"), "{text}");
+        assert!(callbacks(&kb)
+            .iter()
+            .any(|(t, d)| t.starts_with("✅") && d == "tf:risk:on"));
         b.handle_tradfi_action("risk:7").await;
         assert_eq!(
             fake.sets(),
             vec![
                 json!({"risk_sizing_enabled": true, "risk_per_trade_pct": 3}),
                 json!({"risk_sizing_enabled": false}),
+                json!({"risk_sizing_enabled": true, "risk_per_trade_pct": 3}),
             ]
         );
     }
