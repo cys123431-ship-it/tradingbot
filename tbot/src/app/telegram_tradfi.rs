@@ -114,12 +114,171 @@ fn exit_ma_of(cfg: &Value) -> i64 {
     }
 }
 
-#[cfg(test)]
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// "청산MA 없음" chosen: no exit line, the opposite alignment closes.
+fn exit_off(cfg: &Value) -> bool {
+    py_truthy(cfg_get(cfg, "exit_ma_off"))
+}
+
+/// Short exit-rule label: "30MA" or "청산MA 없음".
+fn exit_label(cfg: &Value) -> String {
+    if exit_off(cfg) {
+        "청산MA 없음".to_string()
+    } else {
+        format!("{}MA", exit_ma_of(cfg))
+    }
+}
+
+fn exit_rule_text(cfg: &Value) -> String {
+    if exit_off(cfg) {
+        "청산: 청산MA 없음 — 반대 배열이 새로 생기면 청산 (반대 진입 없음), 그 외엔 수익잠금·비상손절".to_string()
+    } else {
+        format!(
+            "청산: 종가가 {}MA 반대편으로 마감하면 청산",
+            exit_ma_of(cfg)
+        )
+    }
+}
+
+/// "11-27 18:30" in KST.
+fn kst_hm(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|t| {
+            t.with_timezone(&chrono::FixedOffset::east_opt(9 * 3600).unwrap())
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// Current settings in the switch shape.
+fn current_switch(cfg: &Value) -> Value {
+    json!({
+        "timeframe": timeframe_of(cfg),
+        "exit_ma_period": exit_ma_of(cfg),
+        "exit_ma_off": exit_off(cfg),
+        "align_slow_enabled": slow_on(cfg),
+    })
+}
+
+fn booked_switch(cfg: &Value) -> Option<Value> {
+    cfg_get(cfg, config_tradfi::NEXT_SWITCH_KEY)
+        .filter(|v| v.is_object())
+        .and_then(|v| config_tradfi::clean_switch(v, true))
+}
+
+fn draft_switch(cfg: &Value) -> Value {
+    cfg_get(cfg, config_tradfi::NEXT_DRAFT_KEY)
+        .and_then(|v| config_tradfi::clean_switch(v, false))
+        .unwrap_or_else(|| current_switch(cfg))
+}
+
+fn booked_line(sw: &Value) -> String {
+    let from = sw["from_timeframe"].as_str().unwrap_or("");
+    format!(
+        "⏭ 예약: {} {} 마감 뒤 → {}",
+        kst_hm(sw["apply_at_ms"].as_i64().unwrap_or(0)),
+        timeframe_label(from),
+        config_tradfi::switch_summary(sw, None)
+    )
+}
+
+pub const NEXT_EXIT_PROMPT_HEAD: &str = "✏️ 예약할 청산 MA 입력";
+/// `pending_input` marker: the next plain text is the booked exit MA period.
+pub const PENDING_NEXT_EXIT_MA: &str = "tf_next_exit_ma";
+
+fn next_screen_text(cfg: &Value, head: &str) -> String {
+    let now = current_switch(cfg);
+    let draft = draft_switch(cfg);
+    let tf = timeframe_of(cfg);
+    let close = config_tradfi::current_bar_close_ms(&tf, now_ms());
+    let mut lines = Vec::new();
+    if !head.is_empty() {
+        lines.push(head.to_string());
+    }
+    lines.push("⏭ 다음 봉부터 변경".to_string());
+    lines.push(format!(
+        "지금: {}",
+        config_tradfi::switch_summary(&now, None)
+    ));
+    lines.push(format!(
+        "바꿀 값: {}",
+        config_tradfi::switch_summary(&draft, None)
+    ));
+    lines.push(format!(
+        "✅ 예약하기를 누르면 지금 {} 봉이 마감되는 {} 뒤에 바뀝니다.",
+        timeframe_label(&tf),
+        kst_hm(close)
+    ));
+    lines.push(
+        "보유 포지션은 그대로 두고, 바뀐 뒤 새 시간봉의 다음 마감부터 새 기준으로 판단합니다 (이미 마감된 봉으로 바로 청산하지 않음). 수익잠금·비상손절은 그대로."
+            .to_string(),
+    );
+    if let Some(sw) = booked_switch(cfg) {
+        lines.push(booked_line(&sw));
+    }
+    lines.join("\n")
+}
+
+fn next_keyboard(cfg: &Value) -> Value {
+    let draft = draft_switch(cfg);
+    let d_tf = draft["timeframe"].as_str().unwrap_or("").to_string();
+    let d_exit = draft["exit_ma_period"].as_i64().unwrap_or(0);
+    let d_off = draft["exit_ma_off"].as_bool().unwrap_or(false);
+    let d_slow = draft["align_slow_enabled"].as_bool().unwrap_or(true);
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    for chunk in TIMEFRAMES.chunks(4) {
+        rows.push(
+            chunk
+                .iter()
+                .map(|tf| {
+                    markup_button(
+                        mark(d_tf == *tf, &timeframe_label(tf)),
+                        format!("tf:nx:bar:{tf}"),
+                    )
+                })
+                .collect(),
+        );
+    }
+    let mut exits: Vec<Value> = EXIT_MA_CHOICES
+        .iter()
+        .chain(std::iter::once(&EXIT_MA_MAX))
+        .map(|n| {
+            markup_button(
+                mark(!d_off && d_exit == *n, &format!("청산 {n}MA")),
+                format!("tf:nx:exit:{n}"),
+            )
+        })
+        .collect();
+    let custom = !d_off && !EXIT_MA_CHOICES.contains(&d_exit) && d_exit != EXIT_MA_MAX;
+    let custom_label = if custom {
+        format!("✏️ 직접 {d_exit}MA")
+    } else {
+        "✏️ 직접".to_string()
+    };
+    exits.push(markup_button(
+        mark(custom, &custom_label),
+        "tf:nx:exit:custom",
+    ));
+    rows.push(exits);
+    rows.push(vec![
+        markup_button(mark(d_off, "청산MA 없음"), "tf:nx:exit:none"),
+        markup_button(mark(d_slow, "120MA 포함"), "tf:nx:slow:on"),
+        markup_button(mark(!d_slow, "120MA 빼기"), "tf:nx:slow:off"),
+    ]);
+    let mut last = vec![markup_button("✅ 예약하기", "tf:nx:save")];
+    if booked_switch(cfg).is_some() {
+        last.push(markup_button("🗑 예약 취소", "tf:nx:cancel"));
+    }
+    last.push(markup_button("↩️ 돌아가기", "tf:status"));
+    rows.push(last);
+    json!({"inline_keyboard": rows})
 }
 
 fn guard_line() -> String {
@@ -259,7 +418,6 @@ pub fn tradfi_status_text(status: &Value) -> String {
     let has_credentials = py_truthy(status.get("has_credentials"));
     let coin = current_coin(&cfg);
     let entry = cfg_str(&cfg, "entry_mode", "cross");
-    let exit_ma = exit_ma_of(&cfg);
     let bar = timeframe_label(&timeframe_of(&cfg));
     let leverage = match cfg_int_of(&cfg, "leverage") {
         0 => 5,
@@ -285,7 +443,7 @@ pub fn tradfi_status_text(status: &Value) -> String {
         ),
         format!("종목: {coin} (TradFi·코인 모두 가능) · {bar} 마감 기준"),
         format!("진입: {} — {}", align_text(&cfg), entry_mode_label(entry)),
-        format!("청산: 종가가 {exit_ma}MA 반대편으로 마감하면 청산"),
+        exit_rule_text(&cfg),
         format!("수익잠금: {}", lock_text(&cfg)),
         guard_line(),
         format!(
@@ -293,6 +451,9 @@ pub fn tradfi_status_text(status: &Value) -> String {
             margin_pct
         ),
     ];
+    if let Some(sw) = booked_switch(&cfg) {
+        lines.push(booked_line(&sw));
+    }
     let trade = status.get("state").and_then(|s| s.get("trade"));
     if py_truthy(trade) {
         if let Some(t) = trade {
@@ -373,6 +534,7 @@ pub fn tradfi_keyboard(cfg: &Value, confirm: Option<(&str, &str)>) -> Value {
     let trading_mode = cfg_str(cfg, "trading_mode", "DRY_RUN");
     let entry_mode = cfg_str(cfg, "entry_mode", "cross");
     let exit_ma = exit_ma_of(cfg);
+    let no_exit = exit_off(cfg);
 
     let mut rows: Vec<Vec<Value>> = Vec::new();
     rows.push(vec![
@@ -402,18 +564,19 @@ pub fn tradfi_keyboard(cfg: &Value, confirm: Option<(&str, &str)>) -> Value {
         .iter()
         .map(|n| {
             markup_button(
-                mark(exit_ma == *n, &format!("청산 {n}MA")),
+                mark(!no_exit && exit_ma == *n, &format!("청산 {n}MA")),
                 format!("tf:exit:{n}"),
             )
         })
         .collect();
-    let custom = !EXIT_MA_CHOICES.contains(&exit_ma);
+    let custom = !no_exit && !EXIT_MA_CHOICES.contains(&exit_ma);
     let custom_label = if custom {
         format!("✏️ 직접 {exit_ma}MA")
     } else {
         "✏️ 직접 입력".to_string()
     };
     exit_buttons.push(markup_button(mark(custom, &custom_label), "tf:exit:custom"));
+    exit_buttons.push(markup_button(mark(no_exit, "없음"), "tf:exit:none"));
     rows.push(exit_buttons);
     let current_tf = timeframe_of(cfg);
     for chunk in TIMEFRAMES.chunks(4) {
@@ -434,7 +597,15 @@ pub fn tradfi_keyboard(cfg: &Value, confirm: Option<(&str, &str)>) -> Value {
         markup_button(mark(plock, "🔒 수익잠금 켬"), "tf:plock:on"),
         markup_button(mark(!plock, "수익잠금 끔"), "tf:plock:off"),
     ]);
-    rows.push(vec![markup_button("🤝 수동 포지션 맡기기", "tf:adopt")]);
+    let next_label = if booked_switch(cfg).is_some() {
+        "⏭ 다음 봉 변경 (예약됨)"
+    } else {
+        "⏭ 다음 봉부터 변경"
+    };
+    rows.push(vec![
+        markup_button(next_label, "tf:nx"),
+        markup_button("🤝 수동 포지션 맡기기", "tf:adopt"),
+    ]);
     rows.push(vec![
         markup_button("🪙 종목 변경", "tf:coin"),
         markup_button("📊 새로고침", "tf:status"),
@@ -618,7 +789,15 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         if holding(&fetch_status(self).await) {
             return (HOLDING_BLOCK.to_string(), tradfi_keyboard(&cfg, None));
         }
-        if let Err(e) = self.tf_set("exit_ma_period", json!(period)).await {
+        let mut changes = Map::new();
+        changes.insert("exit_ma_period".to_string(), json!(period));
+        if exit_off(&cfg) {
+            changes.insert("exit_ma_off".to_string(), json!(false));
+        }
+        if let Err(e) = self
+            .tf_call("config_set", json!({ "changes": changes }))
+            .await
+        {
             return (engine_error_text(&e), tradfi_keyboard(&cfg, None));
         }
         let status_text = self.tf_status_text().await;
@@ -657,6 +836,138 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         }]
     }
 
+    /// Store the menu draft of the next-bar switch.
+    async fn tf_save_draft(&self, draft: &Value) -> Result<Value, String> {
+        let mut changes = Map::new();
+        changes.insert(config_tradfi::NEXT_DRAFT_KEY.to_string(), draft.clone());
+        self.tf_call("config_set", json!({ "changes": changes }))
+            .await
+    }
+
+    async fn tf_next_screen(&self, head: &str) -> (String, Value) {
+        let cfg = fetch_config(self).await;
+        (next_screen_text(&cfg, head), next_keyboard(&cfg))
+    }
+
+    /// `tf:nx...` -- the "⏭ 다음 봉부터 변경" screen.
+    async fn tf_next_action(&self, cfg: &Value, action: &str) -> (String, Value) {
+        let rest = action
+            .strip_prefix("nx")
+            .unwrap_or("")
+            .trim_start_matches(':');
+        let mut draft = draft_switch(cfg);
+        let mut head = String::new();
+        match rest {
+            "" => {}
+            "cancel" => {
+                let mut changes = Map::new();
+                changes.insert(config_tradfi::NEXT_SWITCH_KEY.to_string(), Value::Null);
+                changes.insert(config_tradfi::NEXT_DRAFT_KEY.to_string(), Value::Null);
+                if let Err(e) = self
+                    .tf_call("config_set", json!({ "changes": changes }))
+                    .await
+                {
+                    return (engine_error_text(&e), next_keyboard(cfg));
+                }
+                let status_text = self.tf_status_text().await;
+                return (
+                    format!("🗑 다음 봉 변경 예약을 취소했습니다.\n\n{status_text}"),
+                    self.tf_keyboard().await,
+                );
+            }
+            "save" => {
+                if draft == current_switch(cfg) {
+                    return (
+                        next_screen_text(
+                            cfg,
+                            "ℹ️ 지금 설정과 같습니다. 바꿀 값을 고른 뒤 예약하세요.",
+                        ),
+                        next_keyboard(cfg),
+                    );
+                }
+                let from = timeframe_of(cfg);
+                let at = config_tradfi::current_bar_close_ms(&from, now_ms());
+                let mut booked = draft.clone();
+                booked["from_timeframe"] = json!(from);
+                booked["apply_at_ms"] = json!(at);
+                let mut changes = Map::new();
+                changes.insert(config_tradfi::NEXT_SWITCH_KEY.to_string(), booked.clone());
+                changes.insert(config_tradfi::NEXT_DRAFT_KEY.to_string(), Value::Null);
+                if let Err(e) = self
+                    .tf_call("config_set", json!({ "changes": changes }))
+                    .await
+                {
+                    return (engine_error_text(&e), next_keyboard(cfg));
+                }
+                let status_text = self.tf_status_text().await;
+                return (
+                    format!(
+                        "⏭ 예약했습니다: {}\n{} {} 마감 뒤 적용되고, 새 시간봉의 다음 마감부터 새 기준으로 판단합니다.\n\n{status_text}",
+                        config_tradfi::switch_summary(&booked, Some(&from)),
+                        kst_hm(at),
+                        timeframe_label(&from)
+                    ),
+                    self.tf_keyboard().await,
+                );
+            }
+            "exit:custom" => {
+                return (
+                    format!(
+                        "{NEXT_EXIT_PROMPT_HEAD}\n{EXIT_MA_MIN}~{EXIT_MA_MAX} 사이 숫자를 이 채팅에 보내세요. 예: 45 (그만두려면 취소)"
+                    ),
+                    next_keyboard(cfg),
+                );
+            }
+            "exit:none" => draft["exit_ma_off"] = json!(true),
+            "slow:on" => draft["align_slow_enabled"] = json!(true),
+            "slow:off" => draft["align_slow_enabled"] = json!(false),
+            other => {
+                if let Some(tf) = other.strip_prefix("bar:") {
+                    if TIMEFRAMES.contains(&tf) {
+                        draft["timeframe"] = json!(tf);
+                    }
+                } else if let Some(p) = other.strip_prefix("exit:") {
+                    match p.trim().parse::<i64>() {
+                        Ok(n) if exit_ma_allowed(n) => {
+                            draft["exit_ma_period"] = json!(n);
+                            draft["exit_ma_off"] = json!(false);
+                        }
+                        _ => head = exit_ma_range_error(p),
+                    }
+                }
+            }
+        }
+        if rest.is_empty()
+            || draft != draft_switch(cfg)
+            || cfg_get(cfg, config_tradfi::NEXT_DRAFT_KEY)
+                .map(|v| v.is_null())
+                .unwrap_or(true)
+        {
+            if let Err(e) = self.tf_save_draft(&draft).await {
+                return (engine_error_text(&e), next_keyboard(cfg));
+            }
+        }
+        self.tf_next_screen(&head).await
+    }
+
+    /// Exit MA typed after the "✏️ 직접" button of the next-bar screen.
+    pub async fn tf_next_exit_from_text(&self, text: &str) -> (String, Value) {
+        let cfg = fetch_config(self).await;
+        match parse_exit_ma(text) {
+            Some(n) => {
+                let mut draft = draft_switch(&cfg);
+                draft["exit_ma_period"] = json!(n);
+                draft["exit_ma_off"] = json!(false);
+                if let Err(e) = self.tf_save_draft(&draft).await {
+                    return (engine_error_text(&e), next_keyboard(&cfg));
+                }
+                self.tf_next_screen(&format!("✏️ 예약할 청산선: {n}MA"))
+                    .await
+            }
+            None => (exit_ma_range_error(text.trim()), next_keyboard(&cfg)),
+        }
+    }
+
     /// `/tradfi` command: (status text, keyboard)
     pub async fn tradfi_screen(&self) -> (String, Value) {
         let status = fetch_status(self).await;
@@ -685,9 +996,9 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             let mode = cfg_str(&cfg, "trading_mode", "DRY_RUN").to_string();
             let entry = entry_mode_label(cfg_str(&cfg, "entry_mode", "cross"));
             let bar = timeframe_label(&timeframe_of(&cfg));
-            let exit_ma = exit_ma_of(&cfg);
+            let exit_ma = exit_label(&cfg);
             let body = format!(
-                "⚠️ TradFi 정배열 전략을 켤까요?\n종목: {coin} · {bar} · 모드: {mode} · 진입: {entry} · 청산 {exit_ma}MA\n켜면 /btcmacross·/macross 신규 진입이 OFF 되고 옵션 신규 진입도 멈춥니다 (보유 포지션 관리는 계속).\n거래정지: 선물계좌 총자본(평가손익 포함)이 {min} USDT 미만이면 신규 진입을 하지 않습니다 (보유 포지션은 그대로 관리, {min} 이상이 되면 자동 재개).",
+                "⚠️ TradFi 정배열 전략을 켤까요?\n종목: {coin} · {bar} · 모드: {mode} · 진입: {entry} · 청산 {exit_ma}\n켜면 /btcmacross·/macross 신규 진입이 OFF 되고 옵션 신규 진입도 멈춥니다 (보유 포지션 관리는 계속).\n거래정지: 선물계좌 총자본(평가손익 포함)이 {min} USDT 미만이면 신규 진입을 하지 않습니다 (보유 포지션은 그대로 관리, {min} 이상이 되면 자동 재개).",
                 min = config_tradfi::MIN_EQUITY_USDT
             );
             return (
@@ -801,6 +1112,22 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 );
             }
             return (self.tf_status_text().await, self.tf_keyboard().await);
+        }
+        if action == "exit:none" {
+            if holding(&fetch_status(self).await) {
+                return (HOLDING_BLOCK.to_string(), tradfi_keyboard(&cfg, None));
+            }
+            if let Err(e) = self.tf_set("exit_ma_off", json!(true)).await {
+                return (engine_error_text(&e), tradfi_keyboard(&cfg, None));
+            }
+            let status_text = self.tf_status_text().await;
+            return (
+                format!("🚪 청산MA 없음: 반대 배열이 새로 생기면 청산합니다 (반대 진입 없음).\n\n{status_text}"),
+                self.tf_keyboard().await,
+            );
+        }
+        if action == "nx" || action.starts_with("nx:") {
+            return self.tf_next_action(&cfg, action).await;
         }
         if action == "exit:custom" {
             if holding(&fetch_status(self).await) {
@@ -924,17 +1251,27 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             } else {
                 String::new()
             };
+            let exit_rule = if exit_off(&cfg) {
+                format!(
+                    "{} 마감 때 반대 배열이 새로 생기면 청산 (청산MA 없음, 반대 진입 없음)",
+                    timeframe_label(&timeframe_of(&cfg))
+                )
+            } else {
+                format!(
+                    "{} 종가가 청산선 SMA{} 반대편으로 마감하면 청산 (반대 진입 없음)",
+                    timeframe_label(&timeframe_of(&cfg)),
+                    exit_ma_of(&cfg)
+                )
+            };
             let text = format!(
                 "🤝 이 포지션을 /tradfi에 맡길까요?\n{}\n\n\
                  맡기면 /tradfi 규칙대로 관리합니다:\n\
-                 · {} 종가가 청산선 SMA{} 반대편으로 마감하면 청산 (반대 진입 없음)\n\
+                 · {exit_rule}\n\
                  · 수익잠금: {}\n\
                  {stop_line}\
                  직접 걸어 둔 TP/SL 주문은 그대로 남습니다.\n\
                  청산 뒤 새 진입은 /tradfi 지정 종목({})으로 합니다.",
                 adopt_summary(&preview),
-                timeframe_label(&timeframe_of(&cfg)),
-                exit_ma_of(&cfg),
                 lock_text(&cfg),
                 current_coin(&cfg),
             );
@@ -1074,7 +1411,12 @@ fn tradfi_rules_text(cfg: &Value) -> String {
         "· 진입 방식: 새 배열만(배열이 새로 만들어진 봉에서만) 또는 배열 유지 중(배열이 유지되는 동안 언제든, 청산 후 1봉 대기)".to_string(),
         String::new(),
         "청산".to_string(),
-        format!("· 종가가 {exit_ma}MA 반대편으로 마감하면 청산 (청산 MA는 {EXIT_MA_MIN}~{EXIT_MA_MAX} 중 자유 지정: ✏️ 직접 입력 또는 /tfexit 45)"),
+        if exit_off(cfg) {
+            "· 청산MA 없음 선택 중: 반대 배열이 새로 생기면 청산 (반대 진입 없음)".to_string()
+        } else {
+            format!("· 종가가 {exit_ma}MA 반대편으로 마감하면 청산 (청산 MA는 {EXIT_MA_MIN}~{EXIT_MA_MAX} 중 자유 지정: ✏️ 직접 입력 또는 /tfexit 45, '없음'이면 반대 배열에 청산)")
+        },
+        "· ⏭ 다음 봉부터 변경: 시간봉·청산MA·120MA 포함 여부를 예약하면 지금 봉 마감 뒤 바뀌고, 보유 포지션은 새 시간봉의 다음 마감부터 새 기준으로 관리".to_string(),
         format!("· 수익잠금: {} (켜면 증거금 수익이 단계에 닿을 때마다 그 아래에 거래소 손절을 올림)", lock_text(cfg)),
         String::new(),
         "고정 설정".to_string(),
@@ -1377,6 +1719,7 @@ mod tests {
             "coin",
             "pick:CLUSDT",
             "bar:1d",
+            "exit:none",
         ] {
             let (text, _) = b.handle_tradfi_action(action).await;
             assert!(text.contains("포지션 보유 중"), "{action}: {text}");
@@ -1550,6 +1893,77 @@ mod tests {
         assert!(callbacks(&kb)
             .iter()
             .any(|(t, d)| t.starts_with("✅") && d == "tf:slow:off"));
+    }
+
+    #[tokio::test]
+    async fn next_bar_switch_is_drafted_then_booked() {
+        let fake = Fake::new();
+        *fake.trade.lock().unwrap() =
+            json!({"side": "LONG", "entry_price": 2650.5, "quantity": 0.1});
+        fake.config.lock().unwrap()["timeframe"] = json!("30m");
+        let b = bot(&fake);
+        let (text, kb) = b.handle_tradfi_action("nx").await;
+        assert!(text.contains("다음 봉부터 변경"), "{text}");
+        assert!(text.contains("30분봉"), "{text}");
+        assert!(callbacks(&kb).iter().any(|(_, d)| d == "tf:nx:exit:none"));
+        // unchanged draft cannot be booked
+        let (text, _) = b.handle_tradfi_action("nx:save").await;
+        assert!(text.contains("지금 설정과 같습니다"), "{text}");
+        b.handle_tradfi_action("nx:bar:4h").await;
+        b.handle_tradfi_action("nx:exit:120").await;
+        let (text, kb) = b.handle_tradfi_action("nx:exit:none").await;
+        assert!(
+            text.contains("바꿀 값: 4시간봉 · 청산MA 없음 · 120MA 포함"),
+            "{text}"
+        );
+        assert!(callbacks(&kb)
+            .iter()
+            .any(|(t, d)| t.starts_with("✅") && d == "tf:nx:exit:none"));
+        let (text, kb) = b.handle_tradfi_action("nx:save").await;
+        assert!(
+            text.starts_with("⏭ 예약했습니다: 30분봉 → 4시간봉"),
+            "{text}"
+        );
+        assert!(text.contains("⏭ 예약:"), "{text}");
+        assert!(callbacks(&kb)
+            .iter()
+            .any(|(t, d)| t.contains("예약됨") && d == "tf:nx"));
+        let cfg = fake.config.lock().unwrap().clone();
+        let sw = &cfg[config_tradfi::NEXT_SWITCH_KEY];
+        assert_eq!(sw["timeframe"], json!("4h"));
+        assert_eq!(sw["exit_ma_off"], json!(true));
+        assert_eq!(sw["from_timeframe"], json!("30m"));
+        let at = sw["apply_at_ms"].as_i64().unwrap();
+        assert_eq!(at % 1_800_000, 0);
+        assert!(at > now_ms() && at <= now_ms() + 1_800_000);
+        assert_eq!(cfg[config_tradfi::NEXT_DRAFT_KEY], Value::Null);
+        // the live settings are untouched until the engine applies it
+        assert_eq!(cfg["timeframe"], json!("30m"));
+        let (text, _) = b.handle_tradfi_action("nx:cancel").await;
+        assert!(text.starts_with("🗑"), "{text}");
+        assert_eq!(
+            fake.config.lock().unwrap()[config_tradfi::NEXT_SWITCH_KEY],
+            Value::Null
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_line_none_button() {
+        let fake = Fake::new();
+        let b = bot(&fake);
+        let (text, kb) = b.handle_tradfi_action("exit:none").await;
+        assert!(text.contains("청산MA 없음"), "{text}");
+        assert!(callbacks(&kb)
+            .iter()
+            .any(|(t, d)| t.starts_with("✅") && d == "tf:exit:none"));
+        b.handle_tradfi_action("exit:50").await;
+        assert_eq!(
+            fake.sets(),
+            vec![
+                json!({"exit_ma_off": true}),
+                json!({"exit_ma_period": 50, "exit_ma_off": false})
+            ]
+        );
     }
 
     #[test]

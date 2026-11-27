@@ -586,3 +586,60 @@ async fn tradfi_blocks_new_entries_below_18_usdt_equity() {
     let btc = build_variant(&h, "mainnet", Variant::BtcMa);
     assert!(btc.config().get("min_equity_usdt").is_none());
 }
+
+/// User rule 2026-11-27: a switch booked for the close of the current bar is
+/// applied by the cycle after that close; the newest already-closed bar of the
+/// new timeframe is marked judged, so the first decision is the next close.
+#[tokio::test]
+async fn booked_switch_applies_after_the_old_close() {
+    use tbot::strategy::config_tradfi as tf;
+    let root = temp_dir("tradfi_booked_switch");
+    let mut h = tradfi_only(&root, "mainnet", "XAU");
+    let m30 = 1_800_000i64;
+    let at = 1_000 * m30; // a 30m close
+    {
+        let mut cfg = h.cfg.lock().unwrap();
+        cfg["timeframe"] = json!("30m");
+        cfg["exit_ma_period"] = json!(30);
+        cfg[tf::NEXT_SWITCH_KEY] = json!({
+            "timeframe": "4h", "exit_ma_period": 120, "exit_ma_off": false,
+            "align_slow_enabled": true, "from_timeframe": "30m", "apply_at_ms": at,
+        });
+    }
+    let cfg_arc = h.cfg.clone();
+    let mut svc = build_variant(&h, "mainnet", Variant::TradFi);
+    let writer: Arc<
+        dyn Fn(&str, Map<String, Value>) -> BoxFut<Result<Value, String>> + Send + Sync,
+    > = Arc::new(move |_section: &str, changes: Map<String, Value>| {
+        let cfg_arc = cfg_arc.clone();
+        Box::pin(async move {
+            let mut cfg = cfg_arc.lock().unwrap();
+            for (k, v) in changes {
+                cfg[k.as_str()] = v;
+            }
+            Ok(cfg.clone())
+        })
+    });
+    svc.deps.config_file_writer = Some(writer);
+    h.service = svc;
+    let mode = h.service.mode(None);
+    // before the close: nothing happens
+    *h.clock_ms.lock().unwrap() = at - 1_000;
+    h.service.run_cycle().await.unwrap();
+    assert_eq!(h.service.config()["timeframe"], json!("30m"));
+    // after the close, the old bar judged -> applied
+    let mut state = h.service.load_state("mainnet", &mode).unwrap();
+    state.insert("last_evaluated_bar".to_string(), json!(at - m30));
+    h.service.save_state("mainnet", &mode, &mut state).unwrap();
+    *h.clock_ms.lock().unwrap() = at + 5_000;
+    h.service.run_cycle().await.unwrap();
+    let cfg = h.service.config();
+    assert_eq!(cfg["timeframe"], json!("4h"));
+    assert_eq!(cfg["exit_ma_period"], json!(120));
+    assert_eq!(cfg[tf::NEXT_SWITCH_KEY], Value::Null);
+    let state = h.service.load_state("mainnet", &mode).unwrap();
+    assert_eq!(
+        state["last_evaluated_bar"],
+        json!(tf::bar_before_switch("4h", at))
+    );
+}

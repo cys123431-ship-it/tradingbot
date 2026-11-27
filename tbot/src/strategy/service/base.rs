@@ -707,10 +707,10 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         let mut state = self.load_state(&network, &mode)?;
         // Python wraps everything below in one try/except: any failure becomes
         // an "error" result recorded in state and the ledger.
-        match self
+        let result = self
             .run_cycle_inner(&network, &cfg, &mode, &mut state)
-            .await
-        {
+            .await;
+        let out = match result {
             Ok(value) => Ok(value),
             Err(exc) => {
                 let msg = format!("{}: {}", exc.class, exc.message);
@@ -725,7 +725,18 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
                 ledger.lock().unwrap().event("ERROR", fields);
                 Ok(json!({"action": "error", "reason": msg}))
             }
+        };
+        // /tradfi booked switch: only after this cycle judged (and saved) the
+        // closed bar under the old settings.
+        if let Err(e) = self.apply_booked_switch(&network, &mode).await {
+            eprintln!(
+                "{} booked switch failed: {}: {}",
+                self.label(),
+                e.class,
+                e.message
+            );
         }
+        out
     }
 
     async fn run_cycle_inner(

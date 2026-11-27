@@ -1592,10 +1592,13 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         }
         let trade_side = trade.get("side").and_then(|v| v.as_str()).unwrap_or("");
         let sig_side = signal.get("side").and_then(|v| v.as_str()).unwrap_or("");
+        // /tradfi never reverse-enters: with its exit line off ("청산MA 없음")
+        // the opposite alignment still closes only.
         let exit_on = cfg
             .get("exit_ma_enabled")
             .map(value_truthy)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || self.variant == Variant::TradFi;
         if !sig_side.is_empty() && sig_side != trade_side {
             if exit_on {
                 // Custom exit ON: a cross exit closes only (CROSS_EXIT); the
@@ -3036,6 +3039,78 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             .to_string();
         forced.insert("entry_mode".to_string(), Value::String(entry_mode));
         Value::Object(forced)
+    }
+
+    /// /tradfi: apply the settings switch booked for the close of the bar
+    /// that was forming when it was booked (see `config_tradfi::NEXT_SWITCH_KEY`).
+    pub(crate) async fn apply_booked_switch(
+        &self,
+        network: &str,
+        mode: &str,
+    ) -> Result<(), ServiceError> {
+        use crate::strategy::config_tradfi as tf;
+        if self.variant != Variant::TradFi {
+            return Ok(());
+        }
+        let cfg = self.config();
+        let Some(sw) = cfg
+            .get(tf::NEXT_SWITCH_KEY)
+            .filter(|v| v.is_object())
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let mut state = self.load_state(network, mode)?;
+        let now = self.now_ms();
+        if !tf::switch_due(&sw, now, int_or_zero(state.get("last_evaluated_bar"))) {
+            return Ok(());
+        }
+        let Some(writer) = self.deps.config_file_writer.clone() else {
+            return Ok(());
+        };
+        writer(tf::CONFIG_KEY, tf::switch_changes(&sw))
+            .await
+            .map_err(|e| ServiceError::new("ConfigError", e))?;
+        let new_tf = sw
+            .get("timeframe")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let apply_at = int_or_zero(sw.get("apply_at_ms"));
+        state.insert(
+            "last_evaluated_bar".to_string(),
+            json!(tf::bar_before_switch(&new_tf, apply_at)),
+        );
+        let exit_off = sw.get("exit_ma_off").map(value_truthy).unwrap_or(false);
+        let exit_p = int_or_zero(sw.get("exit_ma_period"));
+        if let Some(trade) = state.get_mut("trade").and_then(|t| t.as_object_mut()) {
+            trade.insert("timeframe".to_string(), json!(new_tf));
+            trade.insert("exit_ma_enabled".to_string(), json!(!exit_off));
+            trade.insert("exit_ma_period".to_string(), json!(exit_p));
+        }
+        let holding = state.get("trade").map(value_truthy).unwrap_or(false);
+        self.save_state(network, mode, &mut state)?;
+        let mut fields = Map::new();
+        fields.insert("mode".to_string(), Value::String(mode.to_string()));
+        fields.insert("network".to_string(), Value::String(network.to_string()));
+        fields.insert("switch".to_string(), sw.clone());
+        self.ledger(network)?
+            .lock()
+            .unwrap()
+            .event("SCHEDULED_SWITCH", fields);
+        let old_tf = cfg.get("timeframe").and_then(|v| v.as_str()).unwrap_or("");
+        let text = format!(
+            "⏭ {} 예약 변경 적용: {}\n{}",
+            self.label(),
+            tf::switch_summary(&sw, Some(old_tf)),
+            if holding {
+                "보유 포지션은 그대로 두고, 새 시간봉의 다음 마감부터 새 기준으로 관리합니다."
+            } else {
+                "새 시간봉의 다음 마감부터 새 기준으로 판단합니다."
+            }
+        );
+        self.notify(text, None).await;
+        Ok(())
     }
 
     pub async fn run_pending_entry_mode_switch(

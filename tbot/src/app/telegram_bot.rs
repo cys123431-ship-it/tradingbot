@@ -1163,6 +1163,13 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                     chat_id,
                     crate::app::telegram_tradfi::PENDING_EXIT_MA.to_string(),
                 );
+            } else if data == "tf:nx:exit:custom"
+                && text.starts_with(crate::app::telegram_tradfi::NEXT_EXIT_PROMPT_HEAD)
+            {
+                pending.insert(
+                    chat_id,
+                    crate::app::telegram_tradfi::PENDING_NEXT_EXIT_MA.to_string(),
+                );
             } else {
                 pending.remove(&chat_id);
             }
@@ -1198,6 +1205,9 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         };
         if pending.as_deref() == Some(crate::app::telegram_tradfi::PENDING_EXIT_MA) {
             return self.handle_pending_exit_ma(chat_id, text).await;
+        }
+        if pending.as_deref() == Some(crate::app::telegram_tradfi::PENDING_NEXT_EXIT_MA) {
+            return self.handle_pending_next_exit_ma(chat_id, text).await;
         }
         if command.is_empty() && !text.trim().is_empty() {
             return self.handle_plain_text(chat_id, text).await;
@@ -1294,6 +1304,29 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
 
     /// Plain text answering the ✏️ exit-MA prompt. A valid number (or 취소)
     /// ends the prompt; anything else explains the range and keeps waiting.
+    /// Text after the "✏️ 직접" button of the /tradfi next-bar screen.
+    async fn handle_pending_next_exit_ma(&self, chat_id: i64, text: &str) -> Vec<Outgoing> {
+        let trimmed = text.trim();
+        let done = matches!(trimmed, "취소" | "cancel" | "Cancel")
+            || crate::app::telegram_tradfi::parse_exit_ma(trimmed).is_some();
+        if done {
+            self.pending_input
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&chat_id);
+        }
+        let (text, markup) = if matches!(trimmed, "취소" | "cancel" | "Cancel") {
+            self.handle_tradfi_action("nx").await
+        } else {
+            self.tf_next_exit_from_text(trimmed).await
+        };
+        vec![Outgoing::Send {
+            chat_id,
+            text,
+            markup: Some(markup),
+        }]
+    }
+
     async fn handle_pending_exit_ma(&self, chat_id: i64, text: &str) -> Vec<Outgoing> {
         let trimmed = text.trim();
         let clear = |bot: &Self| {

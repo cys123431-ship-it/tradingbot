@@ -58,6 +58,154 @@ pub const EMERGENCY_STOP_ROI: i64 = 50;
 /// An open position is still managed and closed as usual, the strategy stays
 /// ON, and entries resume by themselves once equity is back at or above it.
 pub const MIN_EQUITY_USDT: i64 = 18;
+/// Settings switch booked for the close of the current bar (user rule
+/// 2026-11-27): {timeframe, exit_ma_period, exit_ma_off, align_slow_enabled,
+/// from_timeframe, apply_at_ms}. The engine applies it once that bar closed
+/// and was judged under the old settings; the first decision under the new
+/// settings is the first new-timeframe close after the switch (a bar that was
+/// already closed at the switch is never acted on).
+pub const NEXT_SWITCH_KEY: &str = "next_switch";
+/// Menu draft of a switch, not booked yet (same fields without the timing).
+pub const NEXT_DRAFT_KEY: &str = "next_switch_draft";
+/// Apply a booked switch anyway this long after its close when the old bar
+/// was never evaluated (strategy off and flat, market data down...).
+pub const SWITCH_GRACE_MS: i64 = 120_000;
+
+fn bool_of(v: Option<&Value>, default: bool) -> bool {
+    match v {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => match s.trim().to_lowercase().as_str() {
+            "true" | "1" | "on" => true,
+            "false" | "0" | "off" => false,
+            _ => default,
+        },
+        Some(Value::Number(n)) => n.as_f64().map(|f| f != 0.0).unwrap_or(default),
+        _ => default,
+    }
+}
+
+fn i64_of(v: Option<&Value>) -> Option<i64> {
+    v.and_then(|v| {
+        v.as_i64()
+            .or_else(|| v.as_f64().map(|f| f as i64))
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+    })
+}
+
+fn span_ms(tf: &str) -> i64 {
+    crate::core::candles::timeframe_ms(tf).unwrap_or(0)
+}
+
+/// Close time of the `tf` bar that is forming at `now_ms`.
+pub fn current_bar_close_ms(tf: &str, now_ms: i64) -> i64 {
+    let span = span_ms(tf);
+    if span <= 0 {
+        return now_ms;
+    }
+    (now_ms.div_euclid(span) + 1) * span
+}
+
+/// Cleaned switch (or draft when `booked` is false); None when unusable.
+pub fn clean_switch(v: &Value, booked: bool) -> Option<Value> {
+    let m = v.as_object()?;
+    let tf = m.get("timeframe")?.as_str()?.trim().to_lowercase();
+    if !TIMEFRAMES.contains(&tf.as_str()) {
+        return None;
+    }
+    let exit = i64_of(m.get("exit_ma_period")).filter(|p| exit_ma_allowed(*p))?;
+    let mut out = json!({
+        "timeframe": tf,
+        "exit_ma_period": exit,
+        "exit_ma_off": bool_of(m.get("exit_ma_off"), false),
+        "align_slow_enabled": bool_of(m.get("align_slow_enabled"), true),
+    });
+    if booked {
+        let from = m.get("from_timeframe")?.as_str()?.trim().to_lowercase();
+        let at = i64_of(m.get("apply_at_ms")).filter(|t| *t > 0)?;
+        if !TIMEFRAMES.contains(&from.as_str()) {
+            return None;
+        }
+        out["from_timeframe"] = json!(from);
+        out["apply_at_ms"] = json!(at);
+    }
+    Some(out)
+}
+
+/// True once a booked switch may be applied: its close has passed and the bar
+/// ending there was evaluated under the old settings (or the grace ran out).
+pub fn switch_due(sw: &Value, now_ms: i64, last_evaluated_bar: i64) -> bool {
+    let at = i64_of(sw.get("apply_at_ms")).unwrap_or(0);
+    if at <= 0 || now_ms < at {
+        return false;
+    }
+    let from = span_ms(
+        sw.get("from_timeframe")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+    );
+    let judged = from > 0 && last_evaluated_bar >= at - from;
+    judged || now_ms >= at + SWITCH_GRACE_MS
+}
+
+/// Open time of the newest `tf` bar closed at or before `apply_at_ms`. Marking
+/// it evaluated makes the first decision under the new settings the first
+/// close after the switch (no catch-up on a bar that was already closed).
+pub fn bar_before_switch(tf: &str, apply_at_ms: i64) -> i64 {
+    let span = span_ms(tf);
+    if span <= 0 {
+        return 0;
+    }
+    apply_at_ms.div_euclid(span) * span - span
+}
+
+/// "3m" -> "3분봉" ... "1d" -> "1일봉".
+pub fn timeframe_label(tf: &str) -> String {
+    let (num, unit) = tf.split_at(tf.len().saturating_sub(1));
+    match unit {
+        "m" => format!("{num}분봉"),
+        "h" => format!("{num}시간봉"),
+        "d" => format!("{num}일봉"),
+        _ => tf.to_string(),
+    }
+}
+
+/// "4시간봉 · 청산 120MA · 120MA 포함" (with "30분봉 → " when `from` is given).
+pub fn switch_summary(sw: &Value, from: Option<&str>) -> String {
+    let tf = sw.get("timeframe").and_then(|v| v.as_str()).unwrap_or("");
+    let exit = if bool_of(sw.get("exit_ma_off"), false) {
+        "청산MA 없음".to_string()
+    } else {
+        format!("청산 {}MA", i64_of(sw.get("exit_ma_period")).unwrap_or(0))
+    };
+    let slow = if bool_of(sw.get("align_slow_enabled"), true) {
+        "120MA 포함"
+    } else {
+        "120MA 빼기"
+    };
+    let head = match from.filter(|f| !f.is_empty()) {
+        Some(f) => format!("{} → ", timeframe_label(f)),
+        None => String::new(),
+    };
+    format!("{head}{} · {exit} · {slow}", timeframe_label(tf))
+}
+
+/// Config changes that apply a booked switch (and clear it).
+pub fn switch_changes(sw: &Value) -> Map<String, Value> {
+    let mut changes = Map::new();
+    for key in [
+        "timeframe",
+        "exit_ma_period",
+        "exit_ma_off",
+        "align_slow_enabled",
+    ] {
+        if let Some(v) = sw.get(key) {
+            changes.insert(key.to_string(), v.clone());
+        }
+    }
+    changes.insert(NEXT_SWITCH_KEY.to_string(), Value::Null);
+    changes
+}
+
 /// Keys of the retired -50% halt, dropped from stored configs.
 const RETIRED_KEYS: &[&str] = &["drawdown_base_equity", "drawdown_halt_until_ms"];
 
@@ -67,6 +215,7 @@ pub fn default_tradfi_config() -> Value {
         apply_fixed(
             map,
             DEFAULT_EXIT_MA,
+            true,
             "cross",
             DEFAULT_SYMBOL,
             DEFAULT_TIMEFRAME,
@@ -117,6 +266,19 @@ pub fn normalize_tradfi_config(raw: Option<&Value>) -> Value {
         Some(Value::Number(n)) => n.as_f64().unwrap_or(1.0) != 0.0,
         _ => true,
     };
+    // "청산MA 없음": no exit line; a position closes on the opposite
+    // alignment (close only), the profit lock or the emergency stop.
+    let exit_off = bool_of(supplied.get("exit_ma_off"), false);
+    let switches: Vec<(&str, Value)> = [(NEXT_SWITCH_KEY, true), (NEXT_DRAFT_KEY, false)]
+        .into_iter()
+        .map(|(key, booked)| {
+            let v = supplied
+                .get(key)
+                .and_then(|v| clean_switch(v, booked))
+                .unwrap_or(Value::Null);
+            (key, v)
+        })
+        .collect();
     let profit_lock = match supplied.get("profit_lock_enabled") {
         Some(Value::Bool(b)) => *b,
         Some(Value::String(s)) => matches!(s.trim().to_lowercase().as_str(), "true" | "1" | "on"),
@@ -128,9 +290,13 @@ pub fn normalize_tradfi_config(raw: Option<&Value>) -> Value {
         for key in RETIRED_KEYS {
             map.remove(*key);
         }
-        apply_fixed(map, exit_ma, &entry_mode, &symbol, &timeframe);
+        apply_fixed(map, exit_ma, !exit_off, &entry_mode, &symbol, &timeframe);
         map.insert("profit_lock_enabled".into(), Value::Bool(profit_lock));
         map.insert("align_slow_enabled".into(), Value::Bool(align_slow));
+        map.insert("exit_ma_off".into(), Value::Bool(exit_off));
+        for (key, v) in switches {
+            map.insert(key.into(), v);
+        }
     }
     cfg
 }
@@ -157,6 +323,7 @@ pub fn clean_symbol(text: &str) -> String {
 fn apply_fixed(
     map: &mut Map<String, Value>,
     exit_ma: i64,
+    exit_on: bool,
     entry_mode: &str,
     symbol: &str,
     timeframe: &str,
@@ -172,7 +339,7 @@ fn apply_fixed(
         "align_mid_period": MID_PERIOD,
         "slow_period": SLOW_PERIOD,
         "candle_history": 260,
-        "exit_ma_enabled": true,
+        "exit_ma_enabled": exit_on,
         "exit_ma_period": exit_ma,
         "entry_mode": entry_mode,
         "leverage": LEVERAGE,
@@ -280,6 +447,68 @@ mod tests {
         let off = normalize_tradfi_config(Some(&json!({"align_slow_enabled": false})));
         assert_eq!(off["align_slow_enabled"], json!(false));
         assert_eq!(off["slow_period"], json!(SLOW_PERIOD));
+    }
+
+    #[test]
+    fn exit_line_can_be_turned_off() {
+        let cfg = normalize_tradfi_config(None);
+        assert_eq!(cfg["exit_ma_enabled"], json!(true));
+        assert_eq!(cfg["exit_ma_off"], json!(false));
+        let off =
+            normalize_tradfi_config(Some(&json!({"exit_ma_off": true, "exit_ma_period": 50})));
+        assert_eq!(off["exit_ma_enabled"], json!(false));
+        assert_eq!(off["exit_ma_period"], json!(50));
+    }
+
+    #[test]
+    fn booked_switch_is_kept_and_cleaned() {
+        let sw = json!({
+            "timeframe": "4h", "exit_ma_period": 120, "exit_ma_off": false,
+            "align_slow_enabled": true, "from_timeframe": "30m", "apply_at_ms": 1_800_000,
+        });
+        let cfg = normalize_tradfi_config(Some(&json!({ NEXT_SWITCH_KEY: sw.clone() })));
+        assert_eq!(cfg[NEXT_SWITCH_KEY], sw);
+        assert_eq!(cfg[NEXT_DRAFT_KEY], Value::Null);
+        // a booked switch needs its timing; bad fields drop it
+        let bad = normalize_tradfi_config(Some(&json!({
+            NEXT_SWITCH_KEY: {"timeframe": "4h", "exit_ma_period": 30},
+            NEXT_DRAFT_KEY: {"timeframe": "7h", "exit_ma_period": 30},
+        })));
+        assert_eq!(bad[NEXT_SWITCH_KEY], Value::Null);
+        assert_eq!(bad[NEXT_DRAFT_KEY], Value::Null);
+        let draft = normalize_tradfi_config(Some(&json!({
+            NEXT_DRAFT_KEY: {"timeframe": "1H", "exit_ma_period": "45", "exit_ma_off": true},
+        })));
+        assert_eq!(
+            draft[NEXT_DRAFT_KEY],
+            json!({"timeframe": "1h", "exit_ma_period": 45, "exit_ma_off": true, "align_slow_enabled": true})
+        );
+    }
+
+    #[test]
+    fn switch_waits_for_the_old_close_then_skips_closed_new_bars() {
+        let m30 = 1_800_000i64;
+        let h4 = 14_400_000i64;
+        // booked at 10:10 on 30m bars -> applies at the 10:30 close
+        let at = current_bar_close_ms("30m", 20 * m30 + 600_000);
+        assert_eq!(at, 21 * m30);
+        let sw = json!({"timeframe": "4h", "exit_ma_period": 120, "from_timeframe": "30m", "apply_at_ms": at});
+        assert!(!switch_due(&sw, at - 1, 20 * m30));
+        // the 10:00-10:30 bar not judged yet -> wait
+        assert!(!switch_due(&sw, at + 5_000, 19 * m30));
+        // judged under the old settings -> apply
+        assert!(switch_due(&sw, at + 5_000, 20 * m30));
+        // never judged -> apply after the grace
+        assert!(switch_due(&sw, at + SWITCH_GRACE_MS, 19 * m30));
+        // 10:30 -> newest closed 4h bar opened 04:00 (closed 08:00): skipped
+        assert_eq!(bar_before_switch("4h", at), (at / h4) * h4 - h4);
+        // a 4h bar closing exactly at the switch is skipped too
+        assert_eq!(bar_before_switch("4h", 3 * h4), 2 * h4);
+        let changes = switch_changes(&sw);
+        assert_eq!(changes["timeframe"], json!("4h"));
+        assert_eq!(changes["exit_ma_period"], json!(120));
+        assert_eq!(changes[NEXT_SWITCH_KEY], Value::Null);
+        assert!(!changes.contains_key("from_timeframe"));
     }
 
     #[test]
