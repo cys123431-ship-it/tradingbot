@@ -106,6 +106,39 @@ fn risk_text(cfg: &Value) -> Option<String> {
     Some(format!("1회 손실 자본의 {pct}% (손절 2×ATR)"))
 }
 
+pub const EFF_BARS_PROMPT_HEAD: &str = "✏️ 효율 기간 직접 입력";
+/// `pending_input` marker: the next plain text is the efficiency window.
+pub const PENDING_EFF_BARS: &str = "tf_eff_bars";
+
+fn timeframe_span_text(tf: &str, bars: usize) -> String {
+    let h = crate::core::candles::timeframe_ms(tf).unwrap_or(0) as f64 * bars as f64 / 3_600_000.0;
+    if h >= 48.0 {
+        format!("{} 기준 약 {:.0}일", timeframe_label(tf), h / 24.0)
+    } else if h >= 1.0 {
+        format!("{} 기준 약 {:.1}시간", timeframe_label(tf), h)
+    } else {
+        format!("{} 기준 약 {:.0}분", timeframe_label(tf), h * 60.0)
+    }
+}
+
+fn eff_bars_prompt_text(cfg: &Value) -> String {
+    format!(
+        "{EFF_BARS_PROMPT_HEAD}\n지금: 최근 {}봉\n{}~{} 사이 숫자를 이 채팅에 보내세요. 예: 25 (그만두려면 취소)",
+        config_tradfi::efficiency_bars_of(cfg),
+        config_tradfi::EFF_BARS_MIN,
+        config_tradfi::EFF_BARS_MAX
+    )
+}
+
+fn eff_bars_range_error(text: &str) -> String {
+    let shown: String = text.chars().take(20).collect();
+    format!(
+        "❌ 효율 기간은 {}~{} 사이 정수로 입력하세요 (입력: {shown})",
+        config_tradfi::EFF_BARS_MIN,
+        config_tradfi::EFF_BARS_MAX
+    )
+}
+
 /// Screening result -> text (top SCAN_TOP by efficiency).
 fn scan_text(res: &Value) -> String {
     let tf = res["timeframe"].as_str().unwrap_or("");
@@ -581,7 +614,10 @@ pub fn tradfi_status_text(status: &Value) -> String {
         ),
         if auto_on(&cfg) {
             match config_tradfi::efficiency_threshold(&cfg) {
-                Some(th) => format!("종목: 🔎 자동 탐색 ({AUTO_UNIVERSE_TEXT}, 효율 {th} 이상만, 효율 높은 순) · {bar} 마감 기준"),
+                Some(th) => format!(
+                    "종목: 🔎 자동 탐색 ({AUTO_UNIVERSE_TEXT}, 최근 {}봉 효율 {th} 이상만, 효율 높은 순) · {bar} 마감 기준",
+                    config_tradfi::efficiency_bars_of(&cfg)
+                ),
                 None => format!("종목: 🔎 자동 탐색 ({AUTO_UNIVERSE_TEXT}, 여럿이면 돌파 폭 큰 종목) · {bar} 마감 기준"),
             }
         } else {
@@ -786,6 +822,29 @@ pub fn tradfi_keyboard(cfg: &Value, confirm: Option<(&str, &str)>) -> Value {
         ));
     }
     rows.push(eff_row);
+    let eff_bars = config_tradfi::efficiency_bars_of(cfg) as i64;
+    let mut bars_row: Vec<Value> = config_tradfi::EFF_BARS_CHOICES
+        .iter()
+        .map(|n| {
+            markup_button(
+                mark(eff_bars == *n, &format!("{n}봉")),
+                format!("tf:effbars:{n}"),
+            )
+        })
+        .collect();
+    let custom = !config_tradfi::EFF_BARS_CHOICES.contains(&eff_bars);
+    bars_row.push(markup_button(
+        mark(
+            custom,
+            &if custom {
+                format!("✏️ {eff_bars}봉")
+            } else {
+                "✏️ 직접".to_string()
+            },
+        ),
+        "tf:effbars:custom",
+    ));
+    rows.push(bars_row);
     rows.push(vec![
         markup_button(next_label, "tf:nx"),
         markup_button("🤝 수동 포지션 맡기기", "tf:adopt"),
@@ -1198,6 +1257,48 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         )
     }
 
+    /// Store the efficiency window (bars).
+    async fn tf_apply_eff_bars(&self, n: i64) -> (String, Value) {
+        let cfg = fetch_config(self).await;
+        if !config_tradfi::eff_bars_allowed(n) {
+            return (
+                eff_bars_range_error(&n.to_string()),
+                tradfi_keyboard(&cfg, None),
+            );
+        }
+        if let Err(e) = self.tf_set("efficiency_bars", json!(n)).await {
+            return (engine_error_text(&e), tradfi_keyboard(&cfg, None));
+        }
+        let span = timeframe_span_text(&timeframe_of(&cfg), n as usize);
+        let status_text = self.tf_status_text().await;
+        (
+            format!(
+                "📐 효율 기간: 최근 {n}봉 ({span})\n참고: 방향 없이 흔들리는 코인도 {n}봉이면 효율이 평균 약 {:.2} 나옵니다. 기준(0.3/0.4/0.5)은 이보다 충분히 높아야 걸러집니다.{}\n\n{status_text}",
+                1.0 / (n as f64).sqrt(),
+                if config_tradfi::efficiency_threshold(&cfg).is_none() {
+                    "\n(효율필터가 꺼져 있어 지금은 적용되지 않습니다.)"
+                } else {
+                    ""
+                }
+            ),
+            self.tf_keyboard().await,
+        )
+    }
+
+    /// Bars typed after the ✏️ 직접 button of the efficiency window.
+    pub async fn tf_eff_bars_from_text(&self, text: &str) -> (String, Value) {
+        match text.trim().parse::<i64>() {
+            Ok(n) => self.tf_apply_eff_bars(n).await,
+            Err(_) => {
+                let cfg = fetch_config(self).await;
+                (
+                    eff_bars_range_error(text.trim()),
+                    tradfi_keyboard(&cfg, None),
+                )
+            }
+        }
+    }
+
     /// Trend screening text (view only).
     pub async fn tf_scan_text(&self, timeframe: &str, bars: usize) -> String {
         let res = match self
@@ -1477,7 +1578,7 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             let head = if v > 0.0 {
                 format!(
                     "📐 자동 탐색 효율 필터: {v} 이상\n진입 조건을 맞춘 후보 중 최근 {}봉 동안 진입 방향으로 곧게 움직인 정도(효율)가 {v} 이상인 종목만 남기고, 효율이 높은 순으로 진입합니다.{}",
-                    config_tradfi::SCAN_DEFAULT_BARS,
+                    config_tradfi::efficiency_bars_of(&cfg),
                     if auto_on(&cfg) { "" } else { "\n(자동 탐색이 꺼져 있어 지금은 적용되지 않습니다. 🔎 자동 탐색을 켜면 적용됩니다.)" }
                 )
             } else {
@@ -1486,6 +1587,15 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
             };
             let status_text = self.tf_status_text().await;
             return (format!("{head}\n\n{status_text}"), self.tf_keyboard().await);
+        }
+        if action == "effbars:custom" {
+            return (eff_bars_prompt_text(&cfg), tradfi_keyboard(&cfg, None));
+        }
+        if let Some(rest) = action.strip_prefix("effbars:") {
+            if let Ok(n) = rest.trim().parse::<i64>() {
+                return self.tf_apply_eff_bars(n).await;
+            }
+            return (self.tf_status_text().await, self.tf_keyboard().await);
         }
         if action == "scan" {
             let tf = timeframe_of(&cfg);
@@ -2470,6 +2580,37 @@ mod tests {
         let sw = fake.config.lock().unwrap()[config_tradfi::NEXT_SWITCH_KEY].clone();
         assert_eq!(sw["ma_slow_period"], json!(120));
         assert_eq!(sw["ma_long_period"], json!(200));
+    }
+
+    #[tokio::test]
+    async fn efficiency_window_buttons_and_typing() {
+        let fake = Fake::new();
+        let b = bot(&fake);
+        let (text, kb) = b.handle_tradfi_action("effbars:20").await;
+        assert!(
+            text.starts_with("📐 효율 기간: 최근 20봉 (4시간봉 기준 약 3일)"),
+            "{text}"
+        );
+        assert!(text.contains("약 0.22"), "{text}");
+        assert!(callbacks(&kb)
+            .iter()
+            .any(|(t, d)| t.starts_with("✅") && d == "tf:effbars:20"));
+        let (text, _) = b.handle_tradfi_action("effbars:custom").await;
+        assert!(text.starts_with(EFF_BARS_PROMPT_HEAD), "{text}");
+        let (text, _) = b.tf_eff_bars_from_text("3").await;
+        assert!(text.starts_with("❌"), "{text}");
+        let (text, kb) = b.tf_eff_bars_from_text(" 25 ").await;
+        assert!(text.contains("최근 25봉"), "{text}");
+        assert!(callbacks(&kb)
+            .iter()
+            .any(|(t, d)| t.starts_with("✅ ✏️ 25봉") && d == "tf:effbars:custom"));
+        assert_eq!(
+            fake.sets(),
+            vec![
+                json!({"efficiency_bars": 20}),
+                json!({"efficiency_bars": 25})
+            ]
+        );
     }
 
     #[tokio::test]

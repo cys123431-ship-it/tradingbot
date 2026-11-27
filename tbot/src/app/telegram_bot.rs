@@ -1174,6 +1174,13 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                     chat_id,
                     crate::app::telegram_tradfi::PENDING_NEXT_MA.to_string(),
                 );
+            } else if data == "tf:effbars:custom"
+                && text.starts_with(crate::app::telegram_tradfi::EFF_BARS_PROMPT_HEAD)
+            {
+                pending.insert(
+                    chat_id,
+                    crate::app::telegram_tradfi::PENDING_EFF_BARS.to_string(),
+                );
             } else if data == "tf:nx:exit:custom"
                 && text.starts_with(crate::app::telegram_tradfi::NEXT_EXIT_PROMPT_HEAD)
             {
@@ -1216,6 +1223,26 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
         };
         if pending.as_deref() == Some(crate::app::telegram_tradfi::PENDING_EXIT_MA) {
             return self.handle_pending_exit_ma(chat_id, text).await;
+        }
+        if pending.as_deref() == Some(crate::app::telegram_tradfi::PENDING_EFF_BARS) {
+            let trimmed = text.trim();
+            let cancel = matches!(trimmed, "취소" | "cancel" | "Cancel");
+            let (text, markup) = if cancel {
+                self.tradfi_screen().await
+            } else {
+                self.tf_eff_bars_from_text(trimmed).await
+            };
+            if cancel || !text.starts_with("❌") {
+                self.pending_input
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&chat_id);
+            }
+            return vec![Outgoing::Send {
+                chat_id,
+                text,
+                markup: Some(markup),
+            }];
         }
         if pending.as_deref() == Some(crate::app::telegram_tradfi::PENDING_NEXT_EXIT_MA) {
             return self.handle_pending_next_exit_ma(chat_id, text).await;

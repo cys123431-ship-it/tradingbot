@@ -1136,7 +1136,12 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
                 obj.insert("atr".to_string(), json!(atr));
             }
             if let (Some(eff), Some(obj)) = (
-                crate::strategy::config_tradfi::signed_efficiency(&rows, self.now_ms(), span),
+                crate::strategy::config_tradfi::signed_efficiency(
+                    &rows,
+                    self.now_ms(),
+                    span,
+                    crate::strategy::config_tradfi::efficiency_bars_of(cfg),
+                ),
                 value.as_object_mut(),
             ) {
                 obj.insert("efficiency".to_string(), json!(eff));

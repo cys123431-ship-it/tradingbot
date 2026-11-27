@@ -363,7 +363,7 @@ pub const SCAN_TOP: usize = 10;
 /// Efficiency = |last - first| / sum |close-to-close moves| (Kaufman): 1 =
 /// a straight line, 0 = all noise.
 pub fn trend_metrics(closes: &[f64]) -> Option<(f64, f64, f64)> {
-    if closes.len() < 10 || closes.iter().any(|c| *c <= 0.0) {
+    if closes.len() < 6 || closes.iter().any(|c| *c <= 0.0) {
         return None;
     }
     let path: f64 = closes.windows(2).map(|w| (w[1] - w[0]).abs()).sum();
@@ -400,20 +400,36 @@ pub fn trend_metrics(closes: &[f64]) -> Option<(f64, f64, f64)> {
 /// direction (long: >= th, short: <= -th); survivors are taken most
 /// efficient first. 0 = off.
 pub const EFFICIENCY_CHOICES: &[f64] = &[0.3, 0.4, 0.5];
+/// Bars the efficiency is measured over (buttons + any 5..=250 typed).
+pub const EFF_BARS_CHOICES: &[i64] = &[10, 20, 30, 40, 50];
+pub const EFF_BARS_MIN: i64 = 5;
+/// candle_history is 260, so up to 250 closed bars are always available.
+pub const EFF_BARS_MAX: i64 = 250;
 
-/// Signed efficiency (net move / path; + up, - down) of the last
-/// SCAN_DEFAULT_BARS closed candles.
-pub fn signed_efficiency(rows: &[[f64; 6]], now_ms: i64, span_ms: i64) -> Option<f64> {
+pub fn eff_bars_allowed(n: i64) -> bool {
+    (EFF_BARS_MIN..=EFF_BARS_MAX).contains(&n)
+}
+
+/// Bars in use for the efficiency filter (default SCAN_DEFAULT_BARS).
+pub fn efficiency_bars_of(cfg: &Value) -> usize {
+    i64_of(cfg.get("efficiency_bars"))
+        .filter(|n| eff_bars_allowed(*n))
+        .map(|n| n as usize)
+        .unwrap_or(SCAN_DEFAULT_BARS)
+}
+
+/// Signed efficiency (net move / path; + up, - down) of the last `bars`
+/// closed candles.
+pub fn signed_efficiency(rows: &[[f64; 6]], now_ms: i64, span_ms: i64, bars: usize) -> Option<f64> {
     let closes: Vec<f64> = rows
         .iter()
         .filter(|r| span_ms <= 0 || r[0] as i64 + span_ms <= now_ms)
         .map(|r| r[4])
         .collect();
-    let closes = if closes.len() > SCAN_DEFAULT_BARS + 1 {
-        &closes[closes.len() - SCAN_DEFAULT_BARS - 1..]
-    } else {
-        &closes[..]
-    };
+    if closes.len() < bars + 1 {
+        return None;
+    }
+    let closes = &closes[closes.len() - bars - 1..];
     let (er, _, ret) = trend_metrics(closes)?;
     Some(if ret >= 0.0 { er } else { -er })
 }
@@ -508,6 +524,9 @@ pub fn normalize_tradfi_config(raw: Option<&Value>) -> Value {
     let exit_off = bool_of(supplied.get("exit_ma_off"), false);
     let auto_scan = bool_of(supplied.get("auto_scan"), false);
     let risk_on = bool_of(supplied.get("risk_sizing_enabled"), true);
+    let eff_bars = i64_of(supplied.get("efficiency_bars"))
+        .filter(|n| eff_bars_allowed(*n))
+        .unwrap_or(SCAN_DEFAULT_BARS as i64);
     let min_eff = supplied
         .get("auto_min_efficiency")
         .and_then(|v| {
@@ -556,6 +575,7 @@ pub fn normalize_tradfi_config(raw: Option<&Value>) -> Value {
         map.insert("auto_scan".into(), Value::Bool(auto_scan));
         map.insert("risk_sizing_enabled".into(), Value::Bool(risk_on));
         map.insert("auto_min_efficiency".into(), json!(min_eff));
+        map.insert("efficiency_bars".into(), json!(eff_bars));
         map.insert("risk_per_trade_pct".into(), json!(risk_pct));
         // the size is computed per trade: never raise it to the exchange minimum
         if risk_on {
@@ -810,8 +830,15 @@ mod tests {
         let up: Vec<[f64; 6]> = (0..150)
             .map(|i| [i as f64 * 10.0, 0.0, 0.0, 0.0, 100.0 + i as f64, 0.0])
             .collect();
-        let e = signed_efficiency(&up, 10_000, 10).unwrap();
+        let e = signed_efficiency(&up, 10_000, 10, 100).unwrap();
         assert!((e - 1.0).abs() < 1e-9, "{e}");
+        assert!(signed_efficiency(&up, 10_000, 10, 10).is_some());
+        assert!(signed_efficiency(&up[..8], 10_000, 10, 10).is_none());
+        assert_eq!(efficiency_bars_of(&normalize_tradfi_config(None)), 100);
+        let b = normalize_tradfi_config(Some(&json!({"efficiency_bars": 20})));
+        assert_eq!(efficiency_bars_of(&b), 20);
+        let bad = normalize_tradfi_config(Some(&json!({"efficiency_bars": 3})));
+        assert_eq!(efficiency_bars_of(&bad), 100);
     }
 
     #[test]
