@@ -267,6 +267,34 @@ pub fn switch_changes(sw: &Value) -> Map<String, Value> {
     changes
 }
 
+/// Auto coin search (user rule 2026-11-27): with `auto_scan` on, /tradfi
+/// ignores the pinned coin and scans every perpetual with at least this 24h
+/// quote volume -- crypto and TradFi equities/indices, never stablecoins,
+/// commodities (gold, silver, oil...), FX or pre-market contracts. One
+/// position at a time; several hits on one bar -> the widest breakout of the
+/// close beyond the slow MA. Toggling while a position is open only changes
+/// the next entry: the open position is managed and closed by its own rules.
+pub const AUTO_SCOPE: &str = "tradfi_auto";
+pub const AUTO_MIN_QUOTE_VOLUME: f64 = 100_000_000.0;
+const AUTO_STABLES: &[&str] = &[
+    "USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "USDE", "PYUSD", "USD1", "USDS", "RLUSD",
+    "EUR", "EURI", "XUSD", "BFUSD",
+];
+/// TradFi underlying types the auto search may trade.
+const AUTO_TRADFI_TYPES: &[&str] = &["EQUITY", "STOCK", "HK_EQUITY", "KR_EQUITY", "CN_EQUITY"];
+
+/// True when a USDT perpetual belongs to the auto-search universe.
+/// `tradfi` = Binance contractType TRADIFI_PERPETUAL; `underlying_type` is
+/// Binance's underlyingType (COIN for crypto, COMMODITY, EQUITY, INDEX...).
+pub fn auto_market_ok(tradfi: bool, underlying_type: &str, base: &str) -> bool {
+    let kind = underlying_type.trim().to_uppercase();
+    if tradfi {
+        return AUTO_TRADFI_TYPES.contains(&kind.as_str());
+    }
+    (kind.is_empty() || kind == "COIN")
+        && !AUTO_STABLES.contains(&base.trim().to_uppercase().as_str())
+}
+
 /// Keys of the retired -50% halt, dropped from stored configs.
 const RETIRED_KEYS: &[&str] = &["drawdown_base_equity", "drawdown_halt_until_ms"];
 
@@ -330,6 +358,7 @@ pub fn normalize_tradfi_config(raw: Option<&Value>) -> Value {
     // "청산MA 없음": no exit line; a position closes on the opposite
     // alignment (close only), the profit lock or the emergency stop.
     let exit_off = bool_of(supplied.get("exit_ma_off"), false);
+    let auto_scan = bool_of(supplied.get("auto_scan"), false);
     // Alignment periods; an inconsistent set falls back to 1/5/120.
     let (ma_f, ma_s, ma_l) = {
         let p = ma_periods_of(&Value::Object(supplied.clone()));
@@ -364,6 +393,11 @@ pub fn normalize_tradfi_config(raw: Option<&Value>) -> Value {
         map.insert("profit_lock_enabled".into(), Value::Bool(profit_lock));
         map.insert("align_slow_enabled".into(), Value::Bool(align_slow));
         map.insert("exit_ma_off".into(), Value::Bool(exit_off));
+        map.insert("auto_scan".into(), Value::Bool(auto_scan));
+        map.insert("auto_min_quote_volume".into(), json!(AUTO_MIN_QUOTE_VOLUME));
+        if auto_scan {
+            map.insert("scan_scope".into(), json!(AUTO_SCOPE));
+        }
         map.insert("fast_period".into(), json!(ma_f));
         map.insert("align_mid_period".into(), json!(ma_s));
         map.insert("slow_period".into(), json!(ma_l));
@@ -578,6 +612,26 @@ mod tests {
             false
         )
         .is_none());
+    }
+
+    #[test]
+    fn auto_scan_scope_and_universe_rules() {
+        let off = normalize_tradfi_config(None);
+        assert_eq!(off["auto_scan"], json!(false));
+        assert_eq!(off["scan_scope"], json!("single"));
+        let on = normalize_tradfi_config(Some(&json!({"auto_scan": true, "single_symbol": "XAU"})));
+        assert_eq!(on["scan_scope"], json!(AUTO_SCOPE));
+        assert_eq!(on["single_symbol"], json!("XAUUSDT"));
+        assert_eq!(on["auto_min_quote_volume"], json!(AUTO_MIN_QUOTE_VOLUME));
+        assert!(auto_market_ok(false, "COIN", "ETH"));
+        assert!(auto_market_ok(false, "", "DOGE"));
+        assert!(!auto_market_ok(false, "COIN", "USDC"));
+        assert!(!auto_market_ok(false, "INDEX", "BTCDOM"));
+        assert!(auto_market_ok(true, "EQUITY", "NVDA"));
+        assert!(auto_market_ok(true, "KR_EQUITY", "SAMSUNG"));
+        assert!(!auto_market_ok(true, "COMMODITY", "XAU"));
+        assert!(!auto_market_ok(true, "FX", "EUR"));
+        assert!(!auto_market_ok(true, "PREMARKET", "OPENAI"));
     }
 
     #[test]

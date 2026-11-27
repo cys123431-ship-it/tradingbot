@@ -643,3 +643,61 @@ async fn booked_switch_applies_after_the_old_close() {
         json!(tf::bar_before_switch("4h", at))
     );
 }
+
+/// User rule 2026-11-27: /tradfi auto search scans crypto + TradFi equities
+/// with >= 100M USDT 24h volume; stablecoins, commodities and index
+/// contracts are never candidates; TradFi only on mainnet.
+#[tokio::test]
+async fn auto_search_universe_filters_by_volume_and_kind() {
+    let root = temp_dir("tradfi_auto_universe");
+    let rows = trend_coins()["BTCUSDT"]["rows"].clone();
+    let mut coins = Map::new();
+    let coin = |vol: f64, tradfi: bool| {
+        let mut c = json!({"volume": vol, "rows": rows.clone(), "mark": 10.0});
+        if tradfi {
+            c["contract_type"] = json!("TRADIFI_PERPETUAL");
+        }
+        c
+    };
+    coins.insert("ETHUSDT".to_string(), coin(2.0e8, false));
+    coins.insert("DOGEUSDT".to_string(), coin(5.0e7, false)); // below the floor
+    coins.insert("USDCUSDT".to_string(), coin(4.0e8, false)); // stablecoin
+    coins.insert("BTCDOMUSDT".to_string(), coin(3.0e8, false)); // index
+    coins.insert("NVDAUSDT".to_string(), coin(1.5e8, true));
+    coins.insert("XAUUSDT".to_string(), coin(3.0e8, true)); // commodity
+    let cfg = vec![
+        ("scan_scope".to_string(), json!("single")),
+        ("single_symbol".to_string(), json!("XAUUSDT")),
+        ("auto_scan".to_string(), json!(true)),
+    ];
+    let mut h = ScopeHarness::new(&root, coins, true, cfg);
+    {
+        let mut markets = h.fake.markets.lock().unwrap();
+        markets["ETH/USDT:USDT"]["info"]["underlyingType"] = json!("COIN");
+        markets["BTCDOM/USDT:USDT"]["info"]["underlyingType"] = json!("INDEX");
+        markets["NVDA/USDT:USDT"]["info"]["underlyingType"] = json!("EQUITY");
+        markets["XAU/USDT:USDT"]["info"]["underlyingType"] = json!("COMMODITY");
+    }
+    h.service = build_variant(&h, "mainnet", Variant::TradFi);
+    let cfg = h.service.config();
+    assert_eq!(cfg["scan_scope"], json!("tradfi_auto"));
+    let ids: Vec<String> = h
+        .service
+        .scan_universe("mainnet", &cfg)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_, m, _)| m)
+        .collect();
+    assert_eq!(ids, vec!["ETHUSDT".to_string(), "NVDAUSDT".to_string()]);
+    // testnet: TradFi contracts drop out
+    let test = build_variant(&h, "testnet", Variant::TradFi);
+    let ids: Vec<String> = test
+        .scan_universe("testnet", &cfg)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_, m, _)| m)
+        .collect();
+    assert_eq!(ids, vec!["ETHUSDT".to_string()]);
+}

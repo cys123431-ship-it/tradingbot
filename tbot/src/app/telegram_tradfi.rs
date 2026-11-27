@@ -91,6 +91,12 @@ fn cfg_int_of(cfg: &Value, key: &str) -> i64 {
         .unwrap_or(0)
 }
 
+fn auto_on(cfg: &Value) -> bool {
+    py_truthy(cfg_get(cfg, "auto_scan"))
+}
+
+const AUTO_UNIVERSE_TEXT: &str = "24h 거래대금 100M USDT 이상 코인·주식, 스테이블·원자재 제외";
+
 fn current_coin(cfg: &Value) -> String {
     cfg_get(cfg, "single_symbol")
         .and_then(|v| v.as_str())
@@ -514,7 +520,11 @@ pub fn tradfi_status_text(status: &Value) -> String {
             "거래소: {network_label} · API 키: {}",
             if has_credentials { "있음" } else { "없음" }
         ),
-        format!("종목: {coin} (TradFi·코인 모두 가능) · {bar} 마감 기준"),
+        if auto_on(&cfg) {
+            format!("종목: 🔎 자동 탐색 ({AUTO_UNIVERSE_TEXT}, 여럿이면 돌파 폭 큰 종목) · {bar} 마감 기준")
+        } else {
+            format!("종목: {coin} (TradFi·코인 모두 가능) · {bar} 마감 기준")
+        },
         format!("진입: {} — {}", align_text(&cfg), entry_mode_label(entry)),
         exit_rule_text(&cfg),
         format!("수익잠금: {}", lock_text(&cfg)),
@@ -682,6 +692,18 @@ pub fn tradfi_keyboard(cfg: &Value, confirm: Option<(&str, &str)>) -> Value {
         markup_button("🤝 수동 포지션 맡기기", "tf:adopt"),
     ]);
     rows.push(vec![
+        markup_button(
+            if auto_on(cfg) {
+                "✅ 🔎 자동 탐색 (끄기)"
+            } else {
+                "🔎 자동 탐색 켜기"
+            },
+            if auto_on(cfg) {
+                "tf:auto:off"
+            } else {
+                "tf:auto:on"
+            },
+        ),
         markup_button("🪙 종목 변경", "tf:coin"),
         markup_button("📊 새로고침", "tf:status"),
     ]);
@@ -1353,6 +1375,32 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 self.tf_keyboard().await,
             );
         }
+        if action == "auto:on" || action == "auto:off" {
+            let on = action == "auto:on";
+            if let Err(e) = self.tf_set("auto_scan", json!(on)).await {
+                return (engine_error_text(&e), tradfi_keyboard(&cfg, None));
+            }
+            let status = fetch_status(self).await;
+            let tail = if holding(&status) {
+                "\n보유 중인 포지션은 강제로 청산하지 않고 지금 규칙대로 관리합니다. 그 포지션이 청산된 뒤 다음 진입부터 적용됩니다."
+            } else {
+                "\n다음 봉 마감부터 적용됩니다."
+            };
+            let head = if on {
+                format!(
+                    "🔎 자동 종목 탐색: 켬\n{AUTO_UNIVERSE_TEXT} 종목 중 {} 마감봉에 진입 조건(롱·숏)을 맞춘 종목에 진입합니다. 여럿이면 종가가 slow MA를 가장 크게 넘은 종목. 지정 종목({})은 무시합니다.{tail}",
+                    timeframe_label(&timeframe_of(&cfg)),
+                    current_coin(&cfg)
+                )
+            } else {
+                format!(
+                    "🔎 자동 종목 탐색: 끔\n다시 지정 종목 {}만 거래합니다.{tail}",
+                    current_coin(&cfg)
+                )
+            };
+            let status_text = self.tf_status_text().await;
+            return (format!("{head}\n\n{status_text}"), self.tf_keyboard().await);
+        }
         if action == "plock:on" || action == "plock:off" {
             let on = action == "plock:on";
             if let Err(e) = self.tf_set("profit_lock_enabled", json!(on)).await {
@@ -1582,6 +1630,7 @@ fn tradfi_rules_text(cfg: &Value) -> String {
     [
         "📘 /tradfi 규칙 (TradFi 정배열)".to_string(),
         format!("· 종목: {coin} · 바이낸스 TradFi 무기한(금·원유·미국주식 등)과 일반 코인 무기한 모두 가능 (/tfcoin BTC)"),
+        format!("· 🔎 자동 탐색: 켜면 지정 종목 대신 {AUTO_UNIVERSE_TEXT} 종목 전체에서 마감봉 진입 조건을 맞춘 종목에 진입 (한 번에 1개, 여럿이면 돌파 폭 큰 종목). 보유 중에 켜고 끄면 그 포지션이 청산된 뒤부터 적용"),
         "· 거래소: 바이낸스 메인넷 전용 (테스트넷·업비트 불가)".to_string(),
         format!("· 봉: {bar} 마감 기준 (메뉴에서 3분봉~1일봉 중 하나 선택)"),
         String::new(),
@@ -2194,6 +2243,24 @@ mod tests {
         let sw = fake.config.lock().unwrap()[config_tradfi::NEXT_SWITCH_KEY].clone();
         assert_eq!(sw["ma_slow_period"], json!(120));
         assert_eq!(sw["ma_long_period"], json!(200));
+    }
+
+    #[tokio::test]
+    async fn auto_scan_toggle() {
+        let fake = Fake::new();
+        let b = bot(&fake);
+        let (text, kb) = b.handle_tradfi_action("auto:on").await;
+        assert!(text.starts_with("🔎 자동 종목 탐색: 켬"), "{text}");
+        assert!(text.contains("다음 봉 마감부터"), "{text}");
+        assert!(text.contains("종목: 🔎 자동 탐색"), "{text}");
+        assert!(callbacks(&kb).iter().any(|(_, d)| d == "tf:auto:off"));
+        *fake.trade.lock().unwrap() = json!({"side": "LONG", "entry_price": 1.0, "quantity": 1.0});
+        let (text, _) = b.handle_tradfi_action("auto:off").await;
+        assert!(text.contains("청산된 뒤 다음 진입부터"), "{text}");
+        assert_eq!(
+            fake.sets(),
+            vec![json!({"auto_scan": true}), json!({"auto_scan": false})]
+        );
     }
 
     #[tokio::test]

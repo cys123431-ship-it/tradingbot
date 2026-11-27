@@ -249,6 +249,19 @@ fn dec_from_f64(f: f64) -> Result<Decimal, ServiceError> {
     py_dec(Some(&Value::String(crate::store::ledger::py_float_repr(f))))
 }
 
+/// |close / slow MA - 1| of an alignment signal (slow = the mid period, the
+/// "SMA5" slot); 0 when unknown.
+pub(crate) fn breakout_width(signal: &Value) -> f64 {
+    let close = as_f64(signal.get("close")).unwrap_or(0.0);
+    let line = as_f64(signal.get("sma_mid"))
+        .or_else(|| as_f64(signal.get("sma_slow")))
+        .unwrap_or(0.0);
+    if close <= 0.0 || line <= 0.0 {
+        return 0.0;
+    }
+    (close / line - 1.0).abs()
+}
+
 /// Python `list(await ...)`: universe tuple list used by rotation.
 type UniverseItem = (String, String, Option<f64>);
 
@@ -262,6 +275,9 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         let scope = cfg.get("scan_scope").and_then(|v| v.as_str()).unwrap_or("");
         if scope == TRADFI_SCOPE {
             return self.tradfi_universe(network, cfg).await;
+        }
+        if scope == crate::strategy::config_tradfi::AUTO_SCOPE && self.variant == Variant::TradFi {
+            return self.tradfi_auto_universe(network, cfg).await;
         }
         if scope == "single" && self.variant == Variant::TradFi {
             // /tradfi: any TradFi perpetual or a plain crypto perpetual.
@@ -496,6 +512,111 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             "ValueError",
             format!("SYMBOL_NOT_FOUND:{base}USDT"),
         ))
+    }
+
+    /// /tradfi auto search: every active USDT perpetual with at least
+    /// `auto_min_quote_volume` 24h quote volume that `auto_market_ok` allows
+    /// (crypto + TradFi equities; TradFi only on mainnet), by volume.
+    pub async fn tradfi_auto_universe(
+        &self,
+        network: &str,
+        cfg: &Value,
+    ) -> Result<Vec<(String, String, Option<f64>)>, ServiceError> {
+        use crate::strategy::config_tradfi as tf;
+        let min_volume =
+            as_f64(cfg.get("auto_min_quote_volume")).unwrap_or(tf::AUTO_MIN_QUOTE_VOLUME);
+        let cache_key = format!("{network}:{}", tf::AUTO_SCOPE);
+        if let Some(cached) = self.universe_cache.lock().unwrap().get(&cache_key).cloned() {
+            let ts = cached.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
+            if self.now_ms() - ts < UNIVERSE_TTL_MS {
+                if let Some(list) = cached.get(1) {
+                    return Ok(universe_from_value(list));
+                }
+            }
+        }
+        let exchange = self.exchange(network).await?;
+        let markets = match exchange.markets() {
+            Some(m) => m,
+            None => exchange.load_markets().await?,
+        };
+        let tickers = exchange.fetch_tickers().await?;
+        let tradfi_allowed = self.tradfi_network_allowed("tradfi", network);
+        let mut rows: Vec<(String, String, f64)> = Vec::new();
+        for (symbol, ticker) in tickers.iter() {
+            let Some(market) = markets.get(symbol).and_then(|v| v.as_object()) else {
+                continue;
+            };
+            let market_value = Value::Object(market.clone());
+            if !coinselect::market_is_usdt_perpetual(symbol, Some(&market_value)) {
+                continue;
+            }
+            if market.get("active").and_then(|v| v.as_bool()) == Some(false) {
+                continue;
+            }
+            let status = market
+                .get("info")
+                .and_then(|i| i.get("status"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("TRADING")
+                .to_uppercase();
+            if status != "TRADING" {
+                continue;
+            }
+            let tradfi = coinselect::market_is_tradifi_perpetual(symbol, Some(&market_value));
+            if tradfi && !tradfi_allowed {
+                continue;
+            }
+            let underlying = market
+                .get("info")
+                .and_then(|i| i.get("underlyingType"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let base = market.get("base").and_then(|v| v.as_str()).unwrap_or("");
+            if !tf::auto_market_ok(tradfi, underlying, base) {
+                continue;
+            }
+            let qv = ticker
+                .get("quoteVolume")
+                .filter(|v| !v.is_null())
+                .cloned()
+                .unwrap_or_else(|| {
+                    ticker
+                        .get("info")
+                        .and_then(|i| i.get("quoteVolume"))
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                });
+            let volume = py_f(Some(&qv), 0.0);
+            if volume < min_volume {
+                continue;
+            }
+            let market_id = market
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_uppercase())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| symbol.split(':').next().unwrap_or("").replace('/', ""));
+            rows.push((symbol.clone(), market_id, volume));
+        }
+        rows.sort_by(|a, b| {
+            b.2.partial_cmp(&a.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        let universe: Vec<(String, String, Option<f64>)> =
+            rows.into_iter().map(|(s, m, v)| (s, m, Some(v))).collect();
+        if universe.is_empty() {
+            return Err(ServiceError::new(
+                "ValueError",
+                "empty auto universe (no market above the volume floor)",
+            ));
+        }
+        let cached = json!([self.now_ms(), universe_to_value(&universe), Value::Null]);
+        self.universe_cache
+            .lock()
+            .unwrap()
+            .insert(cache_key, cached);
+        Ok(universe)
     }
 
     pub async fn volume_universe(
@@ -1843,7 +1964,9 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         }
         // Results keep the volume order; only the all-coins scope runs requests
         // in parallel (hundreds of coins), the others stay sequential.
-        let all_coins = cfg.get("scan_scope").and_then(|v| v.as_str()) == Some(ALL_SCOPE);
+        let scope = cfg.get("scan_scope").and_then(|v| v.as_str());
+        let all_coins =
+            scope == Some(ALL_SCOPE) || scope == Some(crate::strategy::config_tradfi::AUTO_SCOPE);
         let concurrency = if all_coins { ALL_SCAN_CONCURRENCY } else { 1 };
         let _ = SCAN_CONCURRENCY;
         use futures::stream::StreamExt as _;
@@ -2030,6 +2153,16 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         // On-time crosses first; one-bar-late crosses keep their volume order after.
         candidates
             .sort_by_key(|s| s.get("entry_type").and_then(|v| v.as_str()) == Some("CROSS_LATE"));
+        if cfg.get("scan_scope").and_then(|v| v.as_str())
+            == Some(crate::strategy::config_tradfi::AUTO_SCOPE)
+        {
+            // /tradfi auto search: widest breakout of the close beyond the slow MA first.
+            candidates.sort_by(|a, b| {
+                breakout_width(b)
+                    .partial_cmp(&breakout_width(a))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
         let crosses: Vec<String> = results
             .iter()
             .filter(|r| {
