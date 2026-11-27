@@ -1054,7 +1054,19 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             market_id,
             Some(ccxt_symbol),
         );
-        serde_json::to_value(result).map_err(|e| ServiceError::new("ValueError", e.to_string()))
+        let mut value = serde_json::to_value(result)
+            .map_err(|e| ServiceError::new("ValueError", e.to_string()))?;
+        if self.variant == Variant::TradFi {
+            // ATR for the loss-limit sizing and its initial stop.
+            let span = timeframe_ms(&timeframe).unwrap_or(0);
+            if let (Some(atr), Some(obj)) = (
+                crate::strategy::config_tradfi::atr_closed(&rows, self.now_ms(), span),
+                value.as_object_mut(),
+            ) {
+                obj.insert("atr".to_string(), json!(atr));
+            }
+        }
+        Ok(value)
     }
 
     pub fn latest_closed_bar(&self, cfg: &Value) -> i64 {
@@ -2725,7 +2737,43 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         if leverage.is_zero() {
             return Err(ServiceError::new("DivisionByZero", "leverage is zero"));
         }
-        let margin = dec_from_f64(available)? * py_dec(cfg.get("margin_fraction"))?;
+        let mut margin = dec_from_f64(available)? * py_dec(cfg.get("margin_fraction"))?;
+        let mut sizing_note = String::new();
+        let mut risk_stop_distance: Option<f64> = None;
+        if self.variant == Variant::TradFi {
+            if let Some(risk_pct) = crate::strategy::config_tradfi::risk_pct_of(cfg) {
+                let Some(atr) = as_f64(signal.get("atr")).filter(|a| *a > 0.0) else {
+                    return Ok((
+                        None,
+                        "RISK_SIZING_ATR_UNAVAILABLE: ATR 없음 — 진입 안 함".to_string(),
+                        context,
+                    ));
+                };
+                let stop_distance = crate::strategy::config_tradfi::RISK_ATR_MULT * atr;
+                let price_f = dec_to_f64(price);
+                let cap = dec_to_f64(margin * leverage);
+                let notional = crate::strategy::config_tradfi::risk_notional(
+                    available,
+                    risk_pct,
+                    price_f,
+                    stop_distance,
+                    cap,
+                );
+                margin = dec_from_f64(notional)? / leverage;
+                risk_stop_distance = Some(stop_distance);
+                sizing_note = format!(
+                    "1회 손실 {}% 기준: 손절 거리 {:.2}% → 노출 {:.2} USDT",
+                    format_f64(risk_pct),
+                    stop_distance / price_f * 100.0,
+                    notional
+                );
+                context.insert(
+                    "risk_sizing".to_string(),
+                    Value::String(sizing_note.clone()),
+                );
+                context.insert("risk_stop_distance".to_string(), json!(stop_distance));
+            }
+        }
         let step = rules.effective_step();
         let quantity = crate::core::rules::floor_to_step(
             &(margin * leverage / price).to_string(),
@@ -2770,6 +2818,16 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         );
         let mut quantity = quantity;
         if quantity < required {
+            if risk_stop_distance.is_some() {
+                return Ok((
+                    None,
+                    format!(
+                        "BELOW_EXCHANGE_MINIMUM: {market_id} {quantity} < {required} ({sizing_note}, 거래소 최소 주문 {} USDT — 한도를 넘겨 키우지 않음)",
+                        rules.min_notional
+                    ),
+                    context,
+                ));
+            }
             if !cfg
                 .get("allow_auto_raise_to_exchange_minimum")
                 .map(value_truthy)
@@ -2823,7 +2881,12 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             "margin": needed.to_string(),
             "estimated_entry_fee": estimated_entry_fee.to_string(),
             "estimated_total_risk": Value::Null,
-            "sizing_mode": format!("margin_{margin_fraction}x{leverage_text}"),
+            "sizing_mode": if risk_stop_distance.is_some() {
+                format!("risk_{}pct_atr{}", crate::strategy::config_tradfi::risk_pct_of(cfg).unwrap_or(0.0), crate::strategy::config_tradfi::RISK_ATR_MULT)
+            } else {
+                format!("margin_{margin_fraction}x{leverage_text}")
+            },
+            "risk_stop_distance": risk_stop_distance,
             "rules": rules_value,
             "fee_rate": fee_rate,
         });
@@ -2862,12 +2925,34 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         } else {
             emergency_roi
         };
-        let stop = crate::core::sma_cross::emergency_stop_price(
+        let mut stop = crate::core::sma_cross::emergency_stop_price(
             side,
             dec_to_f64(entry),
             leverage as f64,
             emergency_roi,
         );
+        // Loss-limit sizing: the 2xATR stop replaces the emergency stop when it
+        // is closer to the entry (it normally is).
+        let risk_distance = as_f64(decision.get("risk_stop_distance")).filter(|d| *d > 0.0);
+        let mut risk_stop = false;
+        if let Some(dist) = risk_distance {
+            let e = dec_to_f64(entry);
+            let candidate = if side == "LONG" { e - dist } else { e + dist };
+            let tighter = match stop {
+                Some(s) => {
+                    if side == "LONG" {
+                        candidate > s
+                    } else {
+                        candidate < s
+                    }
+                }
+                None => true,
+            };
+            if candidate > 0.0 && tighter {
+                stop = Some(candidate);
+                risk_stop = true;
+            }
+        }
         let mut stop_text = String::new();
         if let Some(stop_val) = stop {
             let direction = if side == "LONG" { "up" } else { "down" };
@@ -2907,6 +2992,7 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
         trade.insert("quantity".to_string(), Value::String(qty.to_string()));
         trade.insert("entry_price".to_string(), Value::String(entry.to_string()));
         trade.insert("stop_price".to_string(), Value::String(stop_text));
+        trade.insert("risk_stop".to_string(), Value::Bool(risk_stop));
         trade.insert(
             "take_profit_price".to_string(),
             Value::String(String::new()),

@@ -295,6 +295,65 @@ pub fn auto_market_ok(tradfi: bool, underlying_type: &str, base: &str) -> bool {
         && !AUTO_STABLES.contains(&base.trim().to_uppercase().as_str())
 }
 
+/// Per-trade loss limit sizing (user rule 2026-11-27, BTC backtest: worst
+/// trade -30% -> -2~3% of equity, MDD 90% -> 35% on 6h). The initial stop sits
+/// RISK_ATR_MULT x ATR(RISK_ATR_PERIOD) of the strategy timeframe from the
+/// entry and goes to the exchange as the stop order; the position is sized so
+/// that this stop loses `risk_per_trade_pct` of the available balance, never
+/// more than the fixed size (margin_fraction x leverage). A size below the
+/// exchange minimum is skipped, never raised.
+pub const RISK_CHOICES: &[i64] = &[1, 2, 3];
+pub const DEFAULT_RISK_PCT: i64 = 2;
+pub const RISK_ATR_PERIOD: usize = 14;
+pub const RISK_ATR_MULT: f64 = 2.0;
+
+/// Wilder ATR over the closed candles (`open_ms + span <= now_ms`).
+pub fn atr_closed(rows: &[[f64; 6]], now_ms: i64, span_ms: i64) -> Option<f64> {
+    let closed: Vec<&[f64; 6]> = rows
+        .iter()
+        .filter(|r| span_ms <= 0 || r[0] as i64 + span_ms <= now_ms)
+        .collect();
+    if closed.len() < RISK_ATR_PERIOD + 1 {
+        return None;
+    }
+    let mut atr: Option<f64> = None;
+    for i in 1..closed.len() {
+        let (h, l, pc) = (closed[i][2], closed[i][3], closed[i - 1][4]);
+        let tr = (h - l).max((h - pc).abs()).max((l - pc).abs());
+        atr = Some(match atr {
+            None => tr,
+            Some(a) => (a * (RISK_ATR_PERIOD as f64 - 1.0) + tr) / RISK_ATR_PERIOD as f64,
+        });
+    }
+    atr.filter(|a| *a > 0.0)
+}
+
+/// Notional for the loss-limit sizing: the stop at `stop_distance` (price
+/// units) loses `risk_pct`% of `balance`; capped at `cap_notional`.
+pub fn risk_notional(
+    balance: f64,
+    risk_pct: f64,
+    price: f64,
+    stop_distance: f64,
+    cap_notional: f64,
+) -> f64 {
+    if balance <= 0.0 || risk_pct <= 0.0 || price <= 0.0 || stop_distance <= 0.0 {
+        return 0.0;
+    }
+    let notional = balance * risk_pct / 100.0 * price / stop_distance;
+    notional.min(cap_notional.max(0.0))
+}
+
+/// Risk % in use, or None when the loss-limit sizing is off.
+pub fn risk_pct_of(cfg: &Value) -> Option<f64> {
+    if !bool_of(cfg.get("risk_sizing_enabled"), true) {
+        return None;
+    }
+    i64_of(cfg.get("risk_per_trade_pct"))
+        .filter(|p| RISK_CHOICES.contains(p))
+        .map(|p| p as f64)
+}
+
 /// Keys of the retired -50% halt, dropped from stored configs.
 const RETIRED_KEYS: &[&str] = &["drawdown_base_equity", "drawdown_halt_until_ms"];
 
@@ -359,6 +418,10 @@ pub fn normalize_tradfi_config(raw: Option<&Value>) -> Value {
     // alignment (close only), the profit lock or the emergency stop.
     let exit_off = bool_of(supplied.get("exit_ma_off"), false);
     let auto_scan = bool_of(supplied.get("auto_scan"), false);
+    let risk_on = bool_of(supplied.get("risk_sizing_enabled"), true);
+    let risk_pct = i64_of(supplied.get("risk_per_trade_pct"))
+        .filter(|p| RISK_CHOICES.contains(p))
+        .unwrap_or(DEFAULT_RISK_PCT);
     // Alignment periods; an inconsistent set falls back to 1/5/120.
     let (ma_f, ma_s, ma_l) = {
         let p = ma_periods_of(&Value::Object(supplied.clone()));
@@ -394,6 +457,15 @@ pub fn normalize_tradfi_config(raw: Option<&Value>) -> Value {
         map.insert("align_slow_enabled".into(), Value::Bool(align_slow));
         map.insert("exit_ma_off".into(), Value::Bool(exit_off));
         map.insert("auto_scan".into(), Value::Bool(auto_scan));
+        map.insert("risk_sizing_enabled".into(), Value::Bool(risk_on));
+        map.insert("risk_per_trade_pct".into(), json!(risk_pct));
+        // the size is computed per trade: never raise it to the exchange minimum
+        if risk_on {
+            map.insert(
+                "allow_auto_raise_to_exchange_minimum".into(),
+                Value::Bool(false),
+            );
+        }
         map.insert("auto_min_quote_volume".into(), json!(AUTO_MIN_QUOTE_VOLUME));
         if auto_scan {
             map.insert("scan_scope".into(), json!(AUTO_SCOPE));
@@ -612,6 +684,31 @@ mod tests {
             false
         )
         .is_none());
+    }
+
+    #[test]
+    fn loss_limit_sizing() {
+        let cfg = normalize_tradfi_config(None);
+        assert_eq!(cfg["risk_sizing_enabled"], json!(true));
+        assert_eq!(cfg["risk_per_trade_pct"], json!(2));
+        assert_eq!(risk_pct_of(&cfg), Some(2.0));
+        let off = normalize_tradfi_config(Some(&json!({"risk_sizing_enabled": false})));
+        assert_eq!(risk_pct_of(&off), None);
+        let bad = normalize_tradfi_config(Some(&json!({"risk_per_trade_pct": 9})));
+        assert_eq!(bad["risk_per_trade_pct"], json!(2));
+        // 40 USDT, 2% -> 0.8 USDT at a 4% stop -> 20 USDT notional
+        let n = risk_notional(40.0, 2.0, 100.0, 4.0, 100.0);
+        assert!((n - 20.0).abs() < 1e-9, "{n}");
+        // tight stop -> capped at the fixed size
+        assert!((risk_notional(40.0, 2.0, 100.0, 0.6, 100.0) - 100.0).abs() < 1e-9);
+        assert_eq!(risk_notional(0.0, 2.0, 100.0, 4.0, 100.0), 0.0);
+        // ATR of a steady 2-wide range is 2; the forming candle is ignored
+        let rows: Vec<[f64; 6]> = (0..30)
+            .map(|i| [i as f64 * 1000.0, 100.0, 101.0, 99.0, 100.0, 1.0])
+            .collect();
+        let a = atr_closed(&rows, 29_500, 1000).unwrap();
+        assert!((a - 2.0).abs() < 1e-9, "{a}");
+        assert_eq!(atr_closed(&rows[..10], 99_000, 1000), None);
     }
 
     #[test]

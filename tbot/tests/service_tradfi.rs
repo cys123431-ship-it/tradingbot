@@ -701,3 +701,59 @@ async fn auto_search_universe_filters_by_volume_and_kind() {
         .collect();
     assert_eq!(ids, vec!["ETHUSDT".to_string()]);
 }
+
+/// User rule 2026-11-27: /tradfi sizes each entry so its 2xATR stop loses
+/// risk_per_trade_pct (default 2%) of the available balance, capped at the
+/// fixed size, never raised to the exchange minimum.
+#[tokio::test]
+async fn loss_limit_sizing_sets_quantity_and_skips_below_minimum() {
+    let root = temp_dir("tradfi_risk_sizing");
+    let h = tradfi_only(&root, "mainnet", "XAG");
+    let cfg = h.service.config();
+    assert_eq!(cfg["risk_per_trade_pct"], json!(2));
+    let mode = h.service.mode(Some(&cfg));
+    let check = |wallet: f64, atr: f64| {
+        h.fake.inner.state.lock().unwrap().wallet = wallet;
+        let svc = &h.service;
+        let cfg = cfg.clone();
+        let mode = mode.clone();
+        async move {
+            let signal = json!({
+                "market_id": "XAGUSDT", "ccxt_symbol": "XAG/USDT:USDT",
+                "side": "LONG", "close": 30.0, "atr": atr,
+            });
+            svc.pre_trade_validation("mainnet", &cfg, &mode, &signal)
+                .await
+                .unwrap()
+        }
+    };
+    let (decision, reason, ctx) = check(40.0, 0.6).await;
+    let Some(d) = decision else {
+        panic!("no decision: {reason} {ctx:?}");
+    };
+    let available = ctx["available_balance"].as_f64().unwrap();
+    // stop 1.2 (4% of 30) -> 2% of the balance at risk
+    let qty: f64 = d["quantity"].as_str().unwrap().parse().unwrap();
+    let loss_at_stop = qty * 1.2;
+    assert!(
+        loss_at_stop <= available * 0.02 + 1e-9 && loss_at_stop > available * 0.02 * 0.9,
+        "qty {qty} loss {loss_at_stop} available {available}"
+    );
+    assert!(
+        d["sizing_mode"].as_str().unwrap().starts_with("risk_"),
+        "{d}"
+    );
+    assert_eq!(d["risk_stop_distance"], json!(1.2));
+    // a very wide stop shrinks the size below the 5 USDT minimum -> skipped
+    let (decision, reason, _) = check(40.0, 30.0).await;
+    assert!(decision.is_none());
+    assert!(reason.starts_with("BELOW_EXCHANGE_MINIMUM"), "{reason}");
+    assert!(reason.contains("1회 손실 2%"), "{reason}");
+    // no ATR -> no entry
+    let (decision, reason, _) = check(40.0, 0.0).await;
+    assert!(decision.is_none());
+    assert!(
+        reason.starts_with("RISK_SIZING_ATR_UNAVAILABLE"),
+        "{reason}"
+    );
+}

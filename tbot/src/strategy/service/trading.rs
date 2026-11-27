@@ -1087,12 +1087,16 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
                 && reason.is_none()
                 && matches!(status.as_str(), "TRIGGERED" | "FINISHED" | "FILLED")
             {
-                reason = Some(
+                let risk_stop = *kind == "sl"
+                    && get(&trade, "risk_stop").and_then(|v| v.as_bool()) == Some(true);
+                reason = Some(if risk_stop {
+                    "RISK_STOP".to_string()
+                } else {
                     self.variant
                         .exit_reason_for_kind(kind)
                         .map(|s| s.to_string())
-                        .unwrap_or_else(|| kind.to_uppercase()),
-                );
+                        .unwrap_or_else(|| kind.to_uppercase())
+                });
             }
         }
         let fills = self.exit_fills(network, &trade).await?;

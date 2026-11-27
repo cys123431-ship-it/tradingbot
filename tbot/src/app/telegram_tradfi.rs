@@ -91,6 +91,21 @@ fn cfg_int_of(cfg: &Value, key: &str) -> i64 {
         .unwrap_or(0)
 }
 
+/// "1회 손실 2% (손절 2×ATR)" or None when the loss-limit sizing is off.
+fn risk_text(cfg: &Value) -> Option<String> {
+    if !cfg_get(cfg, "risk_sizing_enabled")
+        .map(|v| py_truthy(Some(v)))
+        .unwrap_or(true)
+    {
+        return None;
+    }
+    let pct = match cfg_int_of(cfg, "risk_per_trade_pct") {
+        p if config_tradfi::RISK_CHOICES.contains(&p) => p,
+        _ => config_tradfi::DEFAULT_RISK_PCT,
+    };
+    Some(format!("1회 손실 자본의 {pct}% (손절 2×ATR)"))
+}
+
 fn auto_on(cfg: &Value) -> bool {
     py_truthy(cfg_get(cfg, "auto_scan"))
 }
@@ -530,8 +545,11 @@ pub fn tradfi_status_text(status: &Value) -> String {
         format!("수익잠금: {}", lock_text(&cfg)),
         guard_line(),
         format!(
-            "레버리지 {leverage}x ISOLATED 고정 · 증거금: 가용 잔고의 {:.0}% 고정 · 비상손절: {stop_text}",
-            margin_pct
+            "레버리지 {leverage}x ISOLATED 고정 · {} · 비상손절: {stop_text}",
+            match risk_text(&cfg) {
+                Some(r) => format!("크기: {r}, 최대 가용 {margin_pct:.0}%"),
+                None => format!("증거금: 가용 잔고의 {margin_pct:.0}% 고정"),
+            }
         ),
     ];
     if let Some(sw) = booked_switch(&cfg) {
@@ -677,6 +695,26 @@ pub fn tradfi_keyboard(cfg: &Value, confirm: Option<(&str, &str)>) -> Value {
                 .collect(),
         );
     }
+    let risk_on = cfg_get(cfg, "risk_sizing_enabled")
+        .map(|v| py_truthy(Some(v)))
+        .unwrap_or(true);
+    let risk_pct = cfg_int_of(cfg, "risk_per_trade_pct");
+    let mut risk_row: Vec<Value> = config_tradfi::RISK_CHOICES
+        .iter()
+        .map(|p| {
+            markup_button(
+                mark(
+                    risk_on
+                        && (risk_pct == *p
+                            || (risk_pct == 0 && *p == config_tradfi::DEFAULT_RISK_PCT)),
+                    &format!("손실한도 {p}%"),
+                ),
+                format!("tf:risk:{p}"),
+            )
+        })
+        .collect();
+    risk_row.push(markup_button(mark(!risk_on, "고정 크기"), "tf:risk:off"));
+    rows.push(risk_row);
     let plock = lock_on(cfg);
     rows.push(vec![
         markup_button(mark(plock, "🔒 수익잠금 켬"), "tf:plock:on"),
@@ -1375,6 +1413,42 @@ impl<A: EngineApi + 'static> TelegramBot<A> {
                 self.tf_keyboard().await,
             );
         }
+        if let Some(rest) = action.strip_prefix("risk:") {
+            let mut changes = Map::new();
+            let head = if rest == "off" {
+                changes.insert("risk_sizing_enabled".to_string(), json!(false));
+                "📏 크기: 고정 (가용 잔고 50% × 5배)\n손절은 비상손절(증거금 -50%)만 걸립니다."
+                    .to_string()
+            } else {
+                let Ok(p) = rest.parse::<i64>() else {
+                    return (self.tf_status_text().await, self.tf_keyboard().await);
+                };
+                if !config_tradfi::RISK_CHOICES.contains(&p) {
+                    return (self.tf_status_text().await, self.tf_keyboard().await);
+                }
+                changes.insert("risk_sizing_enabled".to_string(), json!(true));
+                changes.insert("risk_per_trade_pct".to_string(), json!(p));
+                format!(
+                    "📏 1회 손실 한도: 자본의 {p}%\n진입 때 손절을 2×ATR 거리에 걸고, 그 손절에 맞으면 가용 잔고의 {p}%만 잃도록 크기를 정합니다 (최대 가용 50% × 5배). 계산한 크기가 거래소 최소 주문보다 작으면 진입하지 않습니다."
+                )
+            };
+            if let Err(e) = self
+                .tf_call("config_set", json!({ "changes": changes }))
+                .await
+            {
+                return (engine_error_text(&e), tradfi_keyboard(&cfg, None));
+            }
+            let tail = if holding(&fetch_status(self).await) {
+                "\n보유 중인 포지션은 그대로 두고 다음 진입부터 적용됩니다."
+            } else {
+                "\n다음 진입부터 적용됩니다."
+            };
+            let status_text = self.tf_status_text().await;
+            return (
+                format!("{head}{tail}\n\n{status_text}"),
+                self.tf_keyboard().await,
+            );
+        }
         if action == "auto:on" || action == "auto:off" {
             let on = action == "auto:on";
             if let Err(e) = self.tf_set("auto_scan", json!(on)).await {
@@ -1656,6 +1730,10 @@ fn tradfi_rules_text(cfg: &Value) -> String {
         String::new(),
         "고정 설정".to_string(),
         format!("· 레버리지 5x ISOLATED · 증거금 가용 잔고의 {margin_text}%"),
+        match risk_text(cfg) {
+            Some(r) => format!("· 크기: {r} — 진입 때 2×ATR(시간봉 ATR14) 거리에 손절 주문, 그 손절에 맞으면 가용 잔고의 그 %만 잃도록 수량을 정함 (최대 가용 {margin_text}% × 5배, 거래소 최소 주문 미만이면 진입 안 함). 손실한도 1·2·3% 또는 고정 크기 버튼"),
+            None => "· 크기: 고정 (손실한도 버튼으로 1회 손실 한도 방식으로 바꿀 수 있음)".to_string(),
+        },
         "· 비상손절: 증거금 -50% (Mark 기준, 거래소 주문)".to_string(),
         format!(
             "· 거래정지: 선물계좌 총자본(지갑 + 평가손익)이 {min} USDT 미만이면 신규 진입 정지. 보유 포지션은 청산선·비상손절대로 계속 관리하고, 전략은 ON 유지, {min} USDT 이상으로 돌아오면 자동 재개 (LIVE 모드)",
@@ -2243,6 +2321,30 @@ mod tests {
         let sw = fake.config.lock().unwrap()[config_tradfi::NEXT_SWITCH_KEY].clone();
         assert_eq!(sw["ma_slow_period"], json!(120));
         assert_eq!(sw["ma_long_period"], json!(200));
+    }
+
+    #[tokio::test]
+    async fn loss_limit_buttons() {
+        let fake = Fake::new();
+        let b = bot(&fake);
+        let (text, kb) = b.handle_tradfi_action("risk:3").await;
+        assert!(text.starts_with("📏 1회 손실 한도: 자본의 3%"), "{text}");
+        assert!(callbacks(&kb)
+            .iter()
+            .any(|(t, d)| t.starts_with("✅") && d == "tf:risk:3"));
+        let (text, kb) = b.handle_tradfi_action("risk:off").await;
+        assert!(text.starts_with("📏 크기: 고정"), "{text}");
+        assert!(callbacks(&kb)
+            .iter()
+            .any(|(t, d)| t.starts_with("✅") && d == "tf:risk:off"));
+        b.handle_tradfi_action("risk:7").await;
+        assert_eq!(
+            fake.sets(),
+            vec![
+                json!({"risk_sizing_enabled": true, "risk_per_trade_pct": 3}),
+                json!({"risk_sizing_enabled": false}),
+            ]
+        );
     }
 
     #[tokio::test]

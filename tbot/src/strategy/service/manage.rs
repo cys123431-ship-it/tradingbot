@@ -1606,7 +1606,14 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             let close_ms = open_ms + 60_000;
             // Stops first with the levels known before this candle (conservative).
             let candidates: Vec<(&str, String)> = vec![
-                ("EMERGENCY_STOP", get_str(&trade, "stop_price")),
+                (
+                    if get(&trade, "risk_stop").and_then(|v| v.as_bool()) == Some(true) {
+                        "RISK_STOP"
+                    } else {
+                        "EMERGENCY_STOP"
+                    },
+                    get_str(&trade, "stop_price"),
+                ),
                 ("PROFIT_LOCK", get_str(&trade, "lock_price")),
             ];
             for (kind, level_text) in candidates {
@@ -1765,7 +1772,11 @@ impl<E: FuturesExchange + 'static> SmaCrossService<E> {
             .map(|v| py_truthy(Some(v)))
             .unwrap_or(false)
         {
-            format!("비상손절 {}", get_str(trade, "stop_price"))
+            if get(trade, "risk_stop").and_then(|v| v.as_bool()) == Some(true) {
+                format!("손절(2×ATR) {}", get_str(trade, "stop_price"))
+            } else {
+                format!("비상손절 {}", get_str(trade, "stop_price"))
+            }
         } else {
             "비상손절 OFF".to_string()
         };
