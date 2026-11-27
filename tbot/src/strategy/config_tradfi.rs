@@ -221,12 +221,12 @@ pub fn timeframe_label(tf: &str) -> String {
     }
 }
 
-/// "MA 1·5·120" or "MA 1·5 (120 제외)".
+/// "MA 1·5·120" or "MA 1·5 (긴MA 안 씀)".
 pub fn ma_label(fast: i64, slow: i64, long: i64, use_long: bool) -> String {
     if use_long {
         format!("MA {fast}·{slow}·{long}")
     } else {
-        format!("MA {fast}·{slow} ({long} 제외)")
+        format!("MA {fast}·{slow} (긴MA 안 씀)")
     }
 }
 

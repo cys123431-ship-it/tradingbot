@@ -162,7 +162,7 @@ fn ma_of(cfg: &Value) -> (i64, i64, i64) {
     config_tradfi::ma_periods_of(cfg)
 }
 
-/// "MA 1·5·120" / "MA 1·5 (120 제외)".
+/// "MA 1·5·120" / "MA 1·5 (긴MA 안 씀)".
 fn ma_text(cfg: &Value) -> String {
     let (f, s, l) = ma_of(cfg);
     config_tradfi::ma_label(f, s, l, slow_on(cfg))
@@ -361,7 +361,7 @@ fn align_text(cfg: &Value) -> String {
     if slow_on(cfg) {
         format!("SMA {f}·{s}·{l} 정배열 롱 / 역배열 숏")
     } else {
-        format!("SMA {f}·{s} 정배열 롱 / 역배열 숏 ({l}MA 제외)")
+        format!("SMA {f}·{s} 정배열 롱 / 역배열 숏 (긴MA 안 씀)")
     }
 }
 
@@ -2074,7 +2074,7 @@ mod tests {
         let fake = Fake::new();
         let b = bot(&fake);
         let (text, kb) = b.handle_tradfi_action("slow:off").await;
-        assert!(text.contains("120 제외"), "{text}");
+        assert!(text.contains("긴MA 안 씀"), "{text}");
         assert_eq!(fake.sets(), vec![json!({"align_slow_enabled": false})]);
         assert!(callbacks(&kb)
             .iter()
@@ -2163,7 +2163,7 @@ mod tests {
         // with the long MA excluded, slow may reach it
         fake.config.lock().unwrap()["align_slow_enabled"] = json!(false);
         let (text, _) = b.tf_ma_from_text("1 200").await;
-        assert!(text.contains("MA 1·200 (200 제외)"), "{text}");
+        assert!(text.contains("MA 1·200 (긴MA 안 씀)"), "{text}");
         // ...but it cannot be switched back on until slow < long
         let (text, _) = b.handle_tradfi_action("slow:on").await;
         assert!(text.starts_with("❌"), "{text}");
